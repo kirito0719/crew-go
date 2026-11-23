@@ -132,3 +132,28 @@ func testBeforeOldestIsEmpty(t *testing.T, factory HistoryStoreFactory) {
 		t.Fatalf("越过第一条再往前读返 %d 条、More=%v, want 空页", len(empty.Messages), empty.More)
 	}
 }
+
+// 同时指定 After、Before 和 Limit 时，More 只统计两个游标之间的更早记录。
+func testOpenCursorRange(t *testing.T, factory HistoryStoreFactory) {
+	hs := factory()
+	key := agent_v2.HistoryKey{Owner: "tenant", ConvID: "range"}
+	ctx := t.Context()
+	var points []agent_v2.HistoryCursor
+	for i := range 5 {
+		mustAppend(t, hs, key, schema.UserMessage(fmt.Sprint(i)))
+		page, err := hs.Load(ctx, key, agent_v2.HistoryQuery{Limit: 1})
+		if err != nil || page.Start == "" {
+			t.Fatalf("缺少第 %d 条的游标: %v", i, err)
+		}
+		points = append(points, page.Start)
+	}
+	for _, tc := range []struct {
+		before, after int
+		more          bool
+	}{{4, 0, true}, {4, 1, false}} {
+		page, err := hs.Load(ctx, key, agent_v2.HistoryQuery{After: points[tc.after], Before: points[tc.before], Limit: 2})
+		if err != nil || len(page.Messages) != 2 || page.Messages[0].Content != "2" || page.Messages[1].Content != "3" || page.More != tc.more {
+			t.Fatalf("开区间 (%d,%d) 的尾页或 More 错误: %+v err=%v", tc.after, tc.before, page, err)
+		}
+	}
+}

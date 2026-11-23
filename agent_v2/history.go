@@ -86,11 +86,24 @@ type HistoryStore interface {
 	// Append 把 msgs 追加到 key 对应的会话末尾。**只追加**，见接口 godoc。
 	Append(ctx context.Context, key HistoryKey, msgs []*schema.Message) error
 
-	// Load 按写入顺序返回 q 圈定的那一段：满足 q 的过滤条件的记录里，q.Before 之前（空 = 会话末尾）
-	// 最近的 q.Limit 条（<= 0 不限）。**零值 q 读整场会话。** 会话不存在、没有满足条件的记录时返空页、
+	// Load 按写入顺序返回 q.After 与 q.Before 开区间内符合条件的最近 q.Limit 条记录。
+	// 空游标表示该方向不限，Limit <= 0 时返回该区间的全部匹配记录。**零值 q 读整场会话。** 会话不存在、没有满足条件的记录时返空页、
 	// 不报错——「没聊过」「没记过」不是错误。返回页的 Start 是第一条的位置，More 报更早还有没有满足
 	// 条件的；见 [HistoryPage]。
 	Load(ctx context.Context, key HistoryKey, q HistoryQuery) (HistoryPage, error)
+}
+
+// HistoryTailAppender 是支持跨 Run 压缩边界的历史后端能力。
+// 同一 key 的 Append、AppendAfter 按提交顺序串行，Load 与两者共用稳定游标。读取尾游标之后的 Load 必须看到至少该时刻已经提交的前缀。
+// after 是未过滤的尾记录游标，空串要求会话为空。
+// 匹配时原子追加整批并返回新尾游标与 true，空批返回原游标。失配时整批不写，返回 false、nil。
+// boundary 是本批替代前缀的记录下标，-1 表示普通批次。只有成功的条件追加能为这一行设置
+// [HistoryPage.VerifiedBoundaries]。普通追加或复制消息均不复制此标记。写入结果不确定时应返回错误。
+type HistoryTailAppender interface {
+	HistoryStore
+	// HistoryAppendOwner 返回实现条件追加的存储本身。包装器接管两条写入路径后返回可比较的包装器自身（通常为指针）。
+	HistoryAppendOwner() HistoryStore
+	AppendAfter(ctx context.Context, key HistoryKey, after HistoryCursor, msgs []*schema.Message, boundary int) (HistoryCursor, bool, error)
 }
 
 // HistoryKey 定位一条会话。
@@ -483,7 +496,7 @@ type historyWriter struct {
 
 	mu     sync.Mutex
 	cond   *sync.Cond
-	queue  [][]*schema.Message
+	queue  []historyWrite
 	closed bool
 	warned bool // 积压 warn 每个排空周期最多一次（worker 每次取批清零）——不会刷爆
 
@@ -705,14 +718,18 @@ func (w *historyWriter) waitDrained(ctx context.Context) {
 // writeOne 写一批，**panic-safe**：业务 backend panic 时 recover 转 warn。worker 跑在
 // 独立 goroutine，Run 入口的 outer recover 够不着它——不自己兜则 panic 逃逸 crash 整
 // 进程。而历史是旁路，让它崩掉整个服务显然不成比例。
-func (w *historyWriter) writeOne(msgs []*schema.Message) {
+func (w *historyWriter) writeOne(batch historyWrite) {
+	msgs := batch.msgs
 	defer func() {
 		if r := recover(); r != nil {
+			if batch.coverage != nil {
+				batch.coverage.valid = false
+			}
 			panicerr.Log(w.ctx, slog.LevelWarn, "agent_v2: 会话历史后端 panic，本批丢弃",
 				panicerr.New(r), "key", w.key.String(), "count", len(msgs))
 		}
 	}()
-	if err := w.store.Append(w.ctx, w.key, msgs); err != nil {
+	if err := batch.append(w.ctx, w.store, w.key); err != nil {
 		// warn 不是 debug：历史丢失不常见、丢了很难发现（读的时候只是「少了几条」，
 		// 没有任何信号说这是丢的还是本来就没有）。静默 = 业务永远查不出来。
 		slog.WarnContext(w.ctx, "agent_v2: 会话历史写入失败，本批丢弃",
@@ -725,12 +742,16 @@ func (w *historyWriter) writeOne(msgs []*schema.Message) {
 // 收摊之后到的批次丢弃 + warn，不 panic——那是「流式桥之类脱离 Run 生命周期的 goroutine
 // 迟到了」的信号，丢一批旁路日志远好过崩掉整个进程。
 func (w *historyWriter) submit(msgs []*schema.Message) {
+	w.submitBatch(historyWrite{msgs: msgs, boundary: -1})
+}
+
+func (w *historyWriter) submitBatch(batch historyWrite) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
 		slog.WarnContext(w.ctx, "agent_v2: 写入器已收摊，本批会话历史丢弃——"+
 			"recordHistory 只能从节点体内同步调用，不能从活过 Run 的后台 goroutine 调",
-			"key", w.key.String(), "count", len(msgs))
+			"key", w.key.String(), "count", len(batch.msgs))
 		return
 	}
 	if p := w.pendingRoot; p != nil {
@@ -739,15 +760,15 @@ func (w *historyWriter) submit(msgs []*schema.Message) {
 		// 顶层），再写这一批。只看这一批、不看登记表：边界补记先认领输入、读一次历史判产出之后才入队，认领了还没入队的
 		// 那份挡不住别的分支先入队的一批（审计实测：并发扇出里原话排到了委派分支的问答之后）。更早入队过它的批次已经把
 		// 待补取走了。
-		if !batchHasInput(msgs, p.msg) {
+		if !batchHasInput(batch.msgs, p.msg) {
 			w.ensureRecordMaps()
 			w.recorded[p.msg] = true
 			w.recordedHere[recordSlotKey{msg: p.msg, slot: p.slot}] = true
 			w.noteRecordedID(p.msg)
-			w.queue = append(w.queue, []*schema.Message{p.stamped})
+			w.queue = append(w.queue, historyWrite{msgs: []*schema.Message{p.stamped}, boundary: -1})
 		}
 	}
-	w.queue = append(w.queue, msgs)
+	w.queue = append(w.queue, batch)
 	backlog := len(w.queue)
 	shouldWarn := backlog >= historyWriterBacklogWarn && !w.warned
 	if shouldWarn {
@@ -1204,19 +1225,31 @@ func claimSharedRootInput(ctx context.Context, prior []*schema.Message, input *s
 //
 // 没开历史 / 被 WithoutHistoryCtx 摘掉时是 no-op。
 func recordHistory(ctx context.Context, owner, display string, msgs []*schema.Message) {
-	recordHistoryWithToolBatch(ctx, owner, display, msgs, nil, nil)
+	recordHistoryBatch(ctx, owner, display, msgs, historyRecordOptions{})
 }
 
-// recordHistoryWithToolBatch 可在写入工具结果时保留调用实例，结果正文和原始调用 ID 按原消息存放。
-func recordHistoryWithToolBatch(ctx context.Context, owner, display string, msgs []*schema.Message, batch *toolBatch, calls []schema.ToolCall) {
+type historyRecordOptions struct {
+	batch    *toolBatch
+	calls    []schema.ToolCall
+	coverage *historyCoverage
+	boundary *schema.Message
+}
+
+// recordHistoryBatch 可在写入工具结果时保留调用实例，结果正文和原始调用 ID 按原消息存放。
+func recordHistoryBatch(ctx context.Context, owner, display string, msgs []*schema.Message, opts historyRecordOptions) {
 	w := historyWriterFrom(ctx)
 	if w == nil || len(msgs) == 0 {
 		return
+	}
+	coverage := opts.coverage
+	if coverage != nil && (coverage.writer != w || coverage.owner != owner || coverage.mode != GetHandoffHistoryMode(ctx)) {
+		coverage = nil
 	}
 	w.markRecorded(HistorySlot(ctx), msgs)
 	bumpHistoryReceipt(ctx)
 	// 拷贝一份再盖章：msgs 里的 *schema.Message 是 channel 里那批的同一批指针，
 	// 直接改它们的 Annotations 会污染正在喂给模型的消息。
+	boundaryIndex := -1
 	stamped := make([]*schema.Message, 0, len(msgs))
 	for i, m := range msgs {
 		if m == nil {
@@ -1238,9 +1271,12 @@ func recordHistoryWithToolBatch(ctx context.Context, owner, display string, msgs
 		if isDerivedInput(m) {
 			continue
 		}
+		if m == opts.boundary {
+			boundaryIndex = len(stamped)
+		}
 		record := w.stamp(m, owner, display)
-		if i < len(calls) && calls[i].ID != "" && m.Role == schema.RoleTool && schema.GetToolResultID(m) == calls[i].ID {
-			if instance := batch.callInstanceID(i); instance != "" {
+		if i < len(opts.calls) && opts.calls[i].ID != "" && m.Role == schema.RoleTool && schema.GetToolResultID(m) == opts.calls[i].ID {
+			if instance := opts.batch.callInstanceID(i); instance != "" {
 				record.Annotations[ToolCallInstanceIDExtraKey] = instance
 			}
 		}
@@ -1249,7 +1285,7 @@ func recordHistoryWithToolBatch(ctx context.Context, owner, display string, msgs
 	if len(stamped) == 0 {
 		return
 	}
-	w.submit(stamped)
+	w.submitBatch(historyWrite{msgs: stamped, coverage: coverage, boundary: boundaryIndex})
 }
 
 // stamp 给一条要写进历史的消息盖归属、任务章与来源（见 stampHistoryAgent），返回拷贝。
@@ -1397,10 +1433,11 @@ type InMemoryHistoryStore struct {
 // memHistoryConv 是一场会话的记录，连同写入时按消息 ID、任务章、归属建的位置索引（位置升序）——按条件读时
 // 只看命中的那些位置，不扫整场会话（见 [HistoryQuery]）。
 type memHistoryConv struct {
-	msgs    []*schema.Message
-	byID    map[string][]int
-	byTask  map[string][]int
-	byAgent map[string][]int
+	msgs     []*schema.Message
+	verified []bool
+	byID     map[string][]int
+	byTask   map[string][]int
+	byAgent  map[string][]int
 }
 
 func (c *memHistoryConv) index(m *schema.Message, pos int) {
@@ -1446,25 +1483,49 @@ func NewInMemoryHistoryStore() *InMemoryHistoryStore {
 }
 
 // Append 追加到会话末尾。存的是 msgs 元素的指针快照——caller 不改写元素是接口约定。
-func (s *InMemoryHistoryStore) Append(_ context.Context, key HistoryKey, msgs []*schema.Message) error {
+func (s *InMemoryHistoryStore) Append(ctx context.Context, key HistoryKey, msgs []*schema.Message) error {
+	_, _, err := s.appendBatch(key, nil, msgs, -1)
+	return err
+}
+
+// HistoryAppendOwner 返回当前内存存储。
+func (s *InMemoryHistoryStore) HistoryAppendOwner() HistoryStore { return s }
+
+// AppendAfter 在会话锁内比对旧尾游标，并为成功写入的边界记录保存位置证明。
+func (s *InMemoryHistoryStore) AppendAfter(ctx context.Context, key HistoryKey, after HistoryCursor, msgs []*schema.Message, boundary int) (HistoryCursor, bool, error) {
+	return s.appendBatch(key, &after, msgs, boundary)
+}
+
+func (s *InMemoryHistoryStore) appendBatch(key HistoryKey, after *HistoryCursor, msgs []*schema.Message, boundary int) (HistoryCursor, bool, error) {
 	if key.Owner == "" || key.ConvID == "" {
-		return fmt.Errorf("history: key 不完整 (owner=%q conv=%q)", key.Owner, key.ConvID)
+		return "", false, fmt.Errorf("history: key 不完整 (owner=%q conv=%q)", key.Owner, key.ConvID)
 	}
-	if len(msgs) == 0 {
-		return nil
+	if boundary < -1 || boundary >= len(msgs) {
+		return "", false, fmt.Errorf("history: invalid boundary index %d", boundary)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.convs[key]
+	var tail HistoryCursor
+	if c != nil && len(c.msgs) > 0 {
+		tail = HistoryCursor(strconv.Itoa(len(c.msgs) - 1))
+	}
+	if after != nil && *after != tail {
+		return "", false, nil
+	}
+	if len(msgs) == 0 {
+		return tail, true, nil
+	}
 	if c == nil {
 		c = &memHistoryConv{byID: map[string][]int{}, byTask: map[string][]int{}, byAgent: map[string][]int{}}
 		s.convs[key] = c
 	}
-	for _, m := range msgs {
+	for i, m := range msgs {
 		c.index(m, len(c.msgs))
 		c.msgs = append(c.msgs, m)
+		c.verified = append(c.verified, i == boundary)
 	}
-	return nil
+	return HistoryCursor(strconv.Itoa(len(c.msgs) - 1)), true, nil
 }
 
 // Load 返回 q 圈定的那一段（slice 快照，元素仍是共享指针）。游标是消息在会话里的下标（十进制）。
@@ -1487,13 +1548,33 @@ func (s *InMemoryHistoryStore) Load(_ context.Context, key HistoryKey, q History
 			end = b
 		}
 	}
+	begin := 0
+	if q.After != "" {
+		a, err := strconv.Atoi(string(q.After))
+		if err != nil || a < 0 {
+			return HistoryPage{}, fmt.Errorf("history: invalid cursor %q", q.After)
+		}
+		if a >= end {
+			return HistoryPage{}, nil
+		}
+		begin = a + 1
+	}
+	var verified map[int]HistoryCursor
+	notePosition := func(i, pos int) {
+		if c.verified[pos] {
+			if verified == nil {
+				verified = make(map[int]HistoryCursor)
+			}
+			verified[i] = HistoryCursor(strconv.Itoa(pos))
+		}
+	}
 	cand, all := []int(nil), true
 	if c != nil {
 		cand, all = c.candidates(q)
 	}
 	if all {
-		start := 0
-		if q.Limit > 0 && end-q.Limit > 0 {
+		start := begin
+		if q.Limit > 0 && end-q.Limit > begin {
 			start = end - q.Limit
 		}
 		if start >= end {
@@ -1501,12 +1582,15 @@ func (s *InMemoryHistoryStore) Load(_ context.Context, key HistoryKey, q History
 		}
 		out := make([]*schema.Message, end-start)
 		copy(out, src[start:end])
-		return HistoryPage{Messages: out, Start: HistoryCursor(strconv.Itoa(start)), More: start > 0}, nil
+		for i := range out {
+			notePosition(i, start+i)
+		}
+		return HistoryPage{Messages: out, VerifiedBoundaries: verified, Start: HistoryCursor(strconv.Itoa(start)), More: start > begin}, nil
 	}
 	// 候选位置里 end 之前的，从新往旧逐条核对其余条件；凑够 Limit 条之后再找一条，判 More
 	var hits []int // 新 → 旧
 	more := false
-	for i := sort.SearchInts(cand, end) - 1; i >= 0; i-- {
+	for i := sort.SearchInts(cand, end) - 1; i >= 0 && cand[i] >= begin; i-- {
 		if !q.Matches(src[cand[i]]) {
 			continue
 		}
@@ -1522,8 +1606,9 @@ func (s *InMemoryHistoryStore) Load(_ context.Context, key HistoryKey, q History
 	out := make([]*schema.Message, len(hits))
 	for i, p := range hits {
 		out[len(hits)-1-i] = src[p]
+		notePosition(len(hits)-1-i, p)
 	}
-	return HistoryPage{Messages: out, Start: HistoryCursor(strconv.Itoa(hits[len(hits)-1])), More: more}, nil
+	return HistoryPage{Messages: out, VerifiedBoundaries: verified, Start: HistoryCursor(strconv.Itoa(hits[len(hits)-1])), More: more}, nil
 }
 
 // validateHistoryConfig 在构造期挡住「开了会话历史却没给 agent 起名」。

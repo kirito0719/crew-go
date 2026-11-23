@@ -2,6 +2,7 @@
 
 ## 部署前
 
+- 使用 SQL 会话历史时，先排空所有写入同一历史表的旧进程及在途事务，再运行新版 `HistoryStore.Setup` 并统一切换。普通追加与条件追加都要先取得同会话的写锁。直接写表的生产者也需遵守该协议。旧历史可直接读取，旧摘要会从原文重建。[ISSUE-100](../issue/issue-100-history-compaction-concurrent.md)
 - 根模块与三个子模块要求 Go 1.26.0 或更高版本。仓库工具链与 GitLab CI 使用 Go 1.26.4。
 - 对共用同一 Redis 或 SQL 存档域的进程，先停旧副本，再启动新版。新版用任务租约协调执行、续跑和清档。 [任务租约](../v2/checkpoint.md#61-共享存档的任务租约)
 - 恢复执行前会写入 `CPStatusResuming`。回退前让新版处理或显式放弃这类存档，旧版本可以按遗留 frontier 再次执行。自定义 Checkpointer 需要实现原子 `ClaimResume` 和带条件的 `DeleteSubtree`。 [持久准入](../v2/checkpoint.md#持久续跑准入)

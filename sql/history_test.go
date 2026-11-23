@@ -80,6 +80,54 @@ WHEN instr(CAST(NEW.payload AS TEXT), 'boom') > 0 BEGIN SELECT RAISE(ABORT, 'boo
 	}
 }
 
+// 条件追加的边界即使已执行第一条 INSERT，也要随批内后续行的失败回滚，原尾游标还能重试。
+func TestSQLiteHistoryStore_ConditionalBatchRollback(t *testing.T) {
+	h, db := newSQLiteHistory(t)
+	ctx := t.Context()
+	key := agent_v2.HistoryKey{Owner: "o", ConvID: "rollback"}
+	if err := h.Append(ctx, key, []*schema.Message{schema.UserMessage("seed")}); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := h.Load(ctx, key, agent_v2.HistoryQuery{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER reject_row BEFORE INSERT ON crew_history
+WHEN instr(CAST(NEW.payload AS TEXT), 'rejected') > 0 BEGIN SELECT RAISE(ABORT,'rejected'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	boundary := schema.UserMessage("candidate")
+	if _, ok, err := h.AppendAfter(ctx, key, seed.Start, []*schema.Message{boundary, schema.AssistantMessage("rejected")}, 0); err == nil || ok {
+		t.Fatalf("第二行失败时仍接受了整批: applied=%v err=%v", ok, err)
+	}
+	tail, ok, err := h.AppendAfter(ctx, key, seed.Start, []*schema.Message{boundary}, 0)
+	if err != nil || !ok {
+		t.Fatalf("无法从原水位重试: applied=%v err=%v", ok, err)
+	}
+	page, err := h.Load(ctx, key, agent_v2.HistoryQuery{After: seed.Start})
+	if err != nil || len(page.Messages) != 1 || page.VerifiedBoundaries[0] != tail {
+		t.Fatalf("重试后的行和证明不一致: %+v err=%v", page, err)
+	}
+}
+
+func TestSQLiteHistoryStore_CopiedPayloadLosesBoundaryProof(t *testing.T) {
+	h, db := newSQLiteHistory(t)
+	ctx := t.Context()
+	key := agent_v2.HistoryKey{Owner: "t", ConvID: "copy"}
+	tail, ok, err := h.AppendAfter(ctx, key, "", []*schema.Message{schema.UserMessage("snapshot")}, 0)
+	if err != nil || !ok {
+		t.Fatalf("无法建立初始边界: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO crew_history(owner,conv_id,payload,msg_id,task,agent)
+SELECT owner,conv_id,payload,msg_id,task,agent FROM crew_history`); err != nil {
+		t.Fatal(err)
+	}
+	page, err := h.Load(ctx, key, agent_v2.HistoryQuery{})
+	if err != nil || len(page.Messages) != 2 || len(page.VerifiedBoundaries) != 1 || page.VerifiedBoundaries[0] != tail {
+		t.Fatalf("位置证明被复制: %+v err=%v", page, err)
+	}
+}
+
 // TestSQLiteHistoryStore_UnencodableMessageWritesNothing：有一条编不出 JSON，整批不写。
 func TestSQLiteHistoryStore_UnencodableMessageWritesNothing(t *testing.T) {
 	h, _ := newSQLiteHistory(t)
@@ -155,5 +203,29 @@ func TestSQLiteHistoryStore_SetupIdempotentAndKeyRequired(t *testing.T) {
 		if err := h.Append(context.Background(), key, []*schema.Message{schema.UserMessage("q")}); err == nil {
 			t.Errorf("key 不完整 %+v 时 Append 应报错", key)
 		}
+	}
+}
+
+func TestSQLiteHistoryStore_TriggerAppendInvalidatesBoundary(t *testing.T) {
+	h, db := newSQLiteHistory(t)
+	ctx := t.Context()
+	key := agent_v2.HistoryKey{Owner: "t", ConvID: "trigger"}
+	if _, err := db.Exec(`CREATE TRIGGER extra_history AFTER INSERT ON crew_history
+WHEN NEW.msg_id='candidate' BEGIN
+  INSERT INTO crew_history(owner,conv_id,payload,msg_id,task,agent) VALUES (NEW.owner,NEW.conv_id,'{"role":"assistant","content":"trigger-output"}','triggered','','');
+END`); err != nil {
+		t.Fatal(err)
+	}
+	m := schema.UserMessage("candidate")
+	m.ID = "candidate"
+	if _, applied, err := h.AppendAfter(ctx, key, "", []*schema.Message{m}, 0); err != nil || applied {
+		t.Fatalf("额外行使来源失效: applied=%v err=%v", applied, err)
+	}
+	if err := h.Append(ctx, key, []*schema.Message{m}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := h.Load(ctx, key, agent_v2.HistoryQuery{})
+	if err != nil || len(p.Messages) != 2 || p.Messages[0].Content != "candidate" || p.Messages[1].Content != "trigger-output" || len(p.VerifiedBoundaries) != 0 {
+		t.Fatalf("普通行或触发器行被覆盖: %+v err=%v", p, err)
 	}
 }

@@ -753,7 +753,7 @@ func CloseAbandonedTaskHistory(ctx context.Context, destination TaskHistoryDesti
 	}
 	src := historySource{store: store, key: key, task: task}
 	var msgs []*schema.Message // 新 → 旧
-	err := src.scanBackward(ctx, HistoryQuery{Task: task}, historyPageMin, true, func(m *schema.Message) bool {
+	err := src.scanBackward(ctx, HistoryQuery{Task: task}, historyPageMin, true, func(m *schema.Message, _ HistoryCursor) bool {
 		msgs = append(msgs, m)
 		return false
 	}, nil)

@@ -339,14 +339,9 @@ type AutoCompactConfig struct {
 - 同样的 200 轮任务：摘要 18 次、摘要输入 0.8MB；喂给模型的上限不变。不变量：**同一个 Run 里模型输入有界、
   不随轮数涨，跟 Head 里装了什么无关**。
 
-**跨 Run：压缩边界**（`agent_v2/compaction_boundary.go`）。某一轮真摘要了一次、且 `OnModelStart` 钩子这一轮
-没动消息列表（钩子插入或改写的内容不该被当成历史重放），模型节点成功时往会话历史追加一条边界记录：带着这一刻
-的完整替代历史（受保护的组 + 摘要 + 尾部原文，去掉每次 Run 都会重新算出来的长期记忆注入与派生输入），盖本
-agent 的归属与视图模式，正文是摘要，标注 `HistoryCompactionAnnotation`。读 prior 时往前读到本 agent、同视图的
-最新一条边界就停：prior = 替代历史 + 边界之后的记录（别的 agent 的、别的视图的、解不出来的当它不存在）。原始
-记录一条不动，历史仍是 append-only；第 0 层截断把摘要当受保护消息（它代表边界之前的全部对话）。1000 轮的
-会话：每次 Run 从读 4008 条、摘要两次（每次输入 3.8MB）降到读约 190 条、不重新摘要。读历史这一侧见
-[usage-guide.md](usage-guide.md) 会话历史节。
+**跨 Run 的压缩边界。** 模型节点完成 AutoCompact 摘要、该轮输入保持原始视图时，生成包含受保护组、摘要和尾部原文的候选。前言每轮重新组装。组装替代历史时滤掉长期记忆注入，尾部原文还会滤掉标记为可重算的派生输入。
+
+历史后端以 preamble 读取前的会话尾游标为起点，按提交顺序核对当前调用的每个批次。并发调用推进尾部时，本次调用放弃候选，继续追加普通问答。下一次 Run 只在同一成员、同一视图的已确认行停止向前翻页，模型收到替代历史和该行之后的记录。旧边界和重新导入的副本会跳过。本次 prior 已发生裁剪、使用自定义历史压缩器，或直接从存档恢复到模型节点时，都跳过新边界发布。已有边界可在 preamble 读历史时正常复用，Run 内的压缩备忘也继续生效。后端实现及三种视图的前文处理见 [ISSUE-100](../issue/issue-100-history-compaction-concurrent.md)。
 
 **代价与限制**（开放项见 [`doc/code/todo.md`](../code/todo.md)）：
 
@@ -681,8 +676,8 @@ MicroCompact → AutoCompact → ChatModel.WithTools(toolkit) → LLM 调用
   └─ 看 EstimateTokens(messages) 实际值（slog.Debug 可打）
 
 现象：跨 Run 历史每次都 AutoCompact 重摘（很慢）
-  ├─ 开了会话历史层（WithHistory / WithHistoryCtx）吗？开了时某一轮真摘要过，会话历史里就有一条压缩边界，
-  │   下一次 Run 从本 agent、同视图的最新边界读起、不重摘（见「压缩结果的复用」）。查：
+  ├─ 后端实现 HistoryTailAppender 且本次调用读取完整 prior 吗？摘要候选需要条件追加成功，
+  │   下一次 Run 从本 agent、同视图的最新已确认边界读起（见「压缩结果的复用」）。查：
   │   ├─ 那一轮 OnModelStart 钩子动了消息列表——那一轮不写边界（钩子插入 / 改写的内容不该当历史重放）
   │   └─ 换了 agent 名或视图模式——边界按归属 + 视图认，对不上的当它不存在
   ├─ 没开会话历史层（prior 来自 session.Events）：AutoCompact summary **不 AddEvent 进 session.Events**

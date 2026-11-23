@@ -46,7 +46,7 @@
 //     的视图按归属读。条件没生效或按「或」处理，去重误判「记过」、该记的没记；More 把不满足条件的
 //     更早记录也算进去，框架判后端违约、同一句话记两份。
 //
-// # 覆盖什么（19 条子测试）
+// # 覆盖范围
 //
 // RoundTrip / AppendOnly / Order / KeyIsolation（含**分隔符歧义**：`{acme/eu, c-1}` 与
 // `{acme, eu/c-1}` 拼串主键会撞）/ MessageFields（ToolCalls 全字段 + Annotations +
@@ -89,6 +89,7 @@ func RunHistoryStoreTests(t *testing.T, factory HistoryStoreFactory) {
 	}
 
 	t.Run("AppendLoadRoundTrip", func(t *testing.T) { testAppendLoadRoundTrip(t, factory) })
+	t.Run("ConditionalTailAppend", func(t *testing.T) { testTailAppend(t, factory) })
 	t.Run("AppendOnly", func(t *testing.T) { testAppendOnly(t, factory) })
 	t.Run("AppendNoMutation", func(t *testing.T) { testAppendNoMutation(t, factory) })
 	t.Run("Order", func(t *testing.T) { testOrder(t, factory) })
@@ -101,6 +102,7 @@ func RunHistoryStoreTests(t *testing.T, factory HistoryStoreFactory) {
 	t.Run("Concurrent", func(t *testing.T) { testConcurrent(t, factory) })
 	t.Run("LoadLimitReturnsLatest", func(t *testing.T) { testLoadLimitReturnsLatest(t, factory) })
 	t.Run("PagingCoversAllOnce", func(t *testing.T) { testPagingCoversAllOnce(t, factory) })
+	t.Run("OpenCursorRange", func(t *testing.T) { testOpenCursorRange(t, factory) })
 	t.Run("PagingStableUnderAppend", func(t *testing.T) { testPagingStableUnderAppend(t, factory) })
 	t.Run("LimitBeyondTotal", func(t *testing.T) { testLimitBeyondTotal(t, factory) })
 	t.Run("BeforeOldestIsEmpty", func(t *testing.T) { testBeforeOldestIsEmpty(t, factory) })
@@ -125,5 +127,73 @@ func mustAppend(t *testing.T, hs agent_v2.HistoryStore, key agent_v2.HistoryKey,
 	t.Helper()
 	if err := hs.Append(context.Background(), key, msgs); err != nil {
 		t.Fatalf("Append(%s, %d 条): %v", key, len(msgs), err)
+	}
+}
+
+// testTailAppend 核对条件追加与普通追加使用同一条提交顺序，证明只随实际存储位置返回。
+func testTailAppend(t *testing.T, factory HistoryStoreFactory) {
+	hs := factory()
+	st := agent_v2.HistoryTailAppenderFor(hs)
+	if st == nil {
+		t.Skip("后端只提供普通历史追加")
+	}
+	ctx := t.Context()
+	key := agent_v2.HistoryKey{Owner: "owner", ConvID: "tail"}
+	duplicate := schema.AssistantMessage("相同的消息")
+	duplicate.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: "member"}
+	mustAppend(t, hs, key, duplicate)
+	seed, err := hs.Load(ctx, key, agent_v2.HistoryQuery{Limit: 1})
+	if err != nil || seed.Start == "" {
+		t.Fatalf("初始尾游标 = %q, %v", seed.Start, err)
+	}
+
+	type outcome struct {
+		tail    agent_v2.HistoryCursor
+		applied bool
+		err     error
+	}
+	start := make(chan struct{})
+	const contenders = 8
+	results := make(chan outcome, contenders)
+	for range contenders {
+		go func() {
+			<-start
+			tail, applied, err := st.AppendAfter(ctx, key, seed.Start, []*schema.Message{duplicate, duplicate}, 1)
+			results <- outcome{tail, applied, err}
+		}()
+	}
+	close(start)
+	var published agent_v2.HistoryCursor
+	winners := 0
+	var writeErr error
+	for range contenders {
+		r := <-results
+		if r.err != nil {
+			writeErr = r.err
+		}
+		if r.applied {
+			winners++
+			published = r.tail
+		}
+	}
+	if writeErr != nil || winners != 1 || published == "" || published == seed.Start {
+		t.Fatalf("竞争追加成功 %d 次，得到尾游标 %q，错误 %v", winners, published, writeErr)
+	}
+	mustAppend(t, hs, key, duplicate)
+	if _, applied, err := st.AppendAfter(ctx, key, published, []*schema.Message{duplicate}, 0); err != nil || applied {
+		t.Fatalf("普通追加后仍接受旧水位: applied=%t err=%v", applied, err)
+	}
+	page, err := hs.Load(ctx, key, agent_v2.HistoryQuery{Agent: "member", After: seed.Start, Limit: 2})
+	if err != nil || len(page.Messages) != 2 || !page.More || page.VerifiedBoundaries[0] != published || len(page.VerifiedBoundaries) != 1 {
+		t.Fatalf("筛选分页未对齐实际边界: %+v err=%v", page, err)
+	}
+	before, err := hs.Load(ctx, key, agent_v2.HistoryQuery{After: seed.Start, Before: published})
+	if err != nil || len(before.Messages) != 1 || before.More || len(before.VerifiedBoundaries) != 0 {
+		t.Fatalf("开区间内应只有边界前一份重复记录: %+v err=%v", before, err)
+	}
+	mustAppend(t, hs, key, page.Messages[0])
+	copyPage, err := hs.Load(ctx, key, agent_v2.HistoryQuery{After: published})
+	if err != nil || len(copyPage.Messages) != 2 || len(copyPage.VerifiedBoundaries) != 0 {
+		t.Fatalf("普通追加复制了位置证明: %+v err=%v", copyPage, err)
 	}
 }

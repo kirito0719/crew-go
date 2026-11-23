@@ -20,6 +20,7 @@ import (
 	"crew-go/agent_v2/history_conformance"
 	"crew-go/compose_v2"
 	"crew-go/compose_v2/checkpointer_conformance"
+	"crew-go/schema"
 	crewsql "crew-go/sql"
 	"crew-go/store"
 	"crew-go/store/conformance"
@@ -48,6 +49,44 @@ func TestPostgresIntegration(t *testing.T) {
 			})
 		})
 	}
+	t.Run("HistorySequenceCache", func(t *testing.T) {
+		ctx := t.Context()
+		dbA, dbB := stdlib.OpenDB(*config), stdlib.OpenDB(*config)
+		t.Cleanup(func() { _ = dbA.Close(); _ = dbB.Close() })
+		dbA.SetMaxOpenConns(1)
+		dbB.SetMaxOpenConns(1)
+		table := newSQLTestTable()
+		dropSQLTestTablesOnCleanup(t, dbA, table+"_writer", table)
+		a := crewsql.NewHistoryStore(dbA, crewsql.Postgres{}, crewsql.WithHistoryTable(table))
+		b := crewsql.NewHistoryStore(dbB, crewsql.Postgres{}, crewsql.WithHistoryTable(table))
+		if err := a.Setup(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dbA.ExecContext(ctx, "ALTER SEQUENCE "+table+"_id_seq CACHE 8"); err != nil {
+			t.Fatal(err)
+		}
+		key := agent_v2.HistoryKey{Owner: "test", ConvID: "cached-ids"}
+		for _, step := range []struct {
+			st   *crewsql.HistoryStore
+			text string
+		}{{a, "A-first"}, {b, "B-between"}} {
+			if err := step.st.Append(ctx, key, []*schema.Message{schema.AssistantMessage(step.text)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		head, err := a.Load(ctx, key, agent_v2.HistoryQuery{Limit: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tail, ok, err := a.AppendAfter(ctx, key, head.Start, []*schema.Message{schema.UserMessage("A-summary")}, 0)
+		if err != nil || !ok || tail == head.Start {
+			t.Fatalf("未正确推进缓存序号: tail=%q applied=%v err=%v", tail, ok, err)
+		}
+		p, err := b.Load(ctx, key, agent_v2.HistoryQuery{})
+		if err != nil || len(p.Messages) != 3 || p.Messages[0].Content != "A-first" || p.Messages[1].Content != "B-between" || p.Messages[2].Content != "A-summary" || len(p.VerifiedBoundaries) != 1 || p.VerifiedBoundaries[2] != tail {
+			t.Fatalf("消息顺序或证明错误: %+v err=%v", p, err)
+		}
+	})
 	t.Run("SharedApproval", func(t *testing.T) {
 		runSQLSharedApproval(t, "pgx", dsn)
 	})
@@ -193,7 +232,7 @@ func runSQLBackendConformance(t *testing.T, dialect crewsql.Dialect, open func()
 				ttlExec(t, clockDB, "SET SESSION time_zone = '+10:30'")
 			}
 			table, history := newSQLTestTable(), newSQLTestTable()
-			dropSQLTestTablesOnCleanup(t, clockDB, history, table)
+			dropSQLTestTablesOnCleanup(t, clockDB, history+"_writer", history, table)
 			checkSQLStoreTTL(t, clockDB, dialect, table, history)
 			if _, mysqlClock := dialect.(crewsql.MySQL); mysqlClock {
 				checkMySQLTTLPinnedClock(t, clockDB)
@@ -214,7 +253,7 @@ func runSQLBackendConformance(t *testing.T, dialect crewsql.Dialect, open func()
 	t.Run("HistoryStore", func(t *testing.T) {
 		history_conformance.RunHistoryStoreTests(t, func() agent_v2.HistoryStore {
 			table := newSQLTestTable()
-			dropSQLTestTablesOnCleanup(t, db, table)
+			dropSQLTestTablesOnCleanup(t, db, table+"_writer", table)
 			history := crewsql.NewHistoryStore(db, dialect, crewsql.WithHistoryTable(table))
 			if err := history.Setup(t.Context()); err != nil {
 				t.Fatal(err)

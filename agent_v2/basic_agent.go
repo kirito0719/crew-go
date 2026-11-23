@@ -714,7 +714,7 @@ func (a *BasicAgent) runGraph(ctx context.Context, runCfg *runConfig, session *R
 }
 
 // buildInitialMessages 拼接 system + StoreMemory items + sess.SelfHistoryCompacted + 当前 input。
-func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSession, input *schema.Message, source *skill.SkillSource) ([]*schema.Message, []*schema.Message, error) {
+func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSession, input *schema.Message, source *skill.SkillSource, coverage *historyCoverage) ([]*schema.Message, []*schema.Message, error) {
 	var sysPreamble []*schema.Message
 	var msgs []*schema.Message
 	// PromptTemplate（如有）：preamble 渲染出「agent 是什么」的那一段（system + 可选 few-shot）。
@@ -960,6 +960,9 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	}
 	prior, fromHistory := historyPrior(ctx, a.historyCfgFor(ctx), historyOwner(ctx, a.config.Name), mode, need)
 	if !fromHistory {
+		if coverage != nil {
+			coverage.valid = false
+		}
 		prior = session.modelHistory(a.config.Name, HistorySlot(ctx), mode)
 		// 调用方提供的前文排在最前：events 只有这个进程里发生的，更早的轮次在调用方手里（见 caller_history.go）
 		if turns := callerHistory(ctx); len(turns) > 0 {
@@ -1018,6 +1021,9 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 		// 简单截断——保留最后 MaxHistoryPairs 对（user/assistant），按 2x 估算。
 		// **保护跨层 marker**（对齐 4 层压缩都尊重 SkillBodyAnnotation）：激活过的 skill body
 		// 在对话流里，按条数截掉会让 LLM 突然看不到已激活 skill 的内容。
+		if coverage != nil {
+			coverage.valid = false
+		}
 		prior = truncatePriorPreservingMarkers(prior, a.config.MaxHistoryPairs*2)
 	}
 
@@ -1038,7 +1044,7 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	if input.Role == schema.RoleUser && !isDerivedInput(input) && !(fromHistory && priorHasRootInputID(priorForDedup, id)) {
 		shared := mode != HandoffHistorySelfOnly
 		if !shared || !fromHistory || claimSharedRootInput(ctx, priorForDedup, input) {
-			recordHistory(ctx, historyOwner(ctx, a.config.Name), a.config.Name, []*schema.Message{input})
+			recordHistoryBatch(ctx, historyOwner(ctx, a.config.Name), a.config.Name, []*schema.Message{input}, historyRecordOptions{coverage: coverage})
 		}
 	}
 
@@ -2316,15 +2322,15 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	dispatchToolkit := a.composeDispatchToolkit(cfg, grants, backgroundScopeFrom(ctx) != nil, conversationTools)
 	modelFn := a.makeModelFn(cfg, grants, conversationTools)
 	toolsFn := a.makeToolsFn(cfg, grants, dispatchToolkit)
-	preamble := func(ctx context.Context, input *BasicAgentPreambleInput) (*BasicAgentPreambleOutput, error) {
-		return a.preambleFn(ctx, input, cfg.Skill)
-	}
-
 	bld := NewBasicAgentBuilder(modelFn, toolsFn).
 		WithName(a.config.Name).
-		WithMaxRounds(resolveMaxRounds(ctx, a.config.MaxRounds)). // per-call 覆盖（ctx 无则构造期默认）
-		WithPreamble(preamble).                                   // ISSUE-74 修
-		WithPostamble(a.postambleFn)                              // ISSUE-75 修
+		WithMaxRounds(resolveMaxRounds(ctx, a.config.MaxRounds)).
+		WithPostamble(a.postambleFn)
+	bld.WithPreamble(func(ctx context.Context, input *BasicAgentPreambleInput) (*BasicAgentPreambleOutput, error) {
+		// 每次重建图都有独立的来源。直接从 checkpoint 进入模型或工具节点时，没有本次读取的历史前缀。
+		bld.historyCoverage = captureHistoryCoverage(ctx, &cfg)
+		return a.preambleFn(ctx, input, cfg.Skill, bld.historyCoverage)
+	})
 	if a.config.Hooks != nil {
 		bld = bld.WithAgentHooks(a.config.Hooks)
 	}
@@ -2405,7 +2411,7 @@ func (a *BasicAgent) postambleFn(ctx context.Context, in *BasicAgentPostambleInp
 // **idempotent**：preamble 在 Resume 时完整重跑——业务自定义 Store 实现的 Search
 // 等回调必须支持多次调用同结果（除非业务自己读 ResumeContext 主动改写）。详见
 // `BasicAgentPreambleFn` godoc。
-func (a *BasicAgent) preambleFn(ctx context.Context, in *BasicAgentPreambleInput, source *skill.SkillSource) (*BasicAgentPreambleOutput, error) {
+func (a *BasicAgent) preambleFn(ctx context.Context, in *BasicAgentPreambleInput, source *skill.SkillSource, coverage *historyCoverage) (*BasicAgentPreambleOutput, error) {
 	if in == nil || in.UserInput == nil {
 		return nil, fmt.Errorf("agent %q: preamble input is nil", a.config.Name)
 	}
@@ -2414,7 +2420,7 @@ func (a *BasicAgent) preambleFn(ctx context.Context, in *BasicAgentPreambleInput
 		// fallback：理论不会发生（Run 入口已 WithSession 注入）；保守路径不 panic
 		session = sessionForCtx(ctx)
 	}
-	sysPreamble, msgs, err := a.buildInitialMessages(ctx, session, in.UserInput, source)
+	sysPreamble, msgs, err := a.buildInitialMessages(ctx, session, in.UserInput, source, coverage)
 	if err != nil {
 		return nil, err
 	}

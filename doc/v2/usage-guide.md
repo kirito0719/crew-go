@@ -569,24 +569,16 @@ ag.Run(ctx, sess, schema.UserMessage("这一轮的问题"))
 4008 条 / 8MB / 43ms 降到 80 条 / 0.2MB / 0.8ms，三步顺序编排从 30071 条 / 72MB / 352ms 降到 240 条 / 0.6MB / 3.1ms；
 模型看到的 prompt 不变。会话里有 1200 条别的任务的记录时，续跑一个 6 步的任务，去重一共读回 1 条。
 
-**压缩边界：靠摘要控制上下文的会话也只读尾部。** 开了 AutoCompact 的 agent（不论 `MaxHistoryPairs`）某一轮真摘要了
-一次时，模型节点往历史追加一条**压缩边界**（盖 `HistoryCompactionAnnotation`，正文是那次
-的摘要），带着那一刻的完整替代历史；下一次 Run 往前读到本 agent、同视图的最新一条边界就停：prior = 替代历史 +
-边界之后的记录，不再把整场原文读一遍、再在第一轮把它整个摘要一遍（1000 轮时原先每次 Run 读 4008 条、摘要两次、
-每次摘要输入 3.8MB；现在约 190 条、不重新摘要）。关掉轮数截断（`WithMaxHistoryPairs(0)`）、靠摘要控制上下文的会话受益
-最大；开着轮数截断时 prior 同样从边界读起，摘要作为受保护消息留在截断之后。原始记录一条不动，业务回看时可以按这个标注跳过边界或把它当作
-「此前的摘要」展示。机制见 [context-compaction.md](context-compaction.md)「压缩结果的复用」。
+**串行长会话可复用跨 Run 的压缩边界。** 开了 AutoCompact 且实际读取完整历史视图时，内存和 SQL 后端可将摘要、受保护组和近期原文保存在已确认的边界行。下次 Run 读取同一成员和视图时，从该行接上后续原文。期间若有其他调用写入历史，本次调用继续记录普通问答。业务回看仍可通过 `HistoryCompactionAnnotation` 识别摘要记录。
+
+自定义后端可实现 `agent_v2.HistoryTailAppender`，在一个原子操作中核对同会话尾游标并追加整批，同时通过 `HistoryPage.VerifiedBoundaries` 返回具体边界行的位置。普通追加和条件追加共享同一提交顺序。包装器只有同时承接两种写入并从 `HistoryAppendOwner` 返回可比较的自身实例（通常为指针）时才能发布新边界。可用 `HistoryTailAppenderFor` 查询实际能力。普通历史后端继续按原始记录构建跨 Run 视图。[上下文压缩](context-compaction.md) · [并发示例](../issue/issue-100-history-compaction-concurrent.md)
 
 **自研 backend**：实现 `Append` / `Load` 两个方法。`Load(ctx, key, HistoryQuery) (HistoryPage, error)` 先按过滤条件
 （`MessageID` / `Task` / `Agent`，非空的都要满足；任务章与归属在 `Annotations[HistoryTaskAnnotation]` /
-`Annotations[HistoryAgentAnnotation]` 里，写入时抽成带索引的列）筛，再按写入顺序返回 `Before` 之前最近的 `Limit` 条，
+`Annotations[HistoryAgentAnnotation]` 里，写入时抽成带索引的列）筛，再按写入顺序返回 `After` 与 `Before` 开区间内最近的 `Limit` 条，
 `More` 按满足条件的算（零值 query 读整场，会话不存在、没有命中都返空页不报错）；在进程里过滤的用
 `HistoryQuery.Matches` 判，跟框架的判据一致。游标 `HistoryCursor` 由后端铸、对框架不透明，同一场会话里按写入顺序严格
-递增、追加不改变已有游标。业务回看整场用 `agent_v2.LoadAllHistory`。没实现过滤条件的后端（只认 `Before` / `Limit`）
-结果照旧正确——框架逐条核对返回的记录——但按条件查退化成往前翻整场会话，并告警一次。跑 conformance 验语义
-（19 个子测试，其中 5 条管分页：Limit 取最近的、逐页往前不漏不重、往前翻页时别人追加游标不漂、Limit 超过总数、越过
-第一条是空页；4 条管按条件读：同一个 ID 的每一份都返回、条件之间是「且」、带条件翻页不漏不重且最早一页 More 为
-false、没有命中是空页）——
+递增、追加不改变已有游标。业务回看整场用 `agent_v2.LoadAllHistory`。遇到未执行身份过滤的后端，框架会逐条核对消息身份。自定义存储用一致性套件验证开区间分页、追加期间游标稳定、重复记录和联合过滤；支持条件追加的存储还需通过并发写入和行位置证明检查。
 
 ```go
 import "crew-go/agent_v2/history_conformance"

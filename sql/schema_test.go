@@ -192,6 +192,8 @@ func TestSetup_IdentityColumnsCompareBytes(t *testing.T) {
 			}
 			if strings.HasPrefix(c.name, "checkpointer/") {
 				mock.ExpectExec("CREATE TABLE IF NOT EXISTS crew_checkpoint_task_lease").WillReturnResult(sqlmock.NewResult(0, 0))
+			} else if strings.HasPrefix(c.name, "history/") {
+				mock.ExpectExec("CREATE TABLE IF NOT EXISTS crew_history_writer .*" + c.pattern + `\s*PRIMARY KEY \(owner, conv_id\)`).WillReturnResult(sqlmock.NewResult(0, 0))
 			}
 			if err := c.setup(db); err != nil {
 				t.Errorf("Setup 的建表语句里身份列不是按字节比较的类型 / 排序规则: %v", err)

@@ -57,7 +57,7 @@ type modelCallRecord struct {
 	Out *schema.Message `json:"out"`
 	// Compaction 是这一轮 AutoCompact 摘要出的备忘（没摘要为 nil）。
 	Compaction *compactionMemo `json:"compaction,omitempty"`
-	// Boundary 是这一轮要写进会话历史的压缩边界（没摘要、或 OnModelStart 钩子动了消息列表时为 nil）。在模型调用
+	// Boundary 是这一轮交给历史写入器确认的候选压缩边界（没摘要、或 OnModelStart 钩子动了消息列表时为 nil）。在模型调用
 	// 那一刻定：沿用原样续跑时 OnModelStart 再触发一次，它这次动没动消息列表跟那次答复无关。
 	Boundary *schema.Message `json:"boundary,omitempty"`
 	// Binding 是这一轮交给模型的工具（见 toolBinding）：沿用这份答复时，执行它的 tool_call 照这一份判。

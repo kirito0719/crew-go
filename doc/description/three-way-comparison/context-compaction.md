@@ -376,7 +376,7 @@ ReactiveCompact 的 prompt-too-long 检测与重试语义、9 段切分算法、
 - 先归档再替换送模视图；工具配对、当前原始输入、未回应插话、system 和 Skill 等内容保留。`read_context` 在当前 owner、会话与稳定历史成员位置内有界读取。
 - 只复用随 checkpoint 保存的 Run 内备忘。跨 Run 从原始历史重新折叠，同内容继续使用相同定位符，可能重复写同一键。
 
-**不发布新的跨 Run 折叠历史边界。** 并发任务 A 读完历史后，B 可能先完成；A 晚到的自包含快照不能代表 B 的新增记录。现有 HistoryStore 的 cursor 不透明，消息 ID 也不是追加记录的位置，不能靠猜水位宣称快照完整。发布资格由本轮实际完成 AutoCompact 摘要的入口明确给出；仅继承旧摘要不获得资格。已有 AutoCompact 的并发快照问题另记 [ISSUE-100](../../issue/issue-100-history-compaction-concurrent.md)，本轮不新增同类发布路径。
+**不发布新的跨 Run 折叠历史边界。** 并发任务 A 读完历史后，B 可能先完成；A 晚到的自包含快照不能代表 B 的新增记录。现有 HistoryStore 的 cursor 不透明，消息 ID 也不是追加记录的位置，不能靠猜水位宣称快照完整。发布资格由本轮实际完成 AutoCompact 摘要的入口明确给出；仅继承旧摘要不获得资格。后续在 ISSUE-100 中将既有 AutoCompact 边界绑定到存储确认的追加位置，ContextRecovery 仍沿用单 Run 备忘。 [ISSUE-100](../../issue/issue-100-history-compaction-concurrent.md)
 
 这个实现采用分层恢复思路，没有复现 Folio 的 dossier、成本优化器和论文任务集结果。API、预算边界与生产回归见[使用文档](../../v2/context-recovery.md)。
 
@@ -402,4 +402,4 @@ OpenAI Agents SDK 本地 `6c4e4a29` 的 `src/agents/models/_response_terminal.py
 | 隔离撤销修复的对照 | 失败用量、稳定成员定位、继承旧摘要的边界发布三条回归均实际失败；修复版通过 |
 | 文档与注释 | 实际 diff（含新文件）经过 commentaudit，未发现 ERROR；公开 API 用 go doc 核对 |
 
-失败用量、恢复所有权、评测与文档分别经过独立复审；发现使用生产组件或真实 wire-format stub 复现后修复。既有 AutoCompact 并发快照问题保持 ISSUE-100 的开放状态。
+失败用量、恢复所有权、评测与文档分别经过独立复审；发现使用生产组件或真实 wire-format stub 复现后修复。当时另行登记的 AutoCompact 并发快照问题已由后续修复关闭。 [并发边界决策与回归](../../issue/issue-100-history-compaction-concurrent.md)

@@ -72,6 +72,10 @@ type pagedStore struct {
 func (s *pagedStore) Append(ctx context.Context, k agent_v2.HistoryKey, m []*schema.Message) error {
 	return s.inner.Append(ctx, k, m)
 }
+func (s *pagedStore) HistoryAppendOwner() agent_v2.HistoryStore { return s }
+func (s *pagedStore) AppendAfter(ctx context.Context, k agent_v2.HistoryKey, after agent_v2.HistoryCursor, m []*schema.Message, boundary int) (agent_v2.HistoryCursor, bool, error) {
+	return s.inner.AppendAfter(ctx, k, after, m, boundary)
+}
 func (s *pagedStore) Load(ctx context.Context, k agent_v2.HistoryKey, q agent_v2.HistoryQuery) (agent_v2.HistoryPage, error) {
 	p, err := s.inner.Load(ctx, k, q)
 	s.msgs.Add(int64(len(p.Messages)))

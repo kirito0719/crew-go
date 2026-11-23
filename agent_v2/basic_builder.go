@@ -207,13 +207,15 @@ type BasicAgentPostambleInput struct {
 // 已知限制：MicroCompact 作用在跨轮累积 messages 不在单批 tool results——业务
 // 应在 OnModelStart hook 内（下轮入口）调用，或 Phase 4 把这个 wrap 内置到框架。
 type BasicAgentBuilder struct {
-	name      string
-	model     BasicAgentModelFn
-	tools     BasicAgentToolFn
-	preamble  BasicAgentPreambleFn  // ISSUE-74 修：可选 preamble 节点（graph 首段 setup）
-	postamble BasicAgentPostambleFn // ISSUE-75 修：可选 postamble 节点（graph 末段收尾，如 store.Put）
-	maxRounds int
-	hooks     hook.Hooks // 业务级 hook（OnAgentStart/End + OnModelStart/End + OnToolStart/End + OnError）
+	// historyCoverage 仅由 BasicAgent 当次编译的 preamble 建立，嵌套图各自持有。
+	historyCoverage *historyCoverage
+	name            string
+	model           BasicAgentModelFn
+	tools           BasicAgentToolFn
+	preamble        BasicAgentPreambleFn  // ISSUE-74 修：可选 preamble 节点（graph 首段 setup）
+	postamble       BasicAgentPostambleFn // ISSUE-75 修：可选 postamble 节点（graph 末段收尾，如 store.Put）
+	maxRounds       int
+	hooks           hook.Hooks // 业务级 hook（OnAgentStart/End + OnModelStart/End + OnToolStart/End + OnError）
 	// modelConfig 算这次模型调用的请求配置（模型名与按次参数），交给 OnModelStart 的 ModelInput.Config；nil 时不填。
 	modelConfig func(ctx context.Context) *schema.ModelConfig
 	// outputSchema 的校验预算由模型节点读取持久的尝试次数后裁决。
@@ -1138,7 +1140,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 					return err
 				}
 				// 只有源自原始消息流的摘要能成为跨 Run 历史。恢复时沿用当次答复确定的边界。
-				if memo.out != nil && memo.boundaryEligible && !memo.out.Transient {
+				if b.historyCoverage != nil && memo.out != nil && memo.boundaryEligible && !memo.out.Transient {
 					boundary = buildCompactionBoundary(memo.out, msgs, GetHandoffHistoryMode(ctx))
 				}
 				// 模型调用成功那一刻记下原样：OnModelEnd 因为要等人或被叫停停下时，续跑沿用这一份（见 modelCallRecord）。
@@ -1263,15 +1265,14 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 会话历史（opt-in）：本轮 LLM 产出（连同接进来的插话——那是用户的原话）。放在这里而不是节点入口——
 		// 节点入口那时还不知道这一轮会不会失败/中断，写了就得在 Resume 重跑时再写一遍。
 		//
-		// 这一轮真摘要了一次时，先记一条压缩边界（这一刻的完整替代历史，模型调用那一刻定的，见上），再记本轮产出——
-		// 下一次 Run 从这条边界往后读，见 compaction_boundary.go；排列见 modelHistoryRecords。
+		// 新摘要的候选边界排在本轮产出之前。历史写入器只在尾游标仍匹配时发布它，顺序见 modelHistoryRecords。
 		//
 		// 定下这一轮（见 modelCallRecord），在记会话历史之前：重放时据它跳过记历史——这次执行之后作废的话，续跑时
 		// 历史里已经有这一份。
 		saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Late: late, Out: out, Compaction: memo.out, Boundary: boundary, Binding: binding, Final: true, Signals: sigs, FinalRound: finalRound})
 		keepRecord = true
 		compose_v2.EmitSignals(ctx, sigs)
-		recordHistory(ctx, historyOwner(ctx, name), name, modelHistoryRecords(notes, inter, boundary, out, late))
+		recordHistoryBatch(ctx, historyOwner(ctx, name), name, modelHistoryRecords(notes, inter, boundary, out, late), historyRecordOptions{coverage: b.historyCoverage, boundary: boundary})
 		return append(basicModelWrites(notes, inter, out, late, memo.out, binding), compose_v2.Write(basicFinalRoundCh, finalRound)), nil
 	}
 
@@ -1636,7 +1637,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if err := compose_v2.SaveStepResult(ctx, basicToolsHistoryStep, true, compose_v2.Rerunnable(), compose_v2.WithStreams(nil)); err != nil {
 				slog.WarnContext(ctx, "agent_v2: 记「这一批已记过会话历史」失败，这次执行之后作废时续跑会再记一份", "err", err)
 			}
-			recordHistoryWithToolBatch(ctx, historyOwner(ctx, name), name, results, batch, toolCalls)
+			recordHistoryBatch(ctx, historyOwner(ctx, name), name, results, historyRecordOptions{batch: batch, calls: toolCalls, coverage: b.historyCoverage})
 		}
 
 		writes := []compose_v2.ChannelWrite{compose_v2.Write(basicMessagesCh, append(results, referenceMessages...))}
@@ -1961,7 +1962,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				return nil, fmt.Errorf("interjections: %w", err)
 			}
 			if len(inter) > 0 {
-				recordHistory(ctx, historyOwner(ctx, name), name, inter)
+				recordHistoryBatch(ctx, historyOwner(ctx, name), name, inter, historyRecordOptions{coverage: b.historyCoverage})
 				return []compose_v2.ChannelWrite{
 					compose_v2.Write(basicMessagesCh, inter),
 					compose_v2.Write(basicRepeatChainCh, &repeatToolState{}),
@@ -1982,7 +1983,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				// 单独一条、不进会话历史（见 newTurnGateLastChance）；recordHistory 按标记跳过它
 				feedback = append(feedback, newTurnGateLastChance())
 			}
-			recordHistory(ctx, historyOwner(ctx, name), name, feedback)
+			recordHistoryBatch(ctx, historyOwner(ctx, name), name, feedback, historyRecordOptions{coverage: b.historyCoverage})
 			return []compose_v2.ChannelWrite{
 				compose_v2.Write(basicMessagesCh, feedback),
 				compose_v2.Write(basicGateVetoesCh, 1),

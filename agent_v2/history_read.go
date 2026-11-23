@@ -41,19 +41,21 @@ import (
 // HistoryCursor 是会话里一条消息的位置，由后端铸造、对框架不透明。
 //
 // 后端自己决定它装什么（下标、自增序号、偏移量），要满足两条：同一场会话里按写入顺序**严格递增**
-// （后端自己能比较即可，框架不比较）；追加新消息**不改变**已有消息的游标。空串保留给「会话末尾」。
+// （后端自己能比较即可，框架不比较）；追加新消息**不改变**已有消息的游标。空串不指向任何记录，在查询中表示该方向不限，在条件追加中要求会话为空。
 type HistoryCursor string
 
 // HistoryQuery 圈定 [HistoryStore.Load] 读哪一段。**零值 = 整场会话。**
 //
-// 三个过滤条件（MessageID / Task / Agent）非空时都要满足（逐字节相等，判据见 [HistoryQuery.Matches]）；Before /
-// Limit 作用在过滤之后的序列上，[HistoryPage.More] 也按满足条件的算。任务章与归属在消息的 Annotations 里（值是
+// 三个过滤条件（MessageID / Task / Agent）非空时都要满足（逐字节相等，判据见 [HistoryQuery.Matches]）。After / Before
+// 限定开区间，Limit 作用在符合条件的序列上，[HistoryPage.More] 也按满足条件的算。任务章与归属在消息的 Annotations 里（值是
 // 字符串），后端可以在写入时抽出来建索引——框架的去重只按这几个条件查、命中即停，读的量取决于后端按条件读时
 // 要碰多少条。
 type HistoryQuery struct {
 	// Before 非空时只读这个位置**之前**（不含）的消息；空串 = 从会话末尾起。
-	// 取值只来自同一场会话的 [HistoryPage.Start]。
+	// 游标取自同一场会话的 HistoryPage。
 	Before HistoryCursor
+	// After 非空时只读该位置之后（不含）的记录，与 Before 共同限定区间。
+	After HistoryCursor
 	// Limit > 0 时只返 Before 之前**最近的** Limit 条（满足过滤条件的）；<= 0 不限。
 	Limit int
 	// MessageID 非空时只返 Message.ID 等于它的记录。
@@ -64,7 +66,7 @@ type HistoryQuery struct {
 	Agent string
 }
 
-// Matches 报 m 满不满足 q 的过滤条件（MessageID / Task / Agent；Before / Limit 不在这里）。在进程里过滤的后端
+// Matches 报 m 满不满足 q 的过滤条件（MessageID / Task / Agent；After / Before / Limit 由后端处理）。在进程里过滤的后端
 // 直接用它，判据就跟框架的一致：任务章与归属按字符串比，值不是字符串的不命中；nil 不命中。
 func (q HistoryQuery) Matches(m *schema.Message) bool {
 	if m == nil {
@@ -90,10 +92,12 @@ func (q HistoryQuery) Matches(m *schema.Message) bool {
 type HistoryPage struct {
 	// Messages 按写入顺序（旧在前）。
 	Messages []*schema.Message
+	// VerifiedBoundaries 将本页已确认的压缩边界下标映射到该行游标。普通记录、旧边界及其副本没有条目。
+	VerifiedBoundaries map[int]HistoryCursor
 	// Start 是 Messages[0] 在会话里的位置——拿它当下一次的 [HistoryQuery.Before]（过滤条件不变）就接着往前读。
 	// Messages 为空时为空串。
 	Start HistoryCursor
-	// More 报 Start 之前还有没有更早的（满足过滤条件的）消息。
+	// More 报本次查询的区间内，Start 之前是否还有符合过滤条件的消息。
 	More bool
 }
 
@@ -235,12 +239,12 @@ var errHistoryCursorStuck = fmt.Errorf("history: backend reported More but the c
 // 返回的记录再按 filter 核一遍，不满足的不交给 visit：后端没实现过滤条件时（照旧接口写的，新字段被忽略），
 // 框架拿到的是整页原样——不核的话「这个任务里记过这条没有」把任何一条记录都当命中，每条输入都判成记过、一条
 // 不记。核了之后只是慢（按条件查退化成往前翻整场会话），并告警一次。
-func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, firstPage int, grow bool, visit func(m *schema.Message) bool, afterPage func() bool) error {
+func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, firstPage int, grow bool, visit func(m *schema.Message, boundaryCursor HistoryCursor) bool, afterPage func() bool) error {
 	if firstPage < historyPageMin {
 		firstPage = historyPageMin
 	}
 	filtered := filter.MessageID != "" || filter.Task != "" || filter.Agent != ""
-	before := HistoryCursor("")
+	before := filter.Before
 	size := firstPage
 	for {
 		q := filter
@@ -258,7 +262,7 @@ func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, fi
 				warnUnfilteredHistoryBackend(ctx, s.store)
 				continue
 			}
-			if visit(m) {
+			if visit(m, page.VerifiedBoundaries[i]) {
 				return nil
 			}
 		}
@@ -324,7 +328,9 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 	if !ok {
 		return nil, false
 	}
-	var rev []*schema.Message     // 新 → 旧
+	var rev []*schema.Message // 新 → 旧
+	trustBoundaries := HistoryTailAppenderFor(src.store) != nil
+	var baseCursor HistoryCursor
 	var base []*schema.Message    // 遇到的本 agent、同视图的压缩边界里的替代历史
 	var callers []*schema.Message // 写进历史层的前文（新 → 旧），见 callerFirst
 	counted := 0
@@ -341,14 +347,12 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 	} else {
 		seenInputs = make(map[string]struct{})
 	}
-	err := src.scanBackward(ctx, filter, first, true, func(m *schema.Message) bool {
+	err := src.scanBackward(ctx, filter, first, true, func(m *schema.Message, boundaryCursor HistoryCursor) bool {
 		if isCompactionBoundary(m) {
-			// 本 agent、同视图的最新一条边界：它之前的都已由它的替代历史代表，停。别的 agent 的、别的视图
-			// 的，或者解不出来的，当它不存在（见 compaction_boundary.go）。边界本身不是谁说的话，不进任何
-			// 视图——这里是唯一一处把它挡在视图外的地方。
-			if owner, _ := m.Annotations[HistoryAgentAnnotation].(string); owner == ownerAgentName {
+			// 位置证明、归属、视图与内容都成立才可停止。所有边界记录都从普通对话中过滤。
+			if owner, _ := m.Annotations[HistoryAgentAnnotation].(string); trustBoundaries && boundaryCursor != "" && owner == ownerAgentName {
 				if r, ok := decodeCompactionBoundary(m, mode); ok {
-					base = r
+					base, baseCursor = r, boundaryCursor
 					return true
 				}
 			}
@@ -383,19 +387,14 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			"key", src.key.String(), "err", err)
 		return nil, false
 	}
-	if base != nil {
-		// 前文已在边界的替代历史里（摘要那一刻它在消息流里），边界之后读到的只可能是并发写入器晚写的重复
-		return append(base, reversed(rev)...), true
-	}
 	if satisfied {
 		// 前文是这场对话最早的记录，排在视图最前：这一段已经读够、截断会把它们连同更早的一起截掉
 		return reversed(rev), true
 	}
 	if mode == HandoffHistorySelfOnly {
-		// 按归属读时前文不在里面（它的归属是调用方）。这一段没读够说明截断留得下它们，另按前文的归属查一次——
-		// 只取回前文那几条，跟会话多长无关（见 callerHistoryOwner）
+		// 调用方前文有独立归属。只取边界后追加的前文；没有边界时查整场。
 		callers = callers[:0]
-		err = src.scanBackward(ctx, HistoryQuery{Agent: callerHistoryOwner}, historyPageMin, true, func(m *schema.Message) bool {
+		err = src.scanBackward(ctx, HistoryQuery{Agent: callerHistoryOwner, After: baseCursor}, historyPageMin, true, func(m *schema.Message, _ HistoryCursor) bool {
 			if isCallerHistory(m) {
 				callers = append(callers, m)
 			}
@@ -407,7 +406,43 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			return nil, false
 		}
 	}
+	if base != nil {
+		if len(callers) != 0 {
+			// 并发 seed 或导入的前文可能位于边界之后。按原有前文顺序合并，同 ID 留最早一份。
+			fresh, err := src.callersAfterBoundary(ctx, callers, baseCursor)
+			if err != nil {
+				slog.WarnContext(ctx, "agent_v2: 核对边界之后的调用方前文失败，本轮回落到 session events", "key", src.key.String(), "err", err)
+				return nil, false
+			}
+			if len(fresh) > 0 {
+				base = callerFirst(append(base, fresh...), func(m *schema.Message) *schema.Message { return m })
+			}
+		}
+		return append(base, reversed(rev)...), true
+	}
 	return append(dedupCallers(reversed(callers)), reversed(rev)...), true
+}
+
+// callersAfterBoundary 排除已进入摘要的前文副本。调用方的前文按 ID 去重，其他历史记录允许重复。
+func (s historySource) callersAfterBoundary(ctx context.Context, reversedCallers []*schema.Message, boundary HistoryCursor) ([]*schema.Message, error) {
+	callers := dedupCallers(reversed(reversedCallers))
+	fresh := callers[:0]
+	for _, m := range callers {
+		found := false
+		if m.ID != "" {
+			q := HistoryQuery{Before: boundary, Agent: callerHistoryOwner, MessageID: m.ID}
+			if err := s.scanBackward(ctx, q, historyPageMin, false, func(prior *schema.Message, _ HistoryCursor) bool {
+				found = isCallerHistory(prior)
+				return found
+			}, nil); err != nil {
+				return nil, err
+			}
+		}
+		if !found {
+			fresh = append(fresh, m)
+		}
+	}
+	return fresh, nil
 }
 
 // dedupHandoffInputs 在会话事件回退及拼接历史边界后应用共享投影。
@@ -553,7 +588,7 @@ func findHistory(ctx context.Context, hc *historyConfig, q HistoryQuery, own boo
 		q.Task = src.task
 	}
 	hit := false
-	if err := src.scanBackward(ctx, q, historyPageMin, true, func(m *schema.Message) bool {
+	if err := src.scanBackward(ctx, q, historyPageMin, true, func(m *schema.Message, _ HistoryCursor) bool {
 		hit = match(m)
 		return hit
 	}, nil); err != nil {

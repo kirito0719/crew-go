@@ -1,6 +1,6 @@
 # crew-go 问题清单（v1 时代历史 ISSUE + v2 ISSUE-73 起）
 
-当前状态见本页活跃补充、[优先级清单](../code/todo.md) 和 [ISSUE-01 至 ISSUE-99 逐条核验](../code/backlog-audit.md)。本页保留原始题目、实施经过与历史链接。
+当前状态见本页 v2 索引、[优先级清单](../code/todo.md) 和 [ISSUE-01 至 ISSUE-99 逐条核验](../code/backlog-audit.md)。本页保留原始题目、实施经过与历史链接。
 
 > ⚠️ **历史 ISSUE 集合**：本目录 ISSUE-40~72 + 本清单本身都是 v1 时代
 > （`agent/` + `compose/`，GraphState-based）的问题跟踪。Stage 7 后 v1 已删，
@@ -12,14 +12,11 @@
 > **当初为什么转 channel-based** 看 [`../v2/why-channel-based.md`](../v2/why-channel-based.md)
 > （本目录中很多 ISSUE 最终被 channel-based 重设计自然解决，详见该文档"实际收益验证"表）。
 
-## 活跃补充
-
-- [ISSUE-100：并发任务的历史压缩边界缺少源水位](issue-100-history-compaction-concurrent.md)，待决。ContextRecovery 不新增此类发布路径，既有 AutoCompact 的并发边界仍需定义源覆盖范围。
-
 ## v2 期 ISSUE 索引（73+）
 
 | ISSUE | 状态 | 主题 | 文件 |
 |---|---|---|---|
+| **ISSUE-100** | 已修复 | AutoCompact 并发历史边界仅覆盖已确认的前缀 | [并发时序与验证](issue-100-history-compaction-concurrent.md) |
 | **ISSUE-73** | 主体已关闭，文档余项归中心清单 | v2 文档 audit 跟踪 | [issue-73-v2-doc-audit-tracking.md](issue-73-v2-doc-audit-tracking.md) |
 | **ISSUE-74** | ✅ 已修（2026-05-14）| BasicAgent buildInitialMessages preamble 阶段 InterruptError 不存 cp（R25 audit HIGH-2 发现，方案 A preamble 节点化 6 step 落地）| [issue-74-preamble-hitl-cp-gap.md](issue-74-preamble-hitl-cp-gap.md) |
 | **ISSUE-75** | ✅ 已修（2026-05-15）| BasicAgent commitFinal postamble 阶段 InterruptError 后 cp 已 cleanup（R27a audit HIGH-1 发现）—— 方案 A postamble 节点化落地（与 ISSUE-74 完全对称）：commitFinal 迁到 graph 末段独立 postamble 节点，抛 Interrupt 时 cleanupOnSuccess 不触发 cp 保留供 Resume | [issue-75-postamble-hitl-cp-gap.md](issue-75-postamble-hitl-cp-gap.md) |

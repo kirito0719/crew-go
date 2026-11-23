@@ -169,7 +169,7 @@ func newSharedApproval(t *testing.T, backend sharedApprovalBackend) sharedApprov
 	ctx = compose_v2.WithThreadIDCtx(ctx, key.ConvID)
 	db, cp, history := backend.open(t)
 	if backend.prefix != "" {
-		dropSQLTestTablesOnCleanup(t, db, backend.prefix+"_cp_task_lease", backend.prefix+"_cp", backend.prefix+"_history")
+		dropSQLTestTablesOnCleanup(t, db, backend.prefix+"_cp_task_lease", backend.prefix+"_cp", backend.prefix+"_history_writer", backend.prefix+"_history")
 	}
 	if err := cp.Setup(ctx); err != nil {
 		t.Fatal(err)

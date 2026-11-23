@@ -94,6 +94,6 @@ go test ./agent_v2 -run '^TestContextRecovery' -count=1
 
 覆盖生产 BasicAgent 的大工具结果、HITL 与 Resume、工具配对和原历史保留；真实 Loop 覆盖跨轮稳定寻址。内部回归验证写入失败、受保护消息、待答调用、分页、检索以及 owner、会话和成员位置隔离。
 
-单独启用本能力不发布跨 Run 的历史压缩边界：历史快照可能遗漏生成期间另一个任务的追加。已有 AutoCompact 的历史边界仍按原契约工作，两者同时启用时也受该契约约束。
+ContextRecovery 的折叠备忘随本次 Run 保存。单独启用时，下一次 Run 从历史重建视图。两者同时启用时，只有实际完成的 AutoCompact 摘要可以发布跨 Run 边界，且须由后端确认读取与写入覆盖同一连续前缀。[并发历史边界](../issue/issue-100-history-compaction-concurrent.md)
 
 相关设计见[上下文压缩](context-compaction.md)、[Store](store.md)及[三方决策记录](../description/three-way-comparison/context-compaction.md#2026-11-23可取回的折叠视图)。
