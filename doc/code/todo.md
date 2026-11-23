@@ -4,7 +4,7 @@
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **42 项**。P1 **0**、P2 **4**、P3 **38**。缺陷 **0**、能力缺口 **1**、待决 **25**、验收 **16**。
+共 **41 项**。P1 **0**、P2 **3**、P3 **38**。缺陷 **0**、能力缺口 **1**、待决 **25**、验收 **15**。
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -19,7 +19,6 @@
 | --- | --- | --- | --- |
 | A02 | 验收 | 发版候选 CI 与存档升级 | 收集发布 SHA 对应的 PostgreSQL/MySQL CI 结果。在实际启用的后端验证旧挂起档、迁移与回退。共用存档的互斥和跨副本恢复验收暂缓。 [CI](../../.gitlab-ci.yml) · [升级说明](../release/next.md) |
 | A03 | 验收 | 路由模型接管门槛 | 仓内已有真服务报告与按输入、配置指纹做的离线回放。用当前业务的脱敏样本、人工标签及候选模型结果确定错路由率、承接率和端到端 P95 门槛。 [历史实测](../../example/decision/routing_eval/REPORT.md) · [接入和评测](../v2/route-decider.md) · [回放测试](../../example/decision/routing_eval/replay_test.go) |
-| A04 | 验收 | OpenAI 真模型流式和工具调用 | Chat Completions 和 Responses 各有流式与工具调用冒烟，共四个独立用例。有 `OPENAI_API_KEY` 时收集四项结果。 [冒烟测试](../../example/model/openai_smoke/openai_smoke_test.go) |
 | A05 | 验收 | Qwen 真模型链路和 A2A | 用现有 `llm_smoke` 验流式 artifact、服务端 HITL 和 Resume。按发布范围覆盖编排矩阵、Skill Action、工具审批与存档 durability。依赖 `QWEN_API_KEY`。 [冒烟命令](../description/smoke-test-recipes.md) |
 
 ## P3 · 窄路径、扩展与设计决策
@@ -67,6 +66,7 @@
 
 ## 已关闭及归并去向
 
+- **A04 已完成。** 2026-11-18 使用 `gpt-5.4-mini` 验收 Chat Completions 和 Responses，两种 API 的流式与工具调用共四项均通过。 [实测结果](../description/smoke-test-recipes.md#2026-11-18-实测结果)
 - **AgentDock 对照发现的七项缺陷已修。** 涵盖同存档实例互斥、Plan Web 断线、同批检索（Q26）、A2A 补答、后台结果、同名调用统计和 Redis 空 namespace（Q17 的子项）。 [逐项回归](backlog-audit.md#2026-11-20-agentdock-对照修复)
 
 - **C17 已实现。** 分类、采样路由、评估和反馈可按模型用途分组，结构化请求在 chat span 记录输出类型。回归覆盖同名模型、推理失败、原生格式、框架 schema 及业务同名工具。 [可观测性](../v2/observability.md#23-属性) · [跨层回归](../../observability/inference_test.go)
@@ -115,4 +115,4 @@
 - **D04、D09 已修。** Redis 清档复用已有权限并在写入前完成核对。AG-UI 和 A2A 共用运行结果分类，分别返回协议错误码与安全正文。 [复核台账](backlog-audit.md#最近复审发布与设计入口)
 - OTel 错误正文脱敏与截断、fallback 首片段前切换、显式后台子 Agent 的跨进程恢复、离线路由回放和 PostgreSQL/MySQL CI 接入均有源码与回归依据。目标 CI 和业务数据的验收仍在 A02、A03。 [关闭依据](backlog-audit.md#最近复审发布与设计入口)
 - **A01 已关闭。** AG-UI 展示定稿、AutoCompact 答复归属和摘要审批视图的合并态跨层回归通过。旧存档首次续跑遇到可重试错误后仍能继续，摘要按新问题重新确认，业务答复继续按原 ID 使用。四模块 `make test` 和 `make cover` 通过，核心包合并覆盖率 88.5%。 [验证记录](backlog-audit.md#最近复审发布与设计入口) · [升级约定](../release/next.md)
-- ISSUE-48 与 ISSUE-64 同属子图接入。ISSUE-52 的外部测试归 A02、A04–A06。ISSUE-93、97、98 和 99 的现存范围及去向见[编号台账](backlog-audit.md#issue-6599-逐号核验)。
+- ISSUE-48 与 ISSUE-64 同属子图接入。ISSUE-52 相关的 OpenAI 验收已随 A04 完成，其他外部测试归 A02、A05、A06。ISSUE-93、97、98 和 99 的现存范围及去向见[编号台账](backlog-audit.md#issue-6599-逐号核验)。

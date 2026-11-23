@@ -4,7 +4,7 @@
 
 [现行优先级清单](todo.md)是选择下一批的入口。这里保留 ISSUE-01 至 ISSUE-99、同编号专题、最近复审及历史 TODO 的逐项证据。历史 TODO 的 490 条含主表 327 行、优先级快照 48 项，以及发布、测试、文档和其他章节 115 项。同一事项在不同快照里的记录仍可回查。行号对应 [TODO 快照](todo-history.md)或 `e185749` 的文件。
 
-**证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，目标 CI、真实 provider 和业务数据验收见 A02–A07。
+**证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，剩余目标 CI、真实 provider 和业务数据验收见 A02、A03、A05–A07。
 
 ## 2026-11-17 合入 test 后的核验
 
@@ -67,7 +67,7 @@
 | OTel `Status.Message` 原查漏 | 关闭 | `observability/handle.go:255` 先脱敏再按 1024 字符截断，同一正文进入 status/exception。当前 `TestErrorMessage_RedactedBeforeTruncated` 同时检验两个出口。 |
 | fallback 首个可见片段前切换 / 原待办 | 关闭 | `fallback/stream.go` 已调用 `StreamReader.ReadAhead`。`schema/stream_read_ahead_test.go` 验证预读与流终态，fallback 相关测试覆盖 429 和切换。 |
 | Postgres、MySQL 真实数据库 | CI 已接入、本机有证据，目标验收 A02 | `.gitlab-ci.yml` 的两个 job、`sql/conformance_integration_test.go` 和 `e185749` 提交中记载的真库结果。目标 pipeline 结果待收集。 |
-| OpenAI、Qwen、Anthropic 真模型 | 实现入口存在，验收 A04–A06 | OpenAI 双 API 四项冒烟，Qwen A2A 真实冒烟和 Anthropic 独立服务端用例可从 `doc/description/smoke-test-recipes.md` 找到。本轮 default suite 未调用真实 provider。 |
+| OpenAI、Qwen、Anthropic 真模型 | A04 已完成，A05、A06 待验收 | 2026-11-18 OpenAI 流式与工具调用四项通过。待验收项为 Qwen A2A 与 Anthropic 服务端用例。 [OpenAI 实测结果](../description/smoke-test-recipes.md#2026-11-18-实测结果) · [冒烟命令](../description/smoke-test-recipes.md) |
 | ISSUE-97 / 发布迁移 / ISSUE-70 | 已关闭的内置行为与验收分开 | 内置 SQL/Redis 任务租约与拒绝陈旧写入已实现。旧部署执行迁移和真实并发验收合并到 A02。外部副作用需要应用幂等。 |
 | MCP Streamable HTTP | POST、会话生命周期、C01 和 C02 已关闭 | 回归覆盖独立推送、SSE 续订及图片和音频在 BasicAgent 到模型请求间的配对。 [C01 回归](../../mcp/http_sse_test.go) · [C02 回归](../../mcp/tool_media_test.go) |
 | Sandbox 后端可替换性 | 边界待决 Q01 | `sandbox/sandbox.go` 和 `sandbox/tool_test.go` 有接口与工具适配单测，仓内未提供跨后端可复用 conformance。 |
@@ -136,7 +136,7 @@ A01 的合并态四模块默认测试和核心包覆盖率门禁均通过，合�
 | ISSUE-49 · doc/issue/issues.md:939 | 关闭，独立修补另记 | agui/handler.go、adapter.go、run_journal.go 实现 HTTP/SSE、HITL 和持久 Run 回执。agui/tool_result_once_test.go、sql/agui_cancel_session_test.go。展示副本范围修补位于本地 fb1f22e，e185749 仍待引入该修复。 |
 | ISSUE-50 · doc/issue/issues.md:728 | P0 关闭，P1 改归 ISSUE-98 | compose_v2/graph.go 的 Graph.ID 和 SaveNS 冲突守卫，TestPhase51b_GraphID_GuardOnAutoLoad / GuardOnSubgraph。线程历史由 agent_v2/history.go:85、114 提供，旧 ListByThread/LatestByThread 已删除。 |
 | ISSUE-51 · doc/issue/issues.md:710 | 关闭，#2 归 ISSUE-53，#6 随 ISSUE-40 取代 | agent_v2/basic_builder.go 的工具与模型 hook，llm_planner.go:19 的规划哨兵，graph_agent.go:227 的入口检查，StoreMemory 的错误协议。llm_planner_test.go:241、graph_agent_test.go:110、store_memory_error_propagation_test.go。 |
-| ISSUE-52 · doc/issue/issues.md:691 | 仓内关闭，外部验收见 52-A | Makefile:13–28、45，.gitlab-ci.yml:37–109，.gitlab/merge_request_templates/Default.md。OpenAI 冒烟有 integration tag。提交物存在，真实凭据和 GitLab 执行状态未查。 |
+| ISSUE-52 · doc/issue/issues.md:691 | 仓内关闭，外部验收见 52-A | Makefile:13–28、45，.gitlab-ci.yml:37–109，.gitlab/merge_request_templates/Default.md。OpenAI 冒烟有 integration tag，A04 已通过。GitLab 执行结果归 A02。 |
 | ISSUE-53 · doc/issue/issues.md:661 | 关闭，后被 ISSUE-59 替代 | agent_v2/basic_builder.go 的 preamble/model/tools/postamble 各为独立节点。BasicAgentBuilder HITL 与 hook 次数回归。旧 executeRound 已随 v1 移除。 |
 | ISSUE-54 · doc/issue/issues.md:625 | 关闭 | agent_v2/plan_agent.go:744–804、1020 在 plan 节点按真实 executed 解析本步 refs，build 节点提交输入。TestISSUE85_AuditFollowup2_HIGH1_IndexRefPreservesExplicit_TmpSubAgent / Executor。 |
 | ISSUE-55 · doc/issue/issues.md:594 | 关闭 | agent_v2/plan_agent.go:709–718 保存实际 worker Result，只有 defaultExecInputBuilder:1079 添加步骤标题。现有 ref 输入回归见 issue85_planagent_improvements_test.go，旧命名 NoPrefix 测试随 v1 删除。 |
@@ -164,7 +164,7 @@ D06 已关闭。基线 `e185749` 连续以同一指针写入 `alpha/left` 和 `b
 
 ### 52-A
 
-待外部验收。doc/code/todo.md:21–24 与 doc/release/next.md 指向 GitLab PostgreSQL/MySQL job 及真实 OpenAI 冒烟。仓内脚本、测试和 CI 定义存在，当前运行结果和凭据未核对，交给发布检查。
+OpenAI 真实服务端冒烟四项通过，A04 已完成。GitLab PostgreSQL/MySQL job 仍归 A02 发版验收。 [OpenAI 实测结果](../description/smoke-test-recipes.md#2026-11-18-实测结果) · [发版检查](../release/next.md)
 
 ### 58-A
 
@@ -307,7 +307,7 @@ D06 已关闭。基线 `e185749` 连续以同一指针写入 `alpha/left` 和 `b
 | L14 | AG-UI 轮询租约与业务任务分开存储。 共享会话 | P3 修复 | 完成 | — | 552685b。agui/shared_session.go 下补偿租约与 RunID 分域。 · 基线关联提交 552685b（fix: 修复合并复审中的取消补偿与续跑回归） · 现存入口 [doc/v2/agui.md](../../doc/v2/agui.md) · 原文溯源 552685b0（仅文档溯源） |
 | L18 | make test 四模块通过，make cover 的核心包门禁全部达标，合并覆盖率 88.5%。SQLite 回归覆盖进程退出、无 HTTP 请求时的补偿、慢工厂接管与迟到… | 验收／文档记录 | 验收记录 | — | 552685b 原有 88.5% 覆盖率报告与 SQLite 证据。本次另在 e185749 复跑四模块默认测试。 |
 | L19 | Redis 真库验证存档迁移、一致性及 AG-UI 取消补偿。PostgreSQL 和 MySQL 真库集成通过。嵌套、Plan Web mock 和 A2A HITL 冒烟通… | 验收／文档记录 | 验收记录 | — | 552685b 档案区分本地 Redis、PG/MySQL、嵌套与 SSE 冒烟。GitLab 实际 Job 见 L24/L488。 · 基线关联提交 552685b（fix: 修复合并复审中的取消补偿与续跑回归） · 原文溯源 552685b0（仅文档溯源） |
-| L23 | OpenAI 的 Chat Completions 和 Responses 已有流式与工具调用真模型用例。有 OPENAI_API_KEY 时运行并记录结果。运行入口为 go … | 验收／文档记录 | 外部验收 | A04 | 已有 Chat Completions 和 Responses 流式/工具真模型 integration 入口 example/model/openai_smoke。凭据和实际调用结果未查。 · 现存入口 [example/model/openai_smoke/openai_smoke_test.go](../../example/model/openai_smoke/openai_smoke_test.go)、[example/model/openai_smoke](../../example/model/openai_smoke) · 原文溯源 552685b0（仅文档溯源） |
+| L23 | OpenAI 的 Chat Completions 和 Responses 已有流式与工具调用真模型用例。有 OPENAI_API_KEY 时运行并记录结果。运行入口为 go … | 验收／文档记录 | 验收通过 | A04 | 2026-11-18 在 OpenAI 真实服务端以 `gpt-5.4-mini` 跑通四项。 [实测结果](../description/smoke-test-recipes.md#2026-11-18-实测结果) · [冒烟用例](../../example/model/openai_smoke/openai_smoke_test.go) · 原文溯源 552685b0（仅文档溯源） |
 | L24 | PostgreSQL / MySQL 的 GitLab Job 结果在发版验收时核对。业务路由门槛等脱敏样本与人工标注到位后复测。 发版检查 · 路由评测 | 验收／文档记录 | 外部验收 | A02、A03 | ① P1 用脱敏业务样本和人工标注复测阈值，见 L284。② P1 核对指定发布 SHA 的 PostgreSQL/MySQL GitLab Job，见 L488。 · 现存入口 [doc/release/next.md](../../doc/release/next.md)、[doc/v2/route-decider.md](../../doc/v2/route-decider.md) · 原文溯源 552685b0（仅文档溯源） |
 | L32 | OnModelEnd 原地改写未发 replacement，A2A 最终输出仍为原文 | F1 / P1 已修 | 完成 | — | e30501b/02501b4 历史审计修复。TestOnModelEnd_InPlaceRewriteKeepsStreamIdentity。 · 基线关联提交 e30501b（fix: 修复 Agent 与编排的消息归属和恢复契约）、02501b4（Merge branch 'codex/agent-orchestration-audit-fixes' into test） · 原文溯源 e30501bd（仅文档溯源） |
 | L33 | AutoCompact 摘要模型 Ask 后，答案被隔离逻辑清掉，Resume 重复提问。跨版本恢复见合并复审修复 | F2 / P2 已修 | 完成 | A01 | e30501b/02501b4 修首轮答案隔离。跨版本归属/视图绑定另见 L10/L12。 · 基线关联提交 e30501b（fix: 修复 Agent 与编排的消息归属和恢复契约）、02501b4（Merge branch 'codex/agent-orchestration-audit-fixes' into test） · 原文溯源 552685b0（仅文档溯源） |

@@ -329,3 +329,16 @@ go test -tags=integration -count=1 -v ./example/model/openai_smoke
 
 流式用例读取文本分片直到正常结束。工具用例通过 `BasicAgent` 验证实际执行一次、参数正确，
 并检查模型在最终答复中使用工具返回的校验码。
+
+### 2026-11-18 实测结果
+
+两组均使用 `gpt-5.4-mini` 调用 OpenAI，四个用例各运行一次，全部通过，套件用时 11.119 秒。每次模型请求的输出上限为 512 tokens。
+
+| API | 用例 | 结果 | 耗时 |
+| --- | --- | --- | --- |
+| Chat Completions | `TestSmoke_Stream` | 通过，收到 5 个文本分片并正常结束 | 3.02 秒 |
+| Responses | `TestSmoke_ResponsesStream` | 通过，收到 5 个文本分片并正常结束 | 2.27 秒 |
+| Chat Completions | `TestSmoke_ToolCalling` | 通过，工具执行一次，参数正确，最终答复包含工具校验码 | 3.48 秒 |
+| Responses | `TestSmoke_ResponsesToolCalling` | 通过，工具执行一次，参数正确，最终答复包含工具校验码 | 2.34 秒 |
+
+[冒烟测试源码](../../example/model/openai_smoke/openai_smoke_test.go)
