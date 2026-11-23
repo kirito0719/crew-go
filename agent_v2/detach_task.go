@@ -64,10 +64,16 @@ import (
 func DetachTask(ctx context.Context) context.Context {
 	// 所在的任务记进「这一路是从哪些任务里脱离出来的」（compose_v2.DetachedFrom）：在节点执行范围里时
 	// 引擎自己记得到；编排的 agent 级钩子跑在图外，那里的任务只有本包的任务章知道，所以显式交过去
+	trail := historyScopeTrail(ctx)
 	if from, inTask := enclosingTask(ctx); inTask {
-		return compose_v2.DetachExecutionFrom(ctx, from)
+		ctx = compose_v2.DetachExecutionFrom(ctx, from)
+	} else {
+		ctx = compose_v2.DetachExecution(ctx)
 	}
-	return compose_v2.DetachExecution(ctx)
+	if trail != "" {
+		ctx = context.WithValue(ctx, detachedHistoryScopesKey{}, trail)
+	}
+	return ctx
 }
 
 // detachedFromRunning 报 runID 是不是这一路脱离出来之前所在的任务之一（它们都还在执行）。

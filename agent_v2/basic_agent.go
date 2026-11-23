@@ -629,6 +629,7 @@ func (a *BasicAgent) runGraph(ctx context.Context, runCfg *runConfig, session *R
 	// 转交 / 路由能力：只认「这份授予的受让方就是我本人」。业务壳把 opts 原样转发给内层时
 	// 受让方仍是壳、收到的是内层 ⟹ 不匹配 ⟹ 内层连 transfer_to_agent / route_to 都没有。
 	grants := runCfg.grantsFor(a)
+	grants.handoff = grants.handoff.withinHop(ctx)
 	// 本图里的代码（工具函数、钩子）要把能力交给它调起的 agent 时经 RegrantFromNode 显式转授
 	// ——放的是收到的那份，不看 opt-in：opt-in 只管框架给本 agent 注册的那件工具。
 	ctx = withNodeGrants(ctx, grants)

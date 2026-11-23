@@ -46,7 +46,7 @@ type HistoryCursor string
 
 // HistoryQuery 圈定 [HistoryStore.Load] 读哪一段。**零值 = 整场会话。**
 //
-// 三个过滤条件（MessageID / Task / Agent）非空时都要满足（逐字节相等，判据见 [HistoryQuery.Matches]）。After / Before
+// 消息 ID（含框架批量查询的 [HistoryQuery.MessageIDs]）、Task、Agent 三类过滤条件同时生效（逐字节相等，判据见 [HistoryQuery.Matches]）。After / Before
 // 限定开区间，Limit 作用在符合条件的序列上，[HistoryPage.More] 也按满足条件的算。任务章与归属在消息的 Annotations 里（值是
 // 字符串），后端可以在写入时抽出来建索引——框架的去重只按这几个条件查、命中即停，读的量取决于后端按条件读时
 // 要碰多少条。
@@ -64,15 +64,31 @@ type HistoryQuery struct {
 	Task string
 	// Agent 非空时只返归属（Annotations[HistoryAgentAnnotation]）等于它的记录。
 	Agent string
+	ids   *historyIDBatch
 }
 
-// Matches 报 m 满不满足 q 的过滤条件（MessageID / Task / Agent；After / Before / Limit 由后端处理）。在进程里过滤的后端
+// historyIDBatch 由框架按页大小构造，查询和翻页共享同一份只读快照。
+type historyIDBatch struct {
+	values []string
+	set    map[string]bool
+}
+
+// MessageIDs 返回本次批量过滤的消息 ID 快照。非空时，后端只返回其中任一 ID 命中的记录，
+// 再与其他过滤条件取交集；分页和重复记录的语义与单 ID 查询相同。
+func (q HistoryQuery) MessageIDs() []string {
+	if q.ids == nil {
+		return nil
+	}
+	return slices.Clone(q.ids.values)
+}
+
+// Matches 报 m 满不满足 q 的过滤条件（单个或批量消息 ID、Task、Agent；After / Before / Limit 由后端处理）。在进程里过滤的后端
 // 直接用它，判据就跟框架的一致：任务章与归属按字符串比，值不是字符串的不命中；nil 不命中。
 func (q HistoryQuery) Matches(m *schema.Message) bool {
 	if m == nil {
 		return false
 	}
-	if q.MessageID != "" && m.ID != q.MessageID {
+	if (q.MessageID != "" && m.ID != q.MessageID) || (q.ids != nil && !q.ids.set[m.ID]) {
 		return false
 	}
 	if q.Task != "" {
@@ -229,7 +245,7 @@ func resolveHistorySource(ctx context.Context, hc *historyConfig) (historySource
 var errHistoryCursorStuck = fmt.Errorf("history: backend reported More but the cursor did not move")
 
 // scanBackward 从会话末尾往前一页一页读，逐条（新 → 旧）交给 visit；visit 返 true 立即停。
-// afterPage 在每页读完之后调，返 true 也停（nil 表示一直读到会话开头）。
+// afterPage 在还有前页时调用，可以收窄下一页的过滤条件，返回 true 时停止翻页。
 //
 // 后端违约（报 More 却给出空页或原地不动的游标）时返错，不死循环。
 //
@@ -239,11 +255,11 @@ var errHistoryCursorStuck = fmt.Errorf("history: backend reported More but the c
 // 返回的记录再按 filter 核一遍，不满足的不交给 visit：后端没实现过滤条件时（照旧接口写的，新字段被忽略），
 // 框架拿到的是整页原样——不核的话「这个任务里记过这条没有」把任何一条记录都当命中，每条输入都判成记过、一条
 // 不记。核了之后只是慢（按条件查退化成往前翻整场会话），并告警一次。
-func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, firstPage int, grow bool, visit func(m *schema.Message, boundaryCursor HistoryCursor) bool, afterPage func() bool) error {
+func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, firstPage int, grow bool, visit func(m *schema.Message, boundaryCursor HistoryCursor) bool, afterPage func(*HistoryQuery) bool) error {
 	if firstPage < historyPageMin {
 		firstPage = historyPageMin
 	}
-	filtered := filter.MessageID != "" || filter.Task != "" || filter.Agent != ""
+	filtered := filter.ids != nil || filter.MessageID != "" || filter.Task != "" || filter.Agent != ""
 	before := filter.Before
 	size := firstPage
 	for {
@@ -272,7 +288,7 @@ func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, fi
 		if len(page.Messages) == 0 || page.Start == "" || page.Start == before {
 			return errHistoryCursorStuck
 		}
-		if afterPage != nil && afterPage() {
+		if afterPage != nil && afterPage(&filter) {
 			return nil
 		}
 		before = page.Start
@@ -292,9 +308,7 @@ func warnUnfilteredHistoryBackend(ctx context.Context, hs HistoryStore) {
 	if unfilteredBackendWarned.Swap(true) {
 		return
 	}
-	slog.WarnContext(ctx, "agent_v2: 会话历史后端没按 HistoryQuery 的过滤条件（MessageID / Task / Agent）读，"+
-		"框架逐条核对、结果照旧正确，但按条件查退化成往前翻整场会话——后端请实现过滤条件"+
-		"（跑 agent_v2/history_conformance.RunHistoryStoreTests 验证）",
+	slog.WarnContext(ctx, "agent_v2: 会话历史后端没按 HistoryQuery 的过滤条件读取消息 ID（含批量）、任务或归属，框架将逐条核对并按需向前翻页",
 		"backend", fmt.Sprintf("%T", hs))
 }
 
@@ -372,7 +386,7 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			counted++
 		}
 		return false
-	}, func() bool {
+	}, func(_ *HistoryQuery) bool {
 		if need <= 0 || counted <= need {
 			return false
 		}
@@ -426,19 +440,48 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 // callersAfterBoundary 排除已进入摘要的前文副本。调用方的前文按 ID 去重，其他历史记录允许重复。
 func (s historySource) callersAfterBoundary(ctx context.Context, reversedCallers []*schema.Message, boundary HistoryCursor) ([]*schema.Message, error) {
 	callers := dedupCallers(reversed(reversedCallers))
+	keys := make([]string, 0, len(callers))
+	for _, m := range callers {
+		if m.ID != "" {
+			keys = append(keys, m.ID)
+		}
+	}
+	covered := make(map[string]bool)
+	for batch := range slices.Chunk(keys, historyPageMin) {
+		ids := &historyIDBatch{values: batch, set: make(map[string]bool, len(batch))}
+		for _, id := range batch {
+			ids.set[id] = true
+		}
+		remaining := len(ids.values)
+		q := HistoryQuery{Before: boundary, Agent: callerHistoryOwner, ids: ids}
+		err := s.scanBackward(ctx, q, historyPageMin, true, func(prior *schema.Message, _ HistoryCursor) bool {
+			if isCallerHistory(prior) && !covered[prior.ID] {
+				covered[prior.ID] = true
+				remaining--
+			}
+			return remaining == 0
+		}, func(next *HistoryQuery) bool {
+			if remaining == len(next.ids.values) {
+				return false
+			}
+			// 已经找到的 ID 可能还有大量更早的重复行。下一页只查余下 ID，保留上一页的查询快照。
+			pending := &historyIDBatch{set: make(map[string]bool, remaining)}
+			for _, id := range next.ids.values {
+				if !covered[id] {
+					pending.values = append(pending.values, id)
+					pending.set[id] = true
+				}
+			}
+			next.ids = pending
+			return false
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	fresh := callers[:0]
 	for _, m := range callers {
-		found := false
-		if m.ID != "" {
-			q := HistoryQuery{Before: boundary, Agent: callerHistoryOwner, MessageID: m.ID}
-			if err := s.scanBackward(ctx, q, historyPageMin, false, func(prior *schema.Message, _ HistoryCursor) bool {
-				found = isCallerHistory(prior)
-				return found
-			}, nil); err != nil {
-				return nil, err
-			}
-		}
-		if !found {
+		if !covered[m.ID] {
 			fresh = append(fresh, m)
 		}
 	}

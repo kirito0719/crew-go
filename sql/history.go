@@ -25,7 +25,7 @@ const DefaultHistoryTable = "crew_history"
 // 存法：每条消息一行，整条消息的 JSON 存进二进制列；行序 = 自增主键序 = 写入序，Load 按它回放，游标
 // （agent_v2.HistoryCursor）就是这一行的 id。owner 与 conv_id 分两列存、不拼串（拼串会让 {acme/eu, c-1} 与
 // {acme, eu/c-1} 撞成同一个会话），按字节比较（PG `COLLATE "C"`、MySQL VARBINARY、SQLite 默认 BINARY）。
-// HistoryQuery 的三个过滤条件（消息 ID、任务章、归属）在写入时从消息上抽成三列，Load 在库里按它们过滤，
+// HistoryQuery 的过滤条件（单个或批量消息 ID、任务章、归属）在写入时从消息上抽成三列，Load 在库里按它们过滤，
 // 不在进程里逐条解码再筛；标注的值不是字符串时那一列存空串，跟 agent_v2.HistoryQuery.Matches 一样不命中
 // （过滤条件非空才生效）。
 //
@@ -247,6 +247,14 @@ func (h *HistoryStore) Load(ctx context.Context, key agent_v2.HistoryKey, q agen
 	}
 	if q.MessageID != "" {
 		cond("msg_id", q.MessageID)
+	}
+	if ids := q.MessageIDs(); len(ids) > 0 {
+		params := make([]string, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, id)
+			params = append(params, ph(len(args)))
+		}
+		where.WriteString(" AND msg_id IN (" + strings.Join(params, ",") + ")")
 	}
 	if q.Task != "" {
 		cond("task", q.Task)

@@ -660,6 +660,8 @@ compose_v2.Checkpointer in ctx`，普通 error 非哨兵）。有 checkpointer �
 「有种子 + 存档命中」是**正常形态**（崩溃恢复就长这样），引擎不会因此报错。想开新任务传
 `WithFreshRun()`。
 
+需要核对恢复来源时，在目标图的 `compose_v2.Run` 上设置 `compose_v2.WithRestoreSource`。图载入源快照并完成所需准入后、执行恢复节点前，回调收到该只读快照。新开任务或存档被拒时，回调次数为零。嵌套调用可以各自设置观察者。[恢复入口](../../compose_v2/graph_loop.go)
+
 ### 持久续跑准入
 
 入口完成存档身份校验及恢复准备后，`ClaimResume` 在图节点执行前原子提交 `CPStatusResuming` 和新世代。Sync 和 Async 写出的续跑过程档沿用该状态，包括同一续跑范围内新启动的子图。正常退出时提交新挂起档、失败档或封存标记，也可以成功条件清理已完成的存档。

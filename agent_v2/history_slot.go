@@ -74,11 +74,14 @@ package agent_v2
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -130,56 +133,134 @@ func pushHistorySegment(ctx context.Context, segment historySegment) context.Con
 	if parent != "" {
 		name = parent + "/" + name
 	}
-	ctx = openHistoryReceipt(ctx)
-	return context.WithValue(ctx, historySlotCtxKey{}, name)
+	return openHistoryReceipt(context.WithValue(ctx, historySlotCtxKey{}, name))
 }
 
-// historyReceipt 记「从声明它的那一层往下，实际产生过多少条历史记录」。
-//
-// # 为什么不能用「位置有没有被标记过」
-//
-// 边界补记存在的唯一理由是**这一步的执行体可能什么都没记**（远程 agent / 自研 agent /
-// 适配别的框架的壳，它们连历史层的存在都不知道）。原来的判据是「位置 X 有没有被标记过」，
-// 而位置在**两个方向上同时是错的**：
-//
-//   - **太细**：叶子记在 `par/br1/s1`，中间那层的边界查的是它自己那一段，精确匹配对不上
-//     → 同一条产出记两遍 → 第二份归属不同，读回时被判成「别人说的」走 Rewrite 变成
-//     `For context: [X] said:`。模型会以为另一个 agent 独立得出了相同结论——**污染比丢失重**。
-//   - **太粗**：Loop 的多轮、Handoff 的多跳共用同一个位置，第 1 轮标记之后第 2 轮起全被
-//     挡掉 → 中间轮次的产出静默丢。
-//
-// 回执问的是另一个问题：**这次调用的范围内有没有真的产生记录**。它是运行期观测，不是静态
-// 结构判断——这点很关键：`Agent` 是开放接口，业务能塞任何实现进编排，任何「框架静态遍历
-// 编排树」的方案都存在探不到的层。回执**不遍历任何东西**，业务实现什么都没记就是计数为 0，
-// 而那恰恰是它**应该被补记**的正确答案。
-//
-// # 为什么要沿父链上溯
-//
-// 外层问的是「我底下有没有发生过」，不是「紧邻我这一层有没有」。`Par(Seq(Basic))` 里叶子
-// 记完，Sequential 和 Parallel 两层的边界都该判「记过了」。
-//
-// # 并发
-//
-// 每条分支各自派生 ctx ⟹ 各自拿到独立的回执，扇出时分支之间互不干扰。计数用 atomic：
-// 同一张回执会被多个后代分支并发 bump。
+// historyReceipt 属于这一次成员调用。写入方把具体消息登记到本层及祖先层，兄弟调用各有自己的回执。
+// trail 保存跨 Resume 稳定的调用路径，历史行据此识别先前已经完成的子调用。
 type historyReceipt struct {
-	parent *historyReceipt
-	n      atomic.Int64
+	parent   *historyReceipt
+	n        atomic.Int64
+	outputs  sync.Map // historyOutputKey → struct{}
+	trail    string
+	restored sync.Map // 本次成员调用实际恢复过的 *compose_v2.Checkpoint。
+	replayed sync.Map // 已实际重放的子调用回复。
 }
 
-// bump 记一笔，并沿父链一路上报。
-func (r *historyReceipt) bump() {
-	for cur := r; cur != nil; cur = cur.parent {
-		cur.n.Add(1)
+// historyOutputKey 同时核对身份与正文。无 ID 的消息仅在同次调用内可按对象辨认。
+type historyOutputKey struct {
+	id        string
+	anonymous *schema.Message
+	payload   string
+}
+
+func historyOutputOf(m *schema.Message) historyOutputKey {
+	if m == nil {
+		return historyOutputKey{}
 	}
+	body := *m
+	// 历史层盖章前后的消息具有同样的业务内容，业务自己修改的标注仍属于产出。
+	body.Annotations = maps.Clone(m.Annotations)
+	for _, k := range []string{HistoryAgentAnnotation, HistoryAgentDisplayAnnotation, HistoryTaskAnnotation,
+		historyOriginAnnotation, historyScopeAnnotation, hostedHistoryTaskAnnotation, CallerHistoryAnnotation} {
+		delete(body.Annotations, k)
+	}
+	key := historyOutputKey{id: m.ID, payload: inputDigest(&body)}
+	if m.ID == "" {
+		key.anonymous = m
+	}
+	return key
+}
+
+const historyScopeAnnotation = "crew_history_scopes"
+
+type detachedHistoryScopesKey struct{}
+
+func (detachedHistoryScopesKey) ExecutionState() {}
+
+func historyScopeTrail(ctx context.Context) string {
+	if r := historyReceiptFrom(ctx); r != nil {
+		return r.trail
+	}
+	trail, _ := ctx.Value(detachedHistoryScopesKey{}).(string)
+	return trail
 }
 
 type historyReceiptCtxKey struct{}
 
 // openHistoryReceipt 开一张新回执，父指向当前这张。
 func openHistoryReceipt(ctx context.Context) context.Context {
-	r := &historyReceipt{parent: historyReceiptFrom(ctx)}
+	// namespace 区分同一位置的不同轮或调用，各维按原始字节加长度编码。
+	task, ns := currentWriterTask(ctx), compose_v2.GetGraphNS(ctx)
+	identity := identityString(task, HistorySlot(ctx), ns)
+	trail := historyScopeTrail(ctx) + identityHash(identity) + "/"
+	if ns != "" {
+		trail += historyExecutionToken(task, ns)
+	}
+	parent := historyReceiptFrom(ctx)
+	r := &historyReceipt{parent: parent, trail: trail}
 	return context.WithValue(ctx, historyReceiptCtxKey{}, r)
+}
+
+// withHistoryRestoreSource 保留图实际接管的只读源快照。只有查到匹配的旧历史行时才解码消息。
+func withHistoryRestoreSource(ctx context.Context, opts []compose_v2.RunOption) []compose_v2.RunOption {
+	r := historyReceiptFrom(ctx)
+	if r == nil || historyWriterFrom(ctx) == nil {
+		return opts
+	}
+	return append(opts, compose_v2.WithRestoreSource(func(cp *compose_v2.Checkpoint) { r.restored.Store(cp, struct{}{}) }))
+}
+
+// retainedOutput 检查当前图从老存档恢复的消息以及本次重放的子调用结果。两者都须由持久历史印证。
+func (r *historyReceipt) retainedOutput(key historyOutputKey) bool {
+	if r == nil {
+		return false
+	}
+	if _, ok := r.replayed.Load(key); ok {
+		return true
+	}
+	found := false
+	r.restored.Range(func(source, _ any) bool {
+		found = checkpointHasHistoryOutput(source.(*compose_v2.Checkpoint), key)
+		return !found
+	})
+	return found
+}
+
+func checkpointHasHistoryOutput(cp *compose_v2.Checkpoint, key historyOutputKey) bool {
+	matches := func(m *schema.Message) bool { return m != nil && m.ID == key.id && historyOutputOf(m) == key }
+	for _, v := range cp.Channels {
+		typ, _ := compose_v2.LookupType(v.Type)
+		switch typ {
+		case reflect.TypeFor[*schema.Message]():
+			var m *schema.Message
+			if json.Unmarshal(v.Data, &m) == nil && matches(m) {
+				return true
+			}
+		case reflect.TypeFor[[]*schema.Message]():
+			var msgs []*schema.Message
+			if json.Unmarshal(v.Data, &msgs) == nil && slices.ContainsFunc(msgs, matches) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func noteReplayedHistoryOutput(ctx context.Context, final *schema.Message) {
+	r := historyReceiptFrom(ctx)
+	if r == nil || final == nil || final.ID == "" || historyWriterFrom(ctx) == nil {
+		return
+	}
+	key := historyOutputOf(final)
+	for ; r != nil; r = r.parent {
+		r.replayed.Store(key, struct{}{})
+	}
+}
+
+// historyExecutionToken 让直接按 namespace 续子图的调用找回原执行，调用方无需重建父级的历史位置路径。
+func historyExecutionToken(task, ns string) string {
+	return "@" + identityHash(identityString(task, ns)) + "/"
 }
 
 func historyReceiptFrom(ctx context.Context) *historyReceipt {
@@ -187,10 +268,23 @@ func historyReceiptFrom(ctx context.Context) *historyReceipt {
 	return r
 }
 
-// bumpHistoryReceipt 在实际写入历史时记一笔。没有回执（顶层直接跑）时是 no-op。
-func bumpHistoryReceipt(ctx context.Context) {
-	if r := historyReceiptFrom(ctx); r != nil {
-		r.bump()
+// registerHistoryOutputs 只登记本次实际写入或重放的消息。输入侧另用范围计数判断成员是否接管历史。
+func registerHistoryOutputs(ctx context.Context, msgs []*schema.Message) {
+	r := historyReceiptFrom(ctx)
+	if r == nil {
+		return
+	}
+	for cur := r; cur != nil; cur = cur.parent {
+		cur.n.Add(1)
+	}
+	for _, m := range msgs {
+		if m == nil || isDerivedInput(m) {
+			continue
+		}
+		key := historyOutputOf(m)
+		for cur := r; cur != nil; cur = cur.parent {
+			cur.outputs.Store(key, struct{}{})
+		}
 	}
 }
 
@@ -280,12 +374,8 @@ func settleHistoryOnPause(ctx context.Context, agentName string, input *schema.M
 //     `OnAgentStart` 是 [消费] 档，业务可以在那儿把消息整条换掉（脱敏是 CLAUDE.md 举的
 //     例子），叶子记的是脱敏版，而边界握着的是**闭包里改写之前**那条、带原文——按范围
 //     判就不会写进去。
-//   - **产出**问「**这次调用范围内**有没有人记过这条消息」（范围 + 全局登记表按指针）。
-//     透传上来的（执行体记过的同一条）跳过；执行体**加工过**再返回的是新的一条，照记
-//     ——不然「既委派又加工」的执行体（业务 NodeFunc 拼接多路结果是常规用法）产出会丢。
-//     **范围这道前提不能省**：执行体可以每轮返回同一个消息对象（`var okMsg = ...` 在 Go
-//     里是很自然的写法），只问全局登记表就把「同一个对象」当成「同一条产出」，Loop 第 2
-//     轮起静默丢——正是这套改动要消灭的形状换了个触发条件。
+//   - **产出**按本次调用回执里的消息身份和内容核对，跨续跑按实际输入或已完成后代的历史核对。
+//     兄弟收到独立输入时，各自拥有自己返回的回复；成员改写输入的正文、工具数据或业务标注时，改写后的回复另记。
 //
 // 判据都不看 agent 类型——业务自研的 agent 只要自己接了历史层照样算「记过了」，不会被
 // 当外部 agent 补一遍。
@@ -314,7 +404,7 @@ func settleHistoryOnPause(ctx context.Context, agentName string, input *schema.M
 //
 // input 为 nil 或 final 为 nil 时各自跳过（有什么记什么）。
 func settleHistorySlot(ctx context.Context, agentName string, input, final *schema.Message) {
-	settleHistoryAt(ctx, HistorySlot(ctx), agentName, gateExtentProduced, input, final)
+	settleHistoryAt(ctx, HistorySlot(ctx), agentName, gateExtentProduced, input, final, true)
 }
 
 // settleHistoryTopLevel 让**顶层执行体自己**结算边界，位置取自己的名字。
@@ -336,7 +426,7 @@ func settleHistorySlot(ctx context.Context, agentName string, input, final *sche
 // 所以位置只传给这一次结算（做认领的流键 + 过守卫），不进 ctx。归属仍按
 // `historyOwner` 的既定回落取 agentName，后代归属逐字不变。
 func settleHistoryTopLevel(ctx context.Context, agentName string, input, final *schema.Message) {
-	settleHistoryAt(ctx, string(namedHistorySegment(agentName)), agentName, gateInputRecorded, input, final)
+	settleHistoryAt(ctx, string(namedHistorySegment(agentName)), agentName, gateInputRecorded, input, final, true)
 }
 
 // deferRootInput 让顶层执行体（GraphAgent）这次 Run 的原始输入排在这次 Run 写进历史的第一批记录前面。
@@ -363,7 +453,7 @@ func deferRootInput(ctx context.Context, agentName string, input *schema.Message
 		inputAlreadyInHistorySlot(ctx, owner, input) {
 		return
 	}
-	w.deferRoot(input, w.stamp(input, owner, agentName), owner)
+	w.deferRoot(input, w.stamp(ctx, input, owner, agentName), owner)
 }
 
 // endRootInputWindow 在顶层 GraphAgent 的图跑完时调：还没补的原始输入收回，交给出口结算（见 deferRootInput）。
@@ -398,7 +488,7 @@ const (
 )
 
 // settleHistoryAt 是上面两者的共同实现——slot 与输入闸门显式传入。
-func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate, input, final *schema.Message) {
+func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate, input, final *schema.Message, recordInput bool) {
 	w := historyWriterFrom(ctx)
 	if w == nil || historySuppressed(ctx) || slot == "" {
 		return
@@ -421,25 +511,18 @@ func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate
 
 	// 认领放在**最后一个条件**：抢到就一定会记，不会登记了却没写。
 	var msgs []*schema.Message
-	if input != nil && input.Role == schema.RoleUser && !isDerivedInput(input) &&
+	if recordInput && input != nil && input.Role == schema.RoleUser && !isDerivedInput(input) &&
 		!inputTakenCareOf() && !recordedBefore() &&
 		w.claimRecordHere(slot, input) {
 		msgs = append(msgs, input)
 	}
-	// 产出只在「这次调用范围内确实记过东西」时才查全局登记表——见下方判据说明。
-	// 产出也要跳过「可重算的合成物」——判据跟输入侧同源（成分都已在历史里）。典型是
-	// ParallelAgent 默认 merger 拼出来的那条：不跳的话成分和聚合并存，模型读回时同一份
-	// 内容看到两遍。编排在源头决定打不打标（真合成的产出不打，必须留档）。
-	//
-	// **还要挡住「产出就是刚记下的那条输入」**：业务的 `GraphOutputReader` 在出口 channel
-	// 空时回落返 input（`if out == nil { return in }`）是相当自然的写法——它的 godoc 自己
-	// 就建议别返 nil。那种情况下 msgs 会变成 `[input, input]`：上面那行的
-	// claim 已经把登记表置上了，但 `producedHistoryHere` 在纯 NodeFunc 图里是 false，
-	// `&&` 把整道守卫短路掉。后果是下一轮模型读到问题两遍、中间没有答案。
-	if final != nil && !isDerivedInput(final) && !sameMessage(msgs, final) &&
-		!(producedHistoryHere(ctx) && w.alreadyRecorded(final)) &&
-		!finalAlreadyInOtherSlot(ctx, slot, final) {
-		msgs = append(msgs, final)
+	// 兄弟可能独立返回同一个对象，仅本次调用的回执、实际输入或真实子调用能证明透传。
+	if final != nil && !isDerivedInput(final) {
+		key := historyOutputOf(final)
+		wroteInput := len(msgs) > 0 && historyOutputOf(input) == key
+		if !wroteInput && !historyOutputRecorded(ctx, slot, input, key) {
+			msgs = append(msgs, final)
+		}
 	}
 	if len(msgs) == 0 {
 		return
@@ -471,43 +554,48 @@ func inputAlreadyInAnyStream(ctx context.Context, input *schema.Message) bool {
 	return hit
 }
 
-// finalAlreadyInOtherSlot 报这条产出是不是已经**在别的归属下**落盘了。
-//
-// **补的是「跨调用」这一维**：上面那两道守卫都只看本次调用——范围回执每次 Run/Resume 新建、
-// 全局登记表挂在写入器上同样每次新建，而 Resume 不重跑已完成节点 ⟹ Run 里子 agent 记过的
-// 产出，在 Resume 那次调用里两道守卫都「查无此记」，于是顶层出口又记一遍，同一指针两个归属
-// （实测：中断跨 Resume 的透传形状，【子产出】记 2 条，owner 分别是 n1 和图名）。
-//
-// 顺序上放在最后：前两道是内存判断、这道要读历史。按消息 ID 查（[findHistory] 的 own=false），只认**这个任务
-// 这一路**写下的：任务章是本任务的，或者是从本任务脱离出去的独立任务写的（节点里经 DetachTask 开的独立任务
-// 推回同一个会话、它的产出被父图透传时，那份是独立任务写的，见 historyRecordOfTask）。别的任务写下的同一个
-// ID 不算：执行体每次返回同一个消息对象时，前一个任务在 x 分支记过、这个任务在 y 分支产出它，那是 y 的回复、
-// 不是透传——按整场会话查会把它吞掉（审计实测，会话停在 y 的提问上）。
-func finalAlreadyInOtherSlot(ctx context.Context, slot string, final *schema.Message) bool {
-	if final.ID == "" {
+// historyOutputRecorded 先查本调用的回执，再查持久历史。跨边界的回复只认相同身份和内容，
+// 且必须来自实际输入或本次调用的后代。旧行没有执行路径时，核对当前调用真正重放或恢复的消息。
+func historyOutputRecorded(ctx context.Context, slot string, input *schema.Message, key historyOutputKey) bool {
+	r := historyReceiptFrom(ctx)
+	if r != nil {
+		if _, ok := r.outputs.Load(key); ok {
+			return true
+		}
+	}
+	if key.id == "" {
 		return false
 	}
+	forwarded := input != nil && input.ID == key.id && historyOutputOf(input) == key
 	task := currentWriterTask(ctx)
-	hit, _ := findHistory(ctx, nil, HistoryQuery{MessageID: final.ID}, false, func(m *schema.Message) bool {
-		return historyRecordOfTask(m, task) && priorHasMessageIDInOtherSlot([]*schema.Message{m}, final.ID, slot)
-	})
-	return hit
-}
-
-// sameMessage 报 m 是不是已经在 msgs 里——同指针或同身份都算。
-//
-// 同身份也要算：业务可能把 input 拷一份再返（`*in` 解引用赋值是常见写法），拷贝跟原件
-// 指针不同但 `Message.ID` 是构造期铸的、跨拷贝存活。
-func sameMessage(msgs []*schema.Message, m *schema.Message) bool {
-	for _, x := range msgs {
-		if x == m {
-			return true
+	retained := sync.OnceValue(func() bool { return r.retainedOutput(key) })
+	hit, _ := findHistory(ctx, nil, HistoryQuery{MessageID: key.id}, false, func(m *schema.Message) bool {
+		if !historyRecordOfTask(m, task) {
+			return false
 		}
-		if x.ID != "" && x.ID == m.ID {
-			return true
+		owner, _ := m.Annotations[HistoryAgentAnnotation].(string)
+		producer, _ := m.Annotations[HistoryTaskAnnotation].(string)
+		trail, _ := m.Annotations[historyScopeAnnotation].(string)
+		other := owner != slot || producer != task
+		descendant := false
+		if trail != "" && r != nil {
+			descendant = strings.HasPrefix(trail, r.trail) && (other || trail != r.trail)
+			if ns := compose_v2.GetGraphNS(ctx); !descendant && HistorySlot(ctx) == "" && ns != "" {
+				descendant = strings.Contains(trail, historyExecutionToken(task, ns)) && other
+			}
+		} else if other {
+			inSubtree := HistorySlot(ctx) == "" || (producer == task && strings.HasPrefix(owner, slot+"/"))
+			descendant = inSubtree && retained()
+		}
+		// 本位置若已写下原始用户输入，出口回传原话也只保留这一份。
+		return ((forwarded && (other || input.Role == schema.RoleUser)) || descendant) && historyOutputOf(m) == key
+	})
+	if hit {
+		for cur := r; cur != nil; cur = cur.parent {
+			cur.outputs.Store(key, struct{}{})
 		}
 	}
-	return false
+	return hit
 }
 
 // historyConfigProvider 让编排能看到 sub-agent 的历史配置。

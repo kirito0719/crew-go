@@ -202,8 +202,7 @@ transfer 工具 fn 执行（LLM 调用时）：
    `tool.Failure(HandoffNoCoordinatorErrCode, ...)` **软失败回灌 LLM**，让它改成自己作答。
    两种情形会走到这里：sub-agent 配了 `WithHandoffTransfer()` 但**没跑在 HandoffAgent 底下**
    （业务复用同一个 agent 对象、有时独立跑，是合法用法）；或它是**被当成工具跑的那一层**（§6.8）。
-2. **读候选集**：候选名单**跟着授予走**（铸工具时装进闭包），不走 ctx——名单是授予内容的
-   一部分，跟「能不能转」同生共死
+2. **读候选集**。成员收到绑定自身的授予。框架再按本次调用及当前来源收窄名单，模型工具的 `agent_name.enum` 按注册名排序。工具派发和 `HandoffTo` 都使用收窄后的名单。
 3. **验证 target**：
    - 非法（不在候选）→ 返 `tool.Failure(HandoffTargetInvalidErrCode, "目标 %q 不在候选 {A,B,C}")` **软失败回灌 LLM** 重选（不终止 Run；对齐 AgentScope `FunctionNotFoundError` + crew-go `SkillDisabledErrCode` 范式）
    - 合法 → 下一步
@@ -479,11 +478,19 @@ h := agent_v2.NewHandoffAgent(
 ).AddAgent("supervisor", supervisor).AddAgent("worker", worker)
 ```
 
-- 每个非 supervisor 候选成功完成且这次未主动转交时，编排选择 supervisor 为下一跳。显式 `transfer_to_agent` 或 `HandoffTo` 优先。supervisor 直接作答时本次结束。
+- 非 supervisor 候选成功完成且这次未主动转交时，若本跳允许转给 supervisor，编排选择它为下一跳。显式 `transfer_to_agent` 或 `HandoffTo` 优先。supervisor 直接作答时本次结束。
 - 退回复用本轮的历史视图、跳数和存档。用尽跳数时返回当前成员的产出并报告 `Exhausted`。最外层任务成功且写入 active 后，相同 owner 和 ThreadID 的下次 Run 从退回目标开始。
 - 退回目标必须是 `AddAgent` 的注册名，默认空字符串关闭。启用、取消或更改退回目标会改变图的存档身份，同一挂起任务应使用原配置续跑。
 
 ---
+
+### 8.2 按来源限定目标与按次暂停
+
+`WithHandoffTargets("front", "billing", "support")` 将 front 的出站目标限定为 billing 和 support。`WithHandoffTargets("billing")` 让 billing 接手后自行作答。来源和目标使用 `AddAgent` 的注册名。未配置的来源可转向所有已注册成员。模型候选还需通过 `WithHandoffTransfer()` 启用框架工具。[配置与校验](../../agent_v2/handoff_agent.go)
+
+`h.Run(ctx, session, input, agent_v2.WithHandoffPaused())` 暂停这次调用的新转交。续跑时用 `agent_v2.WithResumeHandoffPaused()`。暂停或空名单会隐藏模型转交工具、拒绝程序化转交，并跳过确定性退回。已提交到工具账的转交仍会投递，接手者的新决定继续受本次暂停约束。并发会话可各自选择是否暂停。[冷续跑与并发回归](../../agent_v2/handoff_policy_test.go)
+
+配置了来源名单时，注册名集合、逐来源目标和确定性退回目标共同绑定挂起图版本。相同名单改变声明顺序可继续恢复，改变可达目标需要使用原配置完成已有挂起任务。[存档版本回归](../../agent_v2/handoff_policy_test.go)
 
 ## 9. 转交历史可见性 WithHandoffHistoryMode [已实现]
 

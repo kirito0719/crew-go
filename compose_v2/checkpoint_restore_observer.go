@@ -22,10 +22,14 @@ func notifyCheckpointRestored(ctx context.Context) {
 	if observe == nil {
 		return
 	}
+	runRestoreObserver(ctx, func() { observe(ctx) })
+}
+
+func runRestoreObserver(ctx context.Context, report func()) {
 	defer func() {
 		if value := recover(); value != nil {
 			panicerr.Log(ctx, slog.LevelError, "compose_v2: 恢复存档的观察回调 panic", panicerr.New(value))
 		}
 	}()
-	observe(ctx)
+	report()
 }

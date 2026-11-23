@@ -225,6 +225,9 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 已完成的调用重放结果，集成可从同一交接相位恢复结果引用的会话状态。
 	if mode.remember {
 		if events, ok := recallNestedCall(ctx, call); ok {
+			if mode.settle {
+				noteReplayedHistoryOutput(ctx, FinalMessage(events))
+			}
 			if restore, ok := sub.(nestedOutputRestorer); ok {
 				restore.RestoreNestedOutput(subCtx, childSess, input, FinalMessage(events))
 			}
@@ -279,7 +282,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 那样它什么也不留。只补它自己没记的，见 settleHistorySlot。拿回记下的结果那条路不补
 	// ——首次完成时已经补过。
 	if mode.settle {
-		settleHistorySlot(subCtx, sub.Name(), settleInput, FinalMessage(events))
+		settleHistoryAt(subCtx, HistorySlot(subCtx), sub.Name(), gateExtentProduced, input, FinalMessage(events), settleInput != nil)
 	}
 	return events, nil
 }

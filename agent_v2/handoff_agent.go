@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,7 @@ type HandoffAgent struct {
 	hooks       hook.Hooks
 	retryCfg    compose_v2.RetryConfig // 每步 active sub-agent.Run 的重试策略
 	returnTo    string
+	targets     map[string]map[string]bool
 	// expectedTransfer 按候选注册名记录配置及本实例是否已报告漏配。
 	expectedTransfer map[string]*atomic.Bool
 
@@ -122,6 +124,21 @@ func WithHandoffInitial(name string) HandoffOption {
 // name 是通过 [HandoffAgent.AddAgent] 注册的候选名，空字符串关闭此策略。
 func WithDeterministicReturnTo(name string) HandoffOption {
 	return func(h *HandoffAgent) { h.returnTo = name }
+}
+
+// WithHandoffTargets 限定 source 候选可以转交到的注册名。未配置的来源可转交给所有候选，
+// 显式空名单禁止该来源转出。多次设置同一来源时取最后一次，构造选项时即复制名单。
+func WithHandoffTargets(source string, targets ...string) HandoffOption {
+	allowed := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		allowed[target] = true
+	}
+	return func(h *HandoffAgent) {
+		if h.targets == nil {
+			h.targets = make(map[string]map[string]bool)
+		}
+		h.targets[source] = allowed
+	}
 }
 
 // WithExpectedHandoffTransfer 声明哪些注册候选应通过内置工具自主转交。
@@ -437,7 +454,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 
 	cm := compose_v2.NewChannelManager()
 	// Resume 拿不到授予（ResumeOption 是另一套）：顶层直接 Resume 时候选没有转授下来的路由能力。
-	g, err := h.buildComposeGraph(ctx, session, hooks, nil)
+	g, err := h.buildComposeGraph(ctx, session, hooks, nil, rcfg.handoffPaused)
 	if err != nil {
 		return nil, fmt.Errorf("handoff agent resume: build graph: %w", err)
 	}
@@ -487,7 +504,7 @@ func (h *HandoffAgent) runGraph(
 	cm := compose_v2.NewChannelManager()
 	// 本 HandoffAgent 收到的路由授予转授给候选（候选是它的组成部分）；转交授予不转——每一跳给候选
 	// 新铸一份，地址是本跳的收件人。
-	g, err := h.buildComposeGraph(ctx, session, hooks, runCfg.grantsFor(h).route)
+	g, err := h.buildComposeGraph(ctx, session, hooks, runCfg.grantsFor(h).route, runCfg.handoffPaused)
 	if err != nil {
 		return nil, 0, fmt.Errorf("handoff agent %q: build graph: %w", h.Name(), err)
 	}
@@ -552,6 +569,7 @@ func (h *HandoffAgent) buildComposeGraph(
 	parentSession *RunSession,
 	hooks hook.Hooks,
 	route *routeGrant,
+	paused bool,
 ) (*compose_v2.Graph, error) {
 	bld := NewHandoffAgentBuilder().WithName(h.Name())
 	if hooks != nil {
@@ -609,6 +627,14 @@ func (h *HandoffAgent) buildComposeGraph(
 		if dest == "" {
 			return nil, fmt.Errorf("handoff_agent: 铸不出本跳的收件人（step 不在节点执行里）")
 		}
+		allowed := candSet
+		if targets, ok := h.targets[activeName]; ok {
+			allowed = targets
+		}
+		if paused {
+			allowed = nil
+		}
+		subCtx = context.WithValue(subCtx, handoffTargetLimitKey{}, handoffTargetLimit{allowed: allowed})
 		subCtx = withHandoffDest(subCtx, dest)
 		// 模型 B §9：push 历史视图模式让后接 BasicAgent 的 prior 切换（默认 Rewrite=看前接改写第三人称）。
 		subCtx = WithHandoffHistoryModeCtx(subCtx, h.historyMode)
@@ -634,8 +660,11 @@ func (h *HandoffAgent) buildComposeGraph(
 			// 注册名与 ag.Name() 互相独立，而名字业务还能自己取重）。经 RunOption 进
 			// ag 的签名，不进 ctx——进了 ctx 就是环境，孙辈照样读得到（见 handoffGrant）。
 			// 每次尝试铸一份新的。
-			grant := &handoffGrant{grantee: ag, candidates: candSet}
-			if warned := h.expectedTransfer[activeName]; warned != nil {
+			var grant *handoffGrant
+			if len(allowed) > 0 {
+				grant = &handoffGrant{grantee: ag, candidates: allowed}
+			}
+			if warned := h.expectedTransfer[activeName]; grant != nil && warned != nil {
 				grant.onMissingTransfer = func(ctx context.Context) {
 					logger := slog.Default()
 					if logger.Enabled(ctx, slog.LevelWarn) && warned.CompareAndSwap(false, true) {
@@ -669,11 +698,8 @@ func (h *HandoffAgent) buildComposeGraph(
 			}
 			// 执行体不是 BasicAgent 时它不写历史，边界补记——只补没记的。
 			// 共享视图下原始输入已在流里时只补产出（输入传 nil），守卫方向同上。
-			settleInput := input
-			if sharedView && inputAlreadyInAnyStream(ctx, input) {
-				settleInput = nil
-			}
-			settleHistorySlot(ctx, ag.Name(), settleInput, final)
+			recordInput := !sharedView || !inputAlreadyInAnyStream(ctx, input)
+			settleHistoryAt(ctx, HistorySlot(ctx), ag.Name(), gateExtentProduced, input, final, recordInput)
 			// **决定带出去、不在这里取**——冲突检查在重试之外做，见 handoffAttempt.signals。
 			return handoffAttempt{out: final, signals: sigs}, nil
 		})
@@ -700,7 +726,7 @@ func (h *HandoffAgent) buildComposeGraph(
 		// 程序化成员（业务自己实现的 Agent）现在走 [HandoffTo]：同一套校验，且只有被
 		// 授予方本人调得动。哨兵 TestHandoffAnnotation_NoLongerATransferChannel。
 		nextTarget := toolTarget
-		if nextTarget == "" && h.returnTo != "" && activeName != h.returnTo {
+		if nextTarget == "" && activeName != h.returnTo && allowed[h.returnTo] {
 			nextTarget = h.returnTo
 		}
 
@@ -760,8 +786,20 @@ func (h *HandoffAgent) buildComposeGraph(
 	}
 	bld = bld.WithStepFn(stepFn)
 	graph, err := bld.Compile()
-	if err != nil || h.returnTo == "" {
-		return graph, err
+	if err != nil {
+		return nil, err
+	}
+	if len(h.targets) > 0 {
+		// 登记名按原始字节排序并分层编码，等价名单共享版本，合法的非 UTF-8 名称也能区分。
+		parts := []string{h.returnTo, identityString(slices.Sorted(maps.Keys(agents))...)}
+		for _, source := range slices.Sorted(maps.Keys(h.targets)) {
+			targets := slices.Sorted(maps.Keys(h.targets[source]))
+			parts = append(parts, identityString(source, identityString(targets...)))
+		}
+		return graph.WithCheckpointRevision("handoff-policy:" + identityHash(identityString(parts...))), nil
+	}
+	if h.returnTo == "" {
+		return graph, nil
 	}
 	return graph.WithCheckpointRevision("handoff-return:" + h.returnTo), nil
 }
@@ -769,6 +807,16 @@ func (h *HandoffAgent) buildComposeGraph(
 func (h *HandoffAgent) validateTransferOptions() error {
 	if h.returnTo != "" && h.agents[h.returnTo] == nil {
 		return fmt.Errorf("handoff agent %q: return target %q not registered via AddAgent", h.Name(), h.returnTo)
+	}
+	for source, targets := range h.targets {
+		if h.agents[source] == nil {
+			return fmt.Errorf("handoff agent %q: source %q not registered via AddAgent", h.Name(), source)
+		}
+		for target := range targets {
+			if h.agents[target] == nil {
+				return fmt.Errorf("handoff agent %q: target %q for source %q not registered via AddAgent", h.Name(), target, source)
+			}
+		}
 	}
 	for name := range h.expectedTransfer {
 		if h.agents[name] == nil {

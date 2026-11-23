@@ -34,6 +34,7 @@ type runOptions struct {
 	// 撞槽、拒绝（不可重试、不清档）；否则只告警。
 	inputIsIdentity     bool
 	resumeFrom          *Checkpoint
+	reportRestore       func(*Checkpoint)
 	checkedResumeTarget bool                       // 低阶子图已在同一租约下读出其目标档
 	resumeClaimed       bool                       // 本图领取了自己的存档槽
 	resumeInProgress    bool                       // 本图或祖先已经领取续跑，过程档暂不可重新准入
@@ -414,6 +415,12 @@ func WithEmitCpEvent(enabled bool) RunOption {
 	return func(o *runOptions) {
 		o.emitCpEvent = enabled
 	}
+}
+
+// WithRestoreSource 在本次图执行成功载入并取得存档后交付只读源快照，供调用方核对已有产出。
+// 仅报告本次 Run。新执行和拒绝的存档不会触发回调。嵌套执行须单独设置。观察回调 panic 时记录日志，图照常恢复。
+func WithRestoreSource(observe func(*Checkpoint)) RunOption {
+	return func(o *runOptions) { o.reportRestore = observe }
 }
 
 // WithResumeFrom 从带当前图存档身份的快照恢复执行。手动导出使用
@@ -1743,6 +1750,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			cm.setCpEpochBaseline(claimed.Epoch)
 		}
 		restoreRejected = false
+		if cfg.reportRestore != nil {
+			runRestoreObserver(ctx, func() { cfg.reportRestore(cfg.resumeFrom) })
+		}
 		// 从存档续跑：已提交的进度原样拿回、不重新交出流，所在那段执行取代的东西一个都不撤（见 stream_attempt.go）
 		markStreamsUncertain(ctx)
 		// import baseline 已在 OnGraphStart 之前摆好（F5 不变量：续跑读到父图**最新**值——

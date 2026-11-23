@@ -3,7 +3,8 @@ package agent_v2
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 
 	"crew-go/compose_v2"
 	"crew-go/tool"
@@ -57,16 +58,17 @@ const HandoffNoCoordinatorErrCode = "handoff_no_coordinator"
 //     失败结果，见 tool_batch_signals.go）+ 标记 tool.ReturnDirectMetaKey
 //     让 BasicAgent 一调即出（§6.5 return-direct，避免转交后 LLM 继续唠叨）
 func newHandoffTransferTool(candidates map[string]bool) *tool.FuncTool {
+	target := map[string]any{"type": "string", "description": "目标 agent 名（必须是可转交候选之一）。"}
+	if candidates != nil {
+		target["enum"] = slices.Sorted(maps.Keys(candidates))
+	}
 	return tool.NewFuncTool(
 		HandoffTransferToolName,
 		"把对话控制权转交给另一个专长 agent。当用户需求更适合别的 agent 处理时调用——转交后该 agent 接管对话。",
 		map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"agent_name": map[string]any{
-					"type":        "string",
-					"description": "目标 agent 名（必须是可转交候选之一）。",
-				},
+				"agent_name": target,
 				"reason": map[string]any{
 					"type":        "string",
 					"description": "转交理由（可选，帮目标 agent 理解为何转来）。",
@@ -129,11 +131,7 @@ func handoffTransferToolFunc(ctx context.Context, granted map[string]bool, args 
 	// 下游是 err=nil + 空 final。整条通道已删，哨兵 TestHandoffCandidates_NoExportedAccessor。
 	candidates := granted
 	if candidates != nil && !candidates[target] {
-		names := make([]string, 0, len(candidates))
-		for n := range candidates {
-			names = append(names, n)
-		}
-		sort.Strings(names)
+		names := slices.Sorted(maps.Keys(candidates))
 		return tool.Failure(HandoffTargetInvalidErrCode,
 			fmt.Sprintf("目标 %q 不在可转交候选 %v 中，请换合法目标", target, names)), nil
 	}

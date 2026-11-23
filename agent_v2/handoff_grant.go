@@ -3,8 +3,9 @@ package agent_v2
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
-	"sort"
+	"slices"
 
 	"crew-go/compose_v2"
 )
@@ -70,13 +71,49 @@ type handoffGrant struct {
 	// 而不必先装箱成 Agent 再比（装箱后动态类型仍是具体类型，两种写法等价，但 any
 	// 让调用点更短）。
 	grantee any
-	// candidates 是可转交候选名单——从 HandoffAgent 的 AddAgent 注册名来。跟着 grant
-	// 一起走而不是走 ctx：候选名单是**授予内容的一部分**（授权你转给这几个人），
-	// 跟「能不能转」同生共死才对。
+	// candidates 是发给受让方的目标名单。实际消费时还受当前来源和调用的限制。
 	candidates map[string]bool
 	// onMissingTransfer 由登记了工具期望的直接挂载定义，在 BasicAgent 的 opt-in 闸口报告漏配。
 	// regrant 只转授能力，诊断仍归原挂载。
 	onMissingTransfer func(context.Context)
+}
+
+// handoffTargetLimit 只收窄当前候选已经持有的授权，也约束业务从早前调用保存并再次使用的选项。
+type handoffTargetLimit struct{ allowed map[string]bool }
+type handoffTargetLimitKey struct{}
+
+func (handoffTargetLimitKey) ExecutionState() {}
+
+// withinHop 对实际授予与当前收件人的范围取交集；缺少授予时不会凭上下文获得转交能力。
+func (g *handoffGrant) withinHop(ctx context.Context) *handoffGrant {
+	if g == nil || len(g.candidates) == 0 {
+		return nil
+	}
+	limit, ok := ctx.Value(handoffTargetLimitKey{}).(handoffTargetLimit)
+	if !ok {
+		return g
+	}
+	if len(limit.allowed) == 0 {
+		return nil
+	}
+	var allowed map[string]bool
+	for name := range g.candidates {
+		if !limit.allowed[name] {
+			if allowed == nil {
+				allowed = maps.Clone(g.candidates)
+			}
+			delete(allowed, name)
+		}
+	}
+	if allowed == nil {
+		return g
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	narrowed := *g
+	narrowed.candidates = allowed
+	return &narrowed
 }
 
 // withHandoffGrant 把 grant 交给**这一次** sub-agent 调用（RunOption）。
@@ -321,18 +358,14 @@ func HandoffTo(ctx context.Context, opts []RunOption, self Agent, target string)
 	if target == "" {
 		return fmt.Errorf("handoff: 转交目标不能为空: %w", compose_v2.ErrRunAborted)
 	}
-	g := grantFromOpts(opts).grantFor(self)
+	g := grantFromOpts(opts).grantFor(self).withinHop(ctx)
 	if g == nil {
 		return fmt.Errorf("handoff: %q 没有被授予转交能力"+
 			"（授予由上层 HandoffAgent 在调用它的直接候选时发出，且只发给受让方本人）: %w",
 			self.Name(), compose_v2.ErrRunAborted)
 	}
-	if g.candidates != nil && !g.candidates[target] {
-		names := make([]string, 0, len(g.candidates))
-		for n := range g.candidates {
-			names = append(names, n)
-		}
-		sort.Strings(names)
+	if !g.candidates[target] {
+		names := slices.Sorted(maps.Keys(g.candidates))
 		return fmt.Errorf("handoff: 目标 %q 不在可转交候选 %v 中: %w", target, names, compose_v2.ErrRunAborted)
 	}
 	dest, ok := getHandoffDest(ctx)

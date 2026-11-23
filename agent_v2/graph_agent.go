@@ -507,6 +507,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// Resume 拿不到授予：放一份空的，遮住外层放的那份。
 	ctx = withNodeGrants(ctx, memberGrants{})
 	ctx, commit := compose_v2.WithTaskCommitBarrier(ctx)
+	runOpts = withHistoryRestoreSource(ctx, runOpts)
 	runErr := compose_v2.Run(ctx, g.graph, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := g.outputReader(cm.Channels())
 	finalRef = final
@@ -579,6 +580,7 @@ func (g *GraphAgent) runGraph(
 	// opts，要把能力交给它调起的 agent 时经 RegrantFromNode 显式转授。不自动往下传——节点里请教的
 	// agent 不该凭在这张图里跑就替上层做决定（见 routeGrant）。
 	ctx = withNodeGrants(ctx, runCfg.grantsFor(g))
+	runOpts = withHistoryRestoreSource(ctx, runOpts)
 	runErr := compose_v2.Run(ctx, g.graph, cm, append(runOpts, slotClaimOpt(ctx))...)
 	final := g.outputReader(cm.Channels())
 	return final, runErr

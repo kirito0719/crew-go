@@ -75,7 +75,7 @@ import (
 //     history_read.go），后端要把「取 Before 之前最近 Limit 条」下推成一次有界的读——SQL 用
 //     `WHERE seq < ? ORDER BY seq DESC LIMIT ?` 再反转、Redis 列表用 LRANGE 负下标。在内存里
 //     读出全部再切片当然也满足契约，但那正是这个接口要省掉的成本。
-//   - **Load 要能按条件读**（[HistoryQuery] 的 MessageID / Task / Agent，非空的都要满足）：框架的去重
+//   - **Load 要能按条件读**（[HistoryQuery] 的单个或批量消息 ID、Task、Agent，非空的都要满足）：框架的去重
 //     （「这个任务里记过这条没有」「这条是不是已经在别的归属下记过」）与「只看自己」的视图都按条件查。
 //     消息 ID、任务章（[HistoryTaskAnnotation]）、归属（[HistoryAgentAnnotation]）写入时抽成带索引的列，
 //     按条件读就只碰命中的记录——SQL 用 `WHERE conv = ? AND task = ? AND seq < ? ORDER BY seq DESC LIMIT ?`。
@@ -485,7 +485,7 @@ type historyWriter struct {
 	task string
 	// origin 是这个写入器所在的执行从哪些仍在执行的任务里脱离出来（[compose_v2.DetachedFrom] 的 sid，编码好的
 	// 来源章，见 encodeHistoryOrigin）：经 DetachTask 开的独立任务写下的记录盖上它（historyOriginAnnotation），
-	// 「这条产出是不是已经在别的归属下记过」据此认得出独立任务写的那份（见 finalAlreadyInOtherSlot）。不是脱离
+	// 「这条产出是不是已经在别的归属下记过」据此认得出独立任务写的那份（见 historyOutputRecorded）。不是脱离
 	// 出来的写入器为空。
 	origin string
 
@@ -511,30 +511,8 @@ type historyWriter struct {
 	inFlight bool // worker 正在写某一批（已出队、还没落盘）
 	dead     bool // worker 已退出（正常收摊或猝死）——防 waitDrained 永久等一个不存在的消费者
 
-	// recorded / recordedHere 记「哪些消息已经进过历史」，键是**调用方交进来的那个指针**
-	// （盖章前的原件）。指针够用：产出物从执行体一路传到边界不经序列化，同一条就是同一个
-	// 指针；边界记的也是原件指针（盖章走的是浅拷贝，不影响）。
-	//
-	// **两个集合，因为产出和输入问的不是同一个问题**：
-	//
-	//   - `recorded` 是**全局**的，服务产出，但**只在「这次调用的范围内确实产生过记录」时
-	//     才问它**（见 settleHistorySlot）：叶子记在更深的位置，中间每一层的边界都该跳过，
-	//     不然同一条产出多个归属，第二份读回时被判成「别人说的」走 Rewrite。加范围这道
-	//     前提是因为**执行体可以每轮返回同一个消息对象**（`var okMsg = ...` 是很自然的
-	//     写法）——只问全局就把「同一个对象」当成「同一条产出」，Loop 第 2 轮起静默丢。
-	//   - `recordedHere` 按**流**（位置）分：「这条消息在这条流里进过历史了吗」。它服务
-	//     输入，而输入不能用全局判——SelfOnly 扇出下每条分支流各自要完整（有问有答），
-	//     三条分支共享同一条输入指针时**每条都该记一份**。用全局判就变成「谁先谁赢」，
-	//     实测并发下份数随调度在 1~4 之间翻。按流分之后：Loop 第 N 轮的输入就是第 N-1
-	//     轮的产出、同一条流 ⟹ 命中跳过；扇出的兄弟分支是不同的流 ⟹ 各记各的。
-	//
-	// **输入那侧的查与登记是一次原子操作**（`claimRecordHere`），不是「先查后写」——那中间
-	// 的窗口正是上面那个随调度翻的来源。产出那侧只读（`alreadyRecorded`），因为它的判据
-	// 前面还压着「这次调用范围内产生过记录」这道前提，两条并发边界要同时穿过去得先各自
-	// 有过写入，那时全局表里已经有了。
-	//
-	// **只管同一个 Run 之内**：writer 每个 Run 新建，集合跟着重置。规模上界是这个 Run
-	// 里进过历史的消息条数。
+	// recorded 让运行中插话能核对原始对象是否已经写入；recordedHere 按流原子认领输入。
+	// 两者随本次 Run 的写入器结束。具体产出的归属另由每次成员调用的 historyReceipt 记录。
 	recorded     map[*schema.Message]bool
 	recordedHere map[recordSlotKey]bool
 	// recordedIDs 是进过历史的消息：ID → 那些消息的内容键（inputContentKey），只服务输入侧的「这条输入本 Run 记过没有」
@@ -1095,7 +1073,7 @@ func (w *historyWriter) inputRecorded(m *schema.Message) bool {
 	return false
 }
 
-// alreadyRecorded 报这条消息是不是已经进过历史（全局，只读，按指针——服务产出，见 recorded）。
+// alreadyRecorded 报这条消息是不是已经进过历史（供插话写入方按原始对象核对）。
 func (w *historyWriter) alreadyRecorded(m *schema.Message) bool {
 	if m == nil {
 		return false
@@ -1246,7 +1224,7 @@ func recordHistoryBatch(ctx context.Context, owner, display string, msgs []*sche
 		coverage = nil
 	}
 	w.markRecorded(HistorySlot(ctx), msgs)
-	bumpHistoryReceipt(ctx)
+	registerHistoryOutputs(ctx, msgs)
 	// 拷贝一份再盖章：msgs 里的 *schema.Message 是 channel 里那批的同一批指针，
 	// 直接改它们的 Annotations 会污染正在喂给模型的消息。
 	boundaryIndex := -1
@@ -1274,7 +1252,7 @@ func recordHistoryBatch(ctx context.Context, owner, display string, msgs []*sche
 		if m == opts.boundary {
 			boundaryIndex = len(stamped)
 		}
-		record := w.stamp(m, owner, display)
+		record := w.stamp(ctx, m, owner, display)
 		if i < len(opts.calls) && opts.calls[i].ID != "" && m.Role == schema.RoleTool && schema.GetToolResultID(m) == opts.calls[i].ID {
 			if instance := opts.batch.callInstanceID(i); instance != "" {
 				record.Annotations[ToolCallInstanceIDExtraKey] = instance
@@ -1289,8 +1267,11 @@ func recordHistoryBatch(ctx context.Context, owner, display string, msgs []*sche
 }
 
 // stamp 给一条要写进历史的消息盖归属、任务章与来源（见 stampHistoryAgent），返回拷贝。
-func (w *historyWriter) stamp(m *schema.Message, owner, display string) *schema.Message {
+func (w *historyWriter) stamp(ctx context.Context, m *schema.Message, owner, display string) *schema.Message {
 	cp := stampHistoryAgent(m, owner, display, w.task)
+	if trail := historyScopeTrail(ctx); trail != "" {
+		cp.Annotations[historyScopeAnnotation] = trail
+	}
 	if w.hosted {
 		cp.Annotations[hostedHistoryTaskAnnotation] = true
 	} else {
@@ -1341,16 +1322,16 @@ func batchHasInput(batch []*schema.Message, in *schema.Message) bool {
 // noteHistoryRecorded 把 msgs 登记成「这次调用里由我记过」，不写进历史：model 节点处理完之后在提交之前作废、续跑重放
 // 定下的那一轮时用（见 modelCallRecord）——那一轮在上一次执行里已经记过，这次不再写。
 //
-// 登记跟 recordHistory 开头那两步一样（全局登记表 + 范围回执）：编排边界补记看这两样认「成员自己记过的产出」，不登记
+// 登记跟 recordHistory 共用输入登记表和本次调用的消息回执。范围内的消息回执让边界识别成员的产出，不登记
 // 的话它替成员再记一份（审计实测：Sequential 成员的最终答复在历史里两份，ID 与归属都相同）。边界那侧不能改成按消息
-// ID 查历史去重——同一条流里同一个对象跨轮复用时每轮都得记（见 priorHasMessageIDInOtherSlot）。
+// ID 查历史去重——同一条流里同一个对象跨轮复用时每轮都得记（见 historyOutputRecorded）。
 func noteHistoryRecorded(ctx context.Context, msgs []*schema.Message) {
 	w := historyWriterFrom(ctx)
 	if w == nil || len(msgs) == 0 {
 		return
 	}
 	w.markRecorded(HistorySlot(ctx), msgs)
-	bumpHistoryReceipt(ctx)
+	registerHistoryOutputs(ctx, msgs)
 }
 
 // stampHistoryAgent 返回一份浅拷贝，Annotations 上标好归属 agent 与任务章（task 为空时不盖）。
@@ -1383,6 +1364,7 @@ func stampHistoryAgent(m *schema.Message, owner, display, task string) *schema.M
 		// 这条记录会冒充那个任务的。
 		delete(anns, HistoryTaskAnnotation)
 	}
+	delete(anns, historyScopeAnnotation)
 	delete(anns, historyOriginAnnotation) // 同理：来源章只由写入器盖（recordHistory）
 	// 位置跟名字不同才存显示名——顶层回落时两者相同，没必要多存一份。
 	if display != "" && display != owner {
@@ -1474,6 +1456,20 @@ func (c *memHistoryConv) candidates(q HistoryQuery) (pos []int, all bool) {
 	pick(c.byID, q.MessageID)
 	pick(c.byTask, q.Task)
 	pick(c.byAgent, q.Agent)
+	if q.ids != nil {
+		count := 0
+		for _, id := range q.ids.values {
+			count += len(c.byID[id])
+		}
+		if all || count < len(pos) {
+			pos = make([]int, 0, count)
+			for _, id := range q.ids.values {
+				pos = append(pos, c.byID[id]...)
+			}
+			sort.Ints(pos)
+			return pos, false
+		}
+	}
 	return pos, all
 }
 
@@ -1763,43 +1759,6 @@ func rootInputID(msg *schema.Message) string {
 		return ""
 	}
 	return msg.ID
-}
-
-// priorHasMessageIDInOtherSlot 报这条消息是不是已经**在别的归属下**记过了。
-//
-// # 为什么是「别的归属」而不是「记过没有」
-//
-// 要挡的害处是**同一份内容挂在两个归属下**——顶层图透传子 agent 的产出指针时，子在自己
-// 的流里记过一次，顶层出口若再记一次，模型下一轮就读到两遍。这天生是跨归属现象。
-//
-// 而**同一条流内的重复是真的重复**，必须留：执行体每轮返回同一个消息对象
-// （`var okMsg = schema.AssistantMessage(...)` 然后每次返回它，在 Go 里很自然）时，
-// Loop 各轮的产出都得记下来。按「记过没有」判会把「同一个对象跨轮复用」当成「同一条
-// 产出」，第 2 轮起静默丢——那正是 `TestHistory_ExecutorReusesMessageObject_AllRoundsRecorded`
-// 钉的不变量（我第一版没限归属，当场把它打红）。
-//
-// 与输入侧 `priorHasRootInputIDInSlot` 恰好相反，两者都对：
-//
-//   - 输入侧**限本流**：兄弟分支刚写进去的那份不该挡住我，每条分支流各自要完整（有问有答）
-//   - 产出侧**限别的流**：同流内是真重复，跨流才是归属重记
-//
-// 为什么产出侧必须查**持久化历史**而不是本次调用的登记表：那两道守卫
-// （`producedHistoryHere` 范围回执 / `alreadyRecorded` 全局登记表）都是 per-call 的，
-// 而 Resume **不重跑已完成节点** ⟹ 回执不会再被 bump、登记表也是新的 ⟹ Run 里记过的
-// 东西在 Resume 那次调用里「查无此记」。跨调用的事实只有落盘的历史知道。
-func priorHasMessageIDInOtherSlot(prior []*schema.Message, id, slot string) bool {
-	if id == "" {
-		return false
-	}
-	for _, m := range prior {
-		if m.ID != id {
-			continue
-		}
-		if o, _ := m.Annotations[HistoryAgentAnnotation].(string); o != slot {
-			return true
-		}
-	}
-	return false
 }
 
 func priorHasRootInputIDInSlot(prior []*schema.Message, nonce, slot string) bool {

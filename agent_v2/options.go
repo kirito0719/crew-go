@@ -14,8 +14,9 @@ import (
 type RunOption func(*runConfig)
 
 type runConfig struct {
-	orchHooks   OrchestrationHooks
-	breakpoints graphBreakpoints
+	handoffPaused bool
+	orchHooks     OrchestrationHooks
+	breakpoints   graphBreakpoints
 
 	// per-call 覆盖构造期 Config（仅本次 Run 生效，不进 cp、不跨 Resume）。
 	// v1→v2 迁移（commit ad2743e 删 v1 agent/ 包）丢失的 ISSUE-18 能力此处补回。
@@ -283,6 +284,17 @@ func WithSettledAbandonedTask(runID string) RunOption {
 	}
 }
 
+// WithHandoffPaused 暂停本次 HandoffAgent.Run 内的新转交，包括确定性回送。
+// 后续调用可重新决定是否暂停；本选项不更改挂起图的版本。
+func WithHandoffPaused() RunOption {
+	return func(c *runConfig) { c.handoffPaused = true }
+}
+
+// WithResumeHandoffPaused 暂停本次 HandoffAgent.Resume 内的新转交。挂起前已提交的决定仍会投递。
+func WithResumeHandoffPaused() ResumeOption {
+	return func(c *resumeConfig) { c.handoffPaused = true }
+}
+
 // applyRunOptions 应用 RunOption 列表，返回最终 cfg。
 func applyRunOptions(opts []RunOption) runConfig {
 	cfg := runConfig{}
@@ -425,6 +437,7 @@ func extractOrchHooksOrCtx(ctx context.Context, optsHooks OrchestrationHooks) co
 type ResumeOption func(*resumeConfig)
 
 type resumeConfig struct {
+	handoffPaused      bool
 	action             ResumeAction
 	abortContext       context.Context
 	abortCleanup       func(context.Context, string, string, *HistoryKey) (int32, error)

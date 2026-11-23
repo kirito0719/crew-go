@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-23 按本地及远端 `test` 的 `7ebad49` 核对。失败模型调用的用量、评测逐轮记录、Folio 式上下文恢复及 ISSUE-100 并发历史边界均已合入。当日 GitHub 开放 Issue 为 0，以下使用仓内编号。[GitHub Issues](https://github.com/kirito0719/crew-go/issues) · [仓内 Issue 索引](../issue/issues.md)
+2026-11-23 复核待办，行业调研已通过 `5d29a77` 合入 `test`。失败模型调用的用量、评测逐轮记录、Folio 式上下文恢复及 ISSUE-100 并发历史边界均已合入。当日 GitHub 开放 Issue 为 0，以下使用仓内编号。[GitHub Issues](https://github.com/kirito0719/crew-go/issues) · [仓内 Issue 索引](../issue/issues.md)
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **41 项**。P1 **0**、P2 **3**、P3 **38**。缺陷 **1**、能力缺口 **1**、待决 **25**、验收 **14**。A16 已在内存和 SQLite 重现，沿用原编号和 P3 优先级。[本次复核](backlog-audit.md#2026-11-23-会话历史与评测复核)
+共 **39 项**。P1 **0**、P2 **3**、P3 **36**。待决 **25**、验收 **14**。A16、C18 和 Q17 的晚到前文查询已完成。[回归与实测](backlog-audit.md#2026-11-23-历史归属转交策略与晚到前文)
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -19,11 +19,8 @@
 
 | 顺序 | 事项 | 本批验收 |
 | --- | --- | --- |
-| 1 | A16 · 补齐第二个成员的回复历史 | 两个成员各自处理独立输入，即使返回相同消息 ID，各自的历史也应有回复。第二个成员实际透传第一份回复时只记原归属。再验挂起后父图透传子图产出的路径。[四组对照](backlog-audit.md#2026-11-23-会话历史与评测复核) |
-| 2 | C18 · 限定每个来源可以转交给谁，并允许单次调用暂停转交 | 给两个来源设置不同目标，核对模型可见的工具候选和程序化 `HandoffTo`。获准的目标确实运行，拒绝的目标执行零次。覆盖一次暂停、下一次恢复和挂起前已提交的转交。[现有授予逻辑](../../agent_v2/handoff_agent.go) |
-| 3 | Q17 · 减少读取摘要边界后晚到前文的查询次数 | 固定摘要后插入 0、1、16、64 条不同 ID 的调用方前文，测 SQL 查询数和 P95。对照三种历史视图的实际模型输入，保留新前文顺序，已在摘要中的副本继续去重。[读取路径](../../agent_v2/history_read.go) · [调用次数实测](backlog-audit.md#2026-11-23-会话历史与评测复核) |
-| 4 | A11、A13 · 补嵌套续跑与禁止重做的回归 | 分别复现直接续完子图再续父图、不可重做的上游遇到入口否决和重试。核对实际工具写入次数、完成记录归属，以及取消后还能续哪份档。[直接恢复子图](../../agent_v2/handoff_commit_test.go) · [入口否决](../../compose_v2/entry_reject_paths_test.go) |
-| 5 | A10 · 核准 MySQL 数值写入和筛选边界 | 在目标 MySQL 版本用 `1e400` 和 `0.10000000000000000001` 做写入、回读及范围查询，记录驱动错误、实际保存值和命中行，明确对调用方的约定。[旧版实测](todo-history.md) · [当前方言](../../sql/dialect_mysql.go) |
+| 1 | A11、A13 · 补嵌套续跑与禁止重做的回归 | 分别复现直接续完子图再续父图、不可重做的上游遇到入口否决和重试。核对实际工具写入次数、完成记录归属，以及取消后还能续哪份档。[直接恢复子图](../../agent_v2/handoff_commit_test.go) · [入口否决](../../compose_v2/entry_reject_paths_test.go) |
+| 2 | A10 · 核准 MySQL 数值写入和筛选边界 | 在目标 MySQL 版本用 `1e400` 和 `0.10000000000000000001` 做写入、回读及范围查询，记录驱动错误、实际保存值和命中行，明确对调用方的约定。[旧版实测](todo-history.md) · [当前方言](../../sql/dialect_mysql.go) |
 
 其余可单独验证的窄路径有 A08 的慢历史写入与共享输入去重、A14 的嵌套同名工具观测分类、A17 的自定义模型工具调用 ID。
 
@@ -48,7 +45,6 @@
 
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
-| C18 | 能力缺口 | 按 Handoff 来源收窄候选与按次暂停转交 | 源自 ISSUE-99 的 #7 和 #8。分别验证候选权限和同一次执行中 tool/程序化转交都受控制。 [控制信号](../issue/issue-99-handoff-control-signal.md) |
 | A06 | 验收 | Anthropic 真流、错误分类与服务端上下文清理 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。跑 `TestSmoke_ContextEditing` 确认两种清理的实际统计、与 compaction 组合的请求以及严格前缀回放。另核对实际触发压缩后的交互和编辑前后的缓存用量。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [流式冒烟命令](../description/smoke-test-recipes.md) · [清理冒烟](../../example/model/anthropic_smoke/context_editing_test.go) |
 | A07 | 验收 | 跑齐 thinking 多轮回放、关停和 provider 变体 | 使用现有模型集成入口补 3 轮以上及中途关闭的对照。Anthropic 的空闲/计费另见 A06。历史 TODO 570。 |
 | A08 | 验收 | 复核有具体目标的弱测试与历史探针 | 核对 Reflect/Plan 失败重试代数、Toolkit.StreamCall 的流式分派与退化，以及观测扇出实例和真实 fallback 指标。ISSUE-99 的现有嵌套测试已断言各成员输出，补慢历史后端下共享输入只写一次的断言。provider 候选归 A18。历史 TODO 207、291、569、639–640、659 及 ISSUE-16、99。 |
@@ -58,7 +54,6 @@
 | A13 | 验收 | 复核禁止重做的入口否决与重试 | 现有回归已覆盖有权重做的上游及若干钩子相位。余下用 AddSubgraphNode、成员主图和 RunWithRetry 对照不可重做的输入，检查上游调用次数、重试之间的代际与取消时的存档。 [条件边](../../compose_v2/out_edges.go) · [入口否决回归](../../compose_v2/entry_reject_paths_test.go) |
 | A14 | 验收 | 低阶 BasicAgentBuilder 的工具 tracing 使用自身类型查表 | 嵌套节点运行同名工具时，验证观测分类来自自身的位置与工具绑定，而不是调用方的表。历史 TODO 532。 [构建器](../../agent_v2/basic_builder.go) |
 | A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `ReasoningContent` 文本已计入，签名块可能仅存在标注。优先用真实回放的服务端 input usage 对照触发点。历史 TODO 329。 [估算](../../compose_v2/token_estimate.go) · [Anthropic](../../model/anthropic/client.go) |
-| A16 | 缺陷 | 同任务不同成员独立返回同一消息 ID 时缺少后一个成员的回复历史 | 两个成员均执行并收到不同输入。复用同一对象或换对象保留同一 ID，均只写第一份归属。修复后独立产出各自归档，真正透传只记原归属。历史 TODO 428。[复现与对照](backlog-audit.md#2026-11-23-会话历史与评测复核) · [历史归属](../../agent_v2/history_slot.go) |
 | A17 | 验收 | 复测自定义模型的非 UTF-8 工具调用 ID | provider JSON 下不会产生这类 ID。通过自定义模型和持久存档复核中断寻址，确认入口应规范化还是拒绝。历史 TODO 341。Redis 旧 GraphID 的迁移修复见 [D07](backlog-audit.md#2026-11-18-剩余缺陷修复)。 |
 | A18 | 验收 | 核对仍有独立使用意义的历史审查条目 | 对只有档案结论的事项按台账定位。先核对现行的长 HistoryKey 可移植边界、旧候选可用性及低阶/自定义入口，再决定是否补测试。 [历史 TODO 逐条表](backlog-audit.md#历史-todo-逐条核验) |
 | Q01 | 待决 | 可插拔 Sandbox 的一致性边界 | 现有 `Sandbox` 和工具适配器只提供约定及单测。确定哪些文件、网络、进程及取消语义由每个应用实现保证，是否要落可共享 conformance。 [现行契约](../v2/sandbox.md) · [接口](../../sandbox/sandbox.go) |
@@ -76,7 +71,7 @@
 | Q14 | 待决 | Sandbox/Code Mode 与框架信任边界 | 在 Q01 确定一致性接口后再决定可执行能力和隔离模型。授权化检索、审批工具提示另有行。历史 TODO 408、414、439。 |
 | Q15 | 待决 | 文档与测试门禁是否扩展 | 候选含 godoc 位置、守护测试的符号覆盖、全称 AST 断言、golden、并行审计隔离和 finding 判据。先以可复现错误验证收益。历史 TODO 363、400、401、418、492 及 ISSUE-73。 |
 | Q16 | 待决 | 复用各编排的 Run 序幕与钩子相位 | 核对构建/载入/失败存档与 start/end 内嵌子调用身份。保留现有入口独立覆盖，按真实漂移决定是否抽取。历史 TODO 402、561、585。 |
-| Q17 | 待决 | Store、历史及压缩数据的保留和成本 | 核对 HistoryStore 留存和导出、PG 表达式索引与 CASE 类型守卫成本、AutoCompact 体量及摘要边界格式。以实际负载建立基线。历史 TODO 425、493、500 及 ISSUE-99。 |
+| Q17 | 待决 | Store、历史及压缩数据的保留和成本 | 核对 HistoryStore 留存和导出、PG 表达式索引与 CASE 类型守卫成本、AutoCompact 体量及摘要边界格式。晚到前文的批量查重已验证。其余各项需要用实际负载建立基线。历史 TODO 425、493、500 及 ISSUE-99。 |
 | Q18 | 待决 | 决策模型推广至其他决策点 | RoutingAgent 已有；Reflect 评估/Plan 规划等先明确各自结果、错误和人审策略，避免套用路由阈值。历史 TODO 293。 |
 | Q19 | 待决 | Plan 步骤同批依赖与动态并行 | 明确何时启用 DAG，同批 InputRefs 的解析时机和并行失败语义。当前 Plan 逐轮只执行首步。 [ISSUE-47](../issue/issue-47-planstep-explicit-input-refs.md) |
 | Q20 | 待决 | Plan 级主动审批 | 现有 ExecInputBuilder 的 Ask 可在单步审批。若要内置 plan gate，先定义首次计划、重规划和版本变化时审批复用。 [ISSUE-58](../issue/issue-58-interrupt-timing-semantics.md) |
@@ -89,7 +84,9 @@
 
 ## 已关闭及归并去向
 
-- **失败用量、评测逐轮记录和 Folio 式恢复**已在 `bb3749c` 合入。**ISSUE-100** 已在 `7ebad49` 修复。Q17 的后续查询成本单列验收。[失败用量回归](../../observability/failed_usage_test.go) · [轨迹记录回归](../../example/decision/trajectory_eval/records_test.go) · [上下文恢复](../v2/context-recovery.md) · [ISSUE-100](../issue/issue-100-history-compaction-concurrent.md)
+- **A16、C18 和 Q17 的查询子项已完成。** 独立成员各自保留回复历史。Handoff 可按来源限制目标并按次暂停新转交。摘要边界后的前文按批量 ID 查重。[回归与数据库实测](backlog-audit.md#2026-11-23-历史归属转交策略与晚到前文)
+
+- **失败用量、评测逐轮记录和 Folio 式恢复**已在 `bb3749c` 合入。**ISSUE-100** 已在 `7ebad49` 修复。[失败用量回归](../../observability/failed_usage_test.go) · [轨迹记录回归](../../example/decision/trajectory_eval/records_test.go) · [上下文恢复](../v2/context-recovery.md) · [ISSUE-100](../issue/issue-100-history-compaction-concurrent.md)
 - **A04 已完成。** 2026-11-18 使用 `gpt-5.4-mini` 验收 Chat Completions 和 Responses，两种 API 的流式与工具调用共四项均通过。 [实测结果](../description/smoke-test-recipes.md#2026-11-18-实测结果)
 - **AgentDock 对照发现的七项缺陷已修。** 涵盖同存档实例互斥、Plan Web 断线、同批检索（Q26）、A2A 补答、后台结果、同名调用统计和 Redis 空 namespace（Q17 的子项）。 [逐项回归](backlog-audit.md#2026-11-20-agentdock-对照修复)
 
