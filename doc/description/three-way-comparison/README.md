@@ -1,6 +1,7 @@
 # 三方对照文档（crew-go / LangGraph / eino）
 
-最近两个月的框架发布、15 个本地参考仓的同步快照，以及与 crew-go 的对照，见
+本轮参考仓同步、框架更新、近期论文及与 crew-go 的对照，见
+[2026-11-23 行业与论文增量调查](industry-survey-20261123.md)。前一轮记录见
 [2026-11-12 行业增量调查](industry-survey-2026q4.md)。
 
 ## 用途
@@ -69,14 +70,16 @@ CLAUDE.md 已加：
 | `runtime-model-params.md` | 运行时模型参数控制（thinking/reasoning 按次开关）**五方**对照（eino/OpenAI-Agents/MAF/LangChain·LangGraph/CrewAI）| ✅ 已写 | ISSUE-89 |
 | [`industry-survey-2026q3.md`](industry-survey-2026q3.md) | **2026-09-21 增量调查**：运行中插话、回合结束闸门、AG-UI 1.0 和当时的 OTel 快照 | ✅ 已写 | 插话/闸门拍板 |
 | [`industry-survey-2026q4.md`](industry-survey-2026q4.md) | **2026-09-12 至 11-12 增量调查**：逐问恢复、异步子 agent、决策模型、过程评测、流式与观测 | ✅ 已写 | 上游版本和源码快照 |
+| [`industry-survey-20261123.md`](industry-survey-20261123.md) | **2026-11-23 增量调查**，参考仓同步、框架运行语义、上下文与编排论文、crew-go 跟进建议 | ✅ 已写 | 上游提交和论文原文 |
 
 ## 三方源码本地路径
 
-2026-11-12 调研的具体 SHA、同步范围和发布版本见 [本轮源码快照](industry-survey-2026q4.md)。
+2026-11-23 的 SHA、同步状态及参考仓边界见 [最新源码快照](industry-survey-20261123.md#一本地参考仓同步)。
+前一轮起点见 [11 月 12 日快照](industry-survey-2026q4.md#六本地源码快照)。
 
 | 项目 | 路径 | 核对分支 |
 |---|---|---|
-| crew-go | `/Users/gupengfei/program/go/src/crew-go` | `test`，调研基线 `c35ef98` |
+| crew-go | `/Users/gupengfei/program/go/src/crew-go` | `origin/test`，本轮基线 `85a140b` |
 | LangGraph | `/Users/gupengfei/program/go/src/langgraph` | `main` |
 | eino | `/Users/gupengfei/program/go/src/eino` | `main`、`origin/alpha/10` |
 | LangChain | `/Users/gupengfei/program/go/src/langchain` | `master` |
