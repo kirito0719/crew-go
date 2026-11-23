@@ -1,6 +1,6 @@
 # crew-go 问题清单（v1 时代历史 ISSUE + v2 ISSUE-73 起）
 
-当前状态见 [优先级清单](../code/todo.md) 和 [ISSUE-01 至 ISSUE-99 逐条核验](../code/backlog-audit.md)。本页保留原始题目、实施经过与历史链接。
+当前状态见本页活跃补充、[优先级清单](../code/todo.md) 和 [ISSUE-01 至 ISSUE-99 逐条核验](../code/backlog-audit.md)。本页保留原始题目、实施经过与历史链接。
 
 > ⚠️ **历史 ISSUE 集合**：本目录 ISSUE-40~72 + 本清单本身都是 v1 时代
 > （`agent/` + `compose/`，GraphState-based）的问题跟踪。Stage 7 后 v1 已删，
@@ -11,6 +11,10 @@
 > v2 演化历史看 [`../v2/migration-history.md`](../v2/migration-history.md)；
 > **当初为什么转 channel-based** 看 [`../v2/why-channel-based.md`](../v2/why-channel-based.md)
 > （本目录中很多 ISSUE 最终被 channel-based 重设计自然解决，详见该文档"实际收益验证"表）。
+
+## 活跃补充
+
+- [ISSUE-100：并发任务的历史压缩边界缺少源水位](issue-100-history-compaction-concurrent.md)，待决。ContextRecovery 不新增此类发布路径，既有 AutoCompact 的并发边界仍需定义源覆盖范围。
 
 ## v2 期 ISSUE 索引（73+）
 

@@ -297,7 +297,8 @@ trace。
 | `gen_ai.invoke_workflow.duration` | 直方图 / s | `gen_ai.workflow.name`；失败时 `error.type` |
 | `gen_ai.execute_tool.duration` | 直方图 / s | `gen_ai.tool.name`、`gen_ai.tool.type`、`gen_ai.agent.name`；失败时 `error.type`，被审批拒绝时 `crew.tool.outcome=denied`；从工具账重放的不记 |
 
-- token 计数在模型调用成功且带用量时记，数量为 0 的省略。
+- token 计数包含成功输出及失败尝试已报告的用量，数量为 0 的省略。失败后重试或切换候选成功，也保留此前已消耗的 token；未知用量不估算。`model.WithFailureUsage` 保留错误链中的用量，`model.UsageFromError` 可供直接调用客户端的业务读取。
+- BasicAgent 在 `OnModelStart` 前隔离失败用量观察者。观测钩子在该钩子内通过 `model.WithFailedUsageObserver` 安装回调；fallback 每次失败、模型整次重试和流式错误通过带回执的错误去重。失败尝试产生带 provider、响应模型和已知用量的 `crew.model.failed_usage` span event；失败输出缺少完整消息，输出模态记 `unknown`。成功调用原有的 `OnModelEnd` 和答复重用标记保持原契约。
 - 口径照约定：输入 token 含缓存读写（cache_read / cache_write 是它的子集）；输出 token 含推理 token（约定要求推理计入
   输出、输出取计费口径）。`MessageUsage.OutputTokens` 本来就是这个口径（`ThinkTokens` 是它的子集，openai 兼容客户端取 `completion_tokens_details.reasoning_tokens`、Claude 取 `output_tokens_details.thinking_tokens`），原样记。缓存写入目前只有
   `model/anthropic` 报。

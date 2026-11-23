@@ -6,6 +6,7 @@ import (
 
 	"crew-go/agent_v2"
 	"crew-go/hook"
+	"crew-go/model"
 	specModel "crew-go/modules/model"
 	"crew-go/schema"
 )
@@ -79,7 +80,7 @@ func (w *wrappedHooks) OnModelStart(ctx context.Context, info *hook.AgentInfo, i
 		return ctx, err
 	}
 	o.modelStartContent(mh, in)
-	return o.keepHandles(ctx1, ctx2), nil
+	return model.KeepFailedUsageObservers(ctx1, o.keepHandles(ctx1, ctx2)), nil
 }
 
 func (w *wrappedHooks) OnModelEndStream(ctx context.Context, info *hook.AgentInfo, sr specModel.MessageStreamReader) (context.Context, specModel.MessageStreamReader, error) {

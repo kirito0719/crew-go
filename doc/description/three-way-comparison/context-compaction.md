@@ -1,5 +1,7 @@
 # 上下文压缩 / 内容卸载 —— 五家对照
 
+2026-11-23 的新增决策见[可取回的折叠视图](#2026-11-23可取回的折叠视图)。
+
 > 权威设计文档是 [`doc/v2/context-compaction.md`](../../v2/context-compaction.md)（我们自己的 4 层压缩）。
 > 本篇只记**对照结论与决策**。
 >
@@ -364,3 +366,40 @@ ReactiveCompact 的 prompt-too-long 检测与重试语义、9 段切分算法、
 | 同行做这件事的理由**不是延迟，是历史重写的安全点**——循环还在用那份 transcript，中途改不安全，回合末是唯一安全点 | 两家的注释各自写明（见调查文档引文） |
 | 五家实现里**没有一家**是「追加 marker + 读取侧自己算截断点」；全都追加一条**自带被替换内容或跨度**的记录（完整替换后历史 / 跨度端点 / 新父指针） | marker-only 形态 = 写入侧与读取侧各有一份「这儿是哪儿」的判据，必然漂 |
 | 「把延迟挪走」同行给的是**另一个形状**：提前起跑（离阈值还有 N 个百分点时后台先摘好缓存，撞线只做应用，撞上在飞就等它）。它敢放后台的前提是「只读快照、不改共享态」+ **长驻执行体** | 我们 `Run()` 会返回，活过它的 goroutine 没有主人（谁启动谁负责退出）⟹ 前提不成立，只备查不照抄 |
+
+## 2026-11-23：可取回的折叠视图
+
+[Folio（arXiv:2611.16627v1）](https://arxiv.org/html/2611.16627v1) 把短笔记、运行时清单和原文分层保存，再按需恢复。crew-go 在既有压缩体系前增加可选的 `WithContextRecovery`，不改变默认行为：
+
+- L1 取业务提供的 `ContextRecoveryNoteAnnotation` 或确定性的正文预览；不会自动要求模型在普通回复中产出笔记。
+- L2 从实际消息生成角色、工具名与配对 ID 清单；L3 在 Store 保存可恢复的模型可见字段。
+- 先归档再替换送模视图；工具配对、当前原始输入、未回应插话、system 和 Skill 等内容保留。`read_context` 在当前 owner、会话与稳定历史成员位置内有界读取。
+- 只复用随 checkpoint 保存的 Run 内备忘。跨 Run 从原始历史重新折叠，同内容继续使用相同定位符，可能重复写同一键。
+
+**不发布新的跨 Run 折叠历史边界。** 并发任务 A 读完历史后，B 可能先完成；A 晚到的自包含快照不能代表 B 的新增记录。现有 HistoryStore 的 cursor 不透明，消息 ID 也不是追加记录的位置，不能靠猜水位宣称快照完整。发布资格由本轮实际完成 AutoCompact 摘要的入口明确给出；仅继承旧摘要不获得资格。已有 AutoCompact 的并发快照问题另记 [ISSUE-100](../../issue/issue-100-history-compaction-concurrent.md)，本轮不新增同类发布路径。
+
+这个实现采用分层恢复思路，没有复现 Folio 的 dossier、成本优化器和论文任务集结果。API、预算边界与生产回归见[使用文档](../../v2/context-recovery.md)。
+
+### 同轮补充：失败用量与过程评测
+
+OpenAI Agents SDK 本地 `6c4e4a29` 的 `src/agents/models/_response_terminal.py` 将失败 Responses 的 usage 放到错误上，重试层再记账。crew-go 采用保留原错误链的 `model.WithFailureUsage`，在实际失败尝试处登记回执，处理 fallback、嵌套调用与共享限流门重复呈现旧错误的场景。成功答复和 Resume 复用仍沿原有 `OnModelEnd` 契约；只统计已报告用量，不估算未知 token。
+
+评测在已有 pass@k、pass^k、P95 与费用汇总基础上补充 `-records` JSONL，每次试验与每个模型轮次都能单独核对。记录包含实际绑定工具 schema、前言与对话快照、请求配置、审批答案、工具体参数和失败用量；不新增重复指标。见 [trajectory_eval](../../../example/README.md#agent-行为评测)。
+
+### 2026-11-23 验收记录
+
+基线 `85a140b`。在独立 `codex/usage-eval-context-recovery` 分支验证，未修改其他 Worktree 的待提交文件。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `make test-all`（`GOFLAGS='-count=1 -p=4'`） | 53 个包检查通过；教学集成 9 项通过、12 项缺少真模型凭据跳过 |
+| `make cover` | 10 个核心包门禁通过，核心总覆盖率 88.3% |
+| `make vet` | 根模块及 redis、sql、a2a/zk 子模块通过 |
+| `go test -race` | model、model/openai、model/anthropic、fallback、observability、agent_v2、trajectory_eval 通过；internal/inference 无独立测试文件，其直接路由路径由 observability 回归覆盖 |
+| `nested_smoke` | 12/12，通过中断、嵌套恢复和清档断言 |
+| Plan Web mock | SSE 挂起、继续、最终消息与 HTTP 410 通过 |
+| `trajectory_eval -runs 3 -records ...` | 12 条试验、18 轮记录；15 个 lookup 轮次都有实际绑定 schema；pass@3 与 pass^3 均 4/4 |
+| 隔离撤销修复的对照 | 失败用量、稳定成员定位、继承旧摘要的边界发布三条回归均实际失败；修复版通过 |
+| 文档与注释 | 实际 diff（含新文件）经过 commentaudit，未发现 ERROR；公开 API 用 go doc 核对 |
+
+失败用量、恢复所有权、评测与文档分别经过独立复审；发现使用生产组件或真实 wire-format stub 复现后修复。既有 AutoCompact 并发快照问题保持 ISSUE-100 的开放状态。

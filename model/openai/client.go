@@ -167,7 +167,13 @@ func (c *Client) providerName() string {
 }
 
 // Generate 调用 OpenAI API（非流式）。
-func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts ...model.Option) (out *schema.Message, err error) {
+	var resp openaiResponse
+	defer func() {
+		if resp.Usage != nil {
+			err = model.WithFailureUsage(err, resp.Usage.toSchema(), c.system, resp.Model)
+		}
+	}()
 	o := model.Apply(opts...)
 	req, err := c.buildRequest(messages, o, false)
 	if err != nil {
@@ -179,7 +185,6 @@ func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts 
 		return nil, err
 	}
 
-	var resp openaiResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return nil, fmt.Errorf("openai：解码响应：%w", err)
 	}
@@ -514,6 +519,8 @@ type streamState struct {
 	// lastUnrecognized 是最近一帧既没有 choices 也没有 usage 的原文（截短过）。流没收到
 	// 结束原因就停了时放进错误里：有的 provider 把错误写成这种形状，不带 error 键。
 	lastUnrecognized string
+	usage            *schema.MessageUsage
+	model            string
 }
 
 // consumeStream 读 SSE 响应体，把每个 chunk 转成 *schema.Message 交给 send，最后给流一个
@@ -550,7 +557,7 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, b
 		}
 		// ctx 取消要作为错误交出去：只闭流的话，消费方的 Recv 可能先读到 io.EOF
 		if err := ctx.Err(); err != nil {
-			schema.SendError(sr, err)
+			schema.SendError(sr, model.WithFailureUsage(err, st.usage, c.system, st.model))
 			return
 		}
 		ev, err := dec.next()
@@ -565,7 +572,7 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, b
 		}
 		done, err := c.handleStreamEvent(ctx, ev, &st, indexMap, send)
 		if err != nil {
-			schema.SendError(sr, err)
+			schema.SendError(sr, model.WithFailureUsage(err, st.usage, c.system, st.model))
 			return
 		}
 		if done {
@@ -578,8 +585,9 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, b
 // endStream 在流结束时给出结论。readErr 为 nil 表示收到了 [DONE]，io.EOF 表示连接正常关闭，
 // 其余是读响应体出错。
 func (c *Client) endStream(ctx context.Context, sr *schema.StreamReader[*schema.Message], st *streamState, readErr error) {
+	sendError := func(err error) { schema.SendError(sr, model.WithFailureUsage(err, st.usage, c.system, st.model)) }
 	if err := ctx.Err(); err != nil {
-		schema.SendError(sr, err)
+		sendError(err)
 		return
 	}
 	broken := readErr != nil && !errors.Is(readErr, io.EOF)
@@ -592,7 +600,7 @@ func (c *Client) endStream(ctx context.Context, sr *schema.StreamReader[*schema.
 		return
 	}
 	if broken {
-		schema.SendError(sr, c.streamError(fmt.Errorf("read stream: %w", readErr)))
+		sendError(c.streamError(fmt.Errorf("read stream: %w", readErr)))
 		return
 	}
 	if c.optionalFinishReason {
@@ -602,12 +610,21 @@ func (c *Client) endStream(ctx context.Context, sr *schema.StreamReader[*schema.
 	if st.lastUnrecognized != "" {
 		detail = "; last unrecognized chunk: " + st.lastUnrecognized
 	}
-	schema.SendError(sr, c.streamError(fmt.Errorf("stream ended without finish_reason%s", detail)))
+	sendError(c.streamError(fmt.Errorf("stream ended without finish_reason%s", detail)))
 }
 
 // handleStreamEvent 处理一个 SSE 事件；done 为 true 表示收到了 [DONE]。
 func (c *Client) handleStreamEvent(ctx context.Context, ev sseEvent, st *streamState, indexMap indexToToolCallID, send func(*schema.Message)) (done bool, err error) {
 	if ev.event == "error" {
+		var reported openaiStreamChunk
+		if json.Unmarshal([]byte(ev.data), &reported) == nil {
+			if reported.Usage != nil {
+				st.usage = reported.Usage.toSchema()
+			}
+			if reported.Model != "" {
+				st.model = reported.Model
+			}
+		}
 		return false, c.streamError(fmt.Errorf("stream error event: %s", clip(ev.data)))
 	}
 	if strings.TrimSpace(ev.data) == "" {
@@ -627,9 +644,6 @@ func (c *Client) handleStreamEvent(ctx context.Context, ev sseEvent, st *streamS
 		// 不带原文：这一帧多半是被截断的模型输出，可能含用户的个人信息，而错误文本会进 span、交给前端与对端
 		return false, c.streamError(fmt.Errorf("invalid stream chunk (%d bytes): %w", len(ev.data), err))
 	}
-	if isErrorValue(chunk.Error) {
-		return false, c.streamError(fmt.Errorf("stream error: %s", clip(string(chunk.Error))))
-	}
 	// Round 8 集成验证 fix: include_usage usage 两种 wire 格式兼容:
 	//   - OpenAI 标准: 独立 usage chunk (choices 空 + usage 非空)
 	//   - deepseek: usage 附在末尾 content chunk (choices 非空 +
@@ -639,6 +653,13 @@ func (c *Client) handleStreamEvent(ctx context.Context, ev sseEvent, st *streamS
 	var streamUsage *schema.MessageUsage
 	if chunk.Usage != nil {
 		streamUsage = chunk.Usage.toSchema()
+		st.usage = streamUsage
+	}
+	if chunk.Model != "" {
+		st.model = chunk.Model
+	}
+	if isErrorValue(chunk.Error) {
+		return false, c.streamError(fmt.Errorf("stream error: %s", clip(string(chunk.Error))))
 	}
 	if len(chunk.Choices) == 0 {
 		if streamUsage != nil {

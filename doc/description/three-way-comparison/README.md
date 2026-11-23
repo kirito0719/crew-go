@@ -53,7 +53,7 @@ CLAUDE.md 已加：
 | `conversation-history.md` | 会话历史层（跨 Run 对话留存）| ✅ 已写 | ISSUE-98 |
 | `subgraph-isolation.md` | 子图嵌套与隔离 | ✅ 已写 | ISSUE-64, ISSUE-70 Phase 2 |
 | `interrupt-resume.md` | Interrupt / Resume 语义 | ✅ 已写 | ISSUE-58/59/70 |
-| `context-compaction.md` | 上下文压缩 / 内容卸载 | ⚠️ 部分（仅卸载去重切口）| — |
+| `context-compaction.md` | 上下文压缩、内容卸载与可取回的折叠视图 | 已记录卸载去重及 2026-11-23 恢复与用量决策 | — |
 | `address-routing.md` | NS / Address 寻址模型 | ✅ 已写 | ISSUE-70 Phase 3 |
 | `agent-interface.md` | Agent 接口 / 嵌入协议 | ✅ 已写 | ISSUE-71（接口合并）|
 | `skill-system.md` | Skill 系统设计（SKILL.md / 激活模式 / 子 agent 隔离）| ✅ 已写 | ISSUE-19, ISSUE-73 |

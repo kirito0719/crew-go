@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
@@ -20,14 +21,33 @@ import (
 )
 
 type observations struct {
-	Route        string
-	Outcome      string
-	Calls        []invocation
-	Approvals    []string
-	Final        string
-	InputTokens  int
-	OutputTokens int
+	Route        string             `json:"route"`
+	Outcome      string             `json:"outcome"`
+	Calls        []invocation       `json:"calls"`
+	Approvals    []string           `json:"approvals"`
+	Final        string             `json:"final"`
+	InputTokens  int                `json:"input_tokens"`
+	OutputTokens int                `json:"output_tokens"`
+	Rounds       []roundObservation `json:"rounds"`
 }
+
+type roundObservation struct {
+	Preamble      []*schema.Message   `json:"preamble,omitempty"`
+	Tools         []*schema.ToolInfo  `json:"tools,omitempty"`
+	RequestConfig *schema.ModelConfig `json:"request_config,omitempty"`
+	ElapsedMS     float64             `json:"elapsed_ms"`
+	started       time.Time
+	Agent         string               `json:"agent"`
+	Round         int32                `json:"round"`
+	Input         []*schema.Message    `json:"input"`
+	Output        *schema.Message      `json:"output,omitempty"`
+	Usage         *schema.MessageUsage `json:"usage,omitempty"`
+	FailedUsage   []model.FailedUsage  `json:"failed_usage,omitempty"`
+	Error         string               `json:"error,omitempty"`
+	Reused        bool                 `json:"reused,omitempty"`
+}
+
+type roundKey struct{}
 
 type recorder struct {
 	hook.NoOpHooks
@@ -42,19 +62,61 @@ func (r *recorder) OnAgentStart(ctx context.Context, info *hook.AgentInfo, _ *ho
 	return ctx, nil
 }
 
-func (r *recorder) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
-	if out != nil && out.Usage != nil && !hook.IsModelResponseReused(out.Extra) {
+func (r *recorder) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
+	encoded, err := json.Marshal(in)
+	if err != nil {
+		return ctx, fmt.Errorf("record model input: %w", err)
+	}
+	var snapshot schema.ModelInput
+	if err := json.Unmarshal(encoded, &snapshot); err != nil {
+		return ctx, fmt.Errorf("decode model input snapshot: %w", err)
+	}
+	r.mu.Lock()
+	index := len(r.o.Rounds)
+	r.o.Rounds = append(r.o.Rounds, roundObservation{Agent: info.Name, Round: info.Round, Input: snapshot.Messages, Preamble: snapshot.Preamble, Tools: snapshot.Tools, RequestConfig: snapshot.Config, started: time.Now(),
+		Reused: hook.IsModelResponseReused(in.Extra)})
+	r.mu.Unlock()
+	ctx = context.WithValue(ctx, roundKey{}, index)
+	return model.WithFailedUsageObserver(ctx, func(_ context.Context, u model.FailedUsage) {
 		r.mu.Lock()
-		r.o.InputTokens += int(out.Usage.InputTokens)
-		r.o.OutputTokens += int(out.Usage.OutputTokens)
-		r.mu.Unlock()
+		defer r.mu.Unlock()
+		r.o.InputTokens += int(u.Usage.InputTokens)
+		r.o.OutputTokens += int(u.Usage.OutputTokens)
+		r.o.Rounds[index].FailedUsage = append(r.o.Rounds[index].FailedUsage, u)
+	}), nil
+}
+
+func (r *recorder) OnModelEnd(ctx context.Context, _ *hook.AgentInfo, out *schema.ModelOutput) (context.Context, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if out != nil {
+		if index, ok := ctx.Value(roundKey{}).(int); ok {
+			r.o.Rounds[index].ElapsedMS = float64(time.Since(r.o.Rounds[index].started)) / float64(time.Millisecond)
+			r.o.Rounds[index].Output = out.Message
+			r.o.Rounds[index].Usage = out.Usage
+		}
+		if out.Usage != nil && !hook.IsModelResponseReused(out.Extra) {
+			r.o.InputTokens += int(out.Usage.InputTokens)
+			r.o.OutputTokens += int(out.Usage.OutputTokens)
+		}
 	}
 	return ctx, nil
+}
+
+func (r *recorder) OnError(ctx context.Context, _ *hook.AgentInfo, err *schema.CommError) context.Context {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index, ok := ctx.Value(roundKey{}).(int); ok && err != nil {
+		r.o.Rounds[index].ElapsedMS = float64(time.Since(r.o.Rounds[index].started)) / float64(time.Millisecond)
+		r.o.Rounds[index].Error = err.Message
+	}
+	return ctx
 }
 
 const lookupTool = "lookup_asset"
 
 func buildWorkflow(llm model.ChatModel, rec *recorder) agent_v2.Agent {
+	llm = recordingModel{inner: llm, rec: rec}
 	kit := tool.NewToolkit()
 	kit.Register(tool.NewFuncTool(lookupTool, "Look up the status of an asset by key", map[string]any{
 		"type": "object", "properties": map[string]any{"key": map[string]any{"type": "string"}},
@@ -101,8 +163,10 @@ func runFixture(ctx context.Context, c fixture, llm model.ChatModel) (observatio
 		}
 		interrupt, ok := compose_v2.IsInterrupt(err)
 		if !ok {
+			rec.o.Outcome = "error"
 			return rec.o, fmt.Errorf("workflow execution: %w", err)
 		}
+		rec.o.Outcome = "interrupt"
 		queries := interrupt.AllQueries()
 		for _, query := range queries {
 			rec.o.Approvals = append(rec.o.Approvals, query.ToolName)
@@ -187,3 +251,47 @@ func (m mockModel) Stream(ctx context.Context, msgs []*schema.Message, opts ...m
 }
 
 func (m mockModel) WithTools([]*schema.ToolInfo) (model.ChatModel, error) { return m, nil }
+
+// recordingModel 在实际调用点记录本轮绑定后的工具表，避免把钩子之前的候选表当成实际 schema。
+type recordingModel struct {
+	inner model.ChatModel
+	rec   *recorder
+	tools []*schema.ToolInfo
+}
+
+func (m recordingModel) ModelName() string {
+	if named, ok := m.inner.(model.ModelNamer); ok {
+		return named.ModelName()
+	}
+	return ""
+}
+func (m recordingModel) WithTools(tools []*schema.ToolInfo) (model.ChatModel, error) {
+	bound, err := m.inner.WithTools(tools)
+	if err != nil || bound == nil {
+		return bound, err
+	}
+	data, err := json.Marshal(tools)
+	if err != nil {
+		return nil, fmt.Errorf("record bound tools: %w", err)
+	}
+	var snapshot []*schema.ToolInfo
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil, fmt.Errorf("decode bound tools: %w", err)
+	}
+	return recordingModel{inner: bound, rec: m.rec, tools: snapshot}, nil
+}
+func (m recordingModel) recordTools(ctx context.Context) {
+	m.rec.mu.Lock()
+	defer m.rec.mu.Unlock()
+	if index, ok := ctx.Value(roundKey{}).(int); ok {
+		m.rec.o.Rounds[index].Tools = m.tools
+	}
+}
+func (m recordingModel) Generate(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	m.recordTools(ctx)
+	return m.inner.Generate(ctx, in, opts...)
+}
+func (m recordingModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	m.recordTools(ctx)
+	return m.inner.Stream(ctx, in, opts...)
+}

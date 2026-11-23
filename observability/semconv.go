@@ -132,3 +132,6 @@ const (
 	MetricRouteEscalations     = "crew.route.escalations"
 	MetricRouteConfidence      = "crew.route.confidence"
 )
+
+// EventFailedModelUsage 记录失败尝试的已知用量，重试成功也保留。
+const EventFailedModelUsage = "crew.model.failed_usage"

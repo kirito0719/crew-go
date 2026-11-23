@@ -2630,7 +2630,7 @@ func resetRequiredToolChoice(o *model.Options) {
 func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool, conversationTools []tool.Tool) *tool.Toolkit {
 	background = background && cfg.BackgroundTasks != nil
 	references := cfg.Skill != nil && cfg.Skill.SkillBox != nil && hasSkillReferences(cfg.Skill.SkillBox)
-	if !cfg.AskUserOptIn && cfg.OutputSchema == nil && cfg.ToolResultSpill == nil && !background && !references && len(conversationTools) == 0 {
+	if !cfg.AskUserOptIn && cfg.OutputSchema == nil && cfg.ToolResultSpill == nil && cfg.ContextRecovery == nil && !background && !references && len(conversationTools) == 0 {
 		return tk
 	}
 	out := tool.NewToolkit()
@@ -2647,6 +2647,9 @@ func withFrameworkTools(cfg *Config, tk *tool.Toolkit, background bool, conversa
 	}
 	if cfg.ToolResultSpill != nil {
 		out.Register(newReadToolOutputTool(cfg.ToolResultSpill))
+	}
+	if cfg.ContextRecovery != nil {
+		out.Register(newReadContextTool(cfg.ContextRecovery, cfg.Name))
 	}
 	if background {
 		out.Register(newBackgroundTaskTool())
@@ -2769,8 +2772,28 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 		origMsgs := msgs
 		memoUpto, memoHead := 0, 0
 		if memoCtx != nil && memoCtx.in != nil && memoCtx.in.Transient == memoCtx.transient &&
-			cfg.AutoCompact != nil && cfg.AutoCompact.Enabled {
+			((cfg.AutoCompact != nil && cfg.AutoCompact.Enabled) || cfg.ContextRecovery != nil) &&
+			recoveryViewsMatch(ctx, cfg.Name, memoCtx.in.Head) {
 			msgs, memoUpto, memoHead = memoCtx.in.apply(msgs)
+		}
+
+		// 先保存钩子允许的完整旧轮次，再折叠送模视图；后续压缩不能覆盖原文。
+		if cfg.ContextRecovery != nil {
+			inputLen := len(msgs)
+			folded, tailLen := foldContextRecovery(ctx, cfg.Name, cfg.ContextRecovery, msgs)
+			if tailLen >= 0 && memoCtx != nil {
+				// 新折叠可能发生在旧 Head 内，备忘仍需覆盖旧前缀的全部原始位置。
+				memoTail := min(tailLen, inputLen-memoHead)
+				memoCtx.out = nextCompactionMemo(origMsgs, memoUpto, memoHead, inputLen, folded, memoTail)
+				if memoCtx.out != nil {
+					memoCtx.out.Transient = memoCtx.transient
+					memoUpto, memoHead = memoCtx.out.Upto, len(memoCtx.out.Head)
+				}
+			}
+			msgs = folded
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 
 		// 第 1 层 MicroCompact——清白名单 tool 旧 tool_result 内容（保结构）
@@ -2794,6 +2817,7 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 				memoCtx.out = nextCompactionMemo(origMsgs, memoUpto, memoHead, inputLen, compacted, cut.tailLen)
 				if memoCtx.out != nil {
 					memoCtx.out.Transient = memoCtx.transient
+					memoCtx.boundaryEligible = true
 				}
 			}
 			// 摘要是可选优化，只有普通模型错误回退到原消息。任务控制错误由执行引擎处理。
@@ -3051,7 +3075,8 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 			if agentsMD != "" {
 				in = append([]*schema.Message{schema.SystemMessage(agentsMD)}, in...)
 			}
-			return streamOrGenerate(c, llm, withModelUserData(c, in), cfg.Name, runID, cfg.Hooks, streamHookInfo, modelRunOpts...)
+			out, err := streamOrGenerate(c, llm, withModelUserData(c, in), cfg.Name, runID, cfg.Hooks, streamHookInfo, modelRunOpts...)
+			return out, model.ReportFailedUsage(c, err)
 		}
 		// callLLM 按 WithModelRetry 整次重来：一次调用就是一条消息、工具在 tools 节点才执行，重来没有本地副作用；
 		// 建流之前与流开始之后的错一样处理。下层（fallback 的每候选重试）已重试到上限的错误带标记，RunWithRetry 不再
@@ -4067,7 +4092,7 @@ func streamOrGenerate(ctx context.Context, llm model.ChatModel, in []*schema.Mes
 				})
 				compose_v2.ForgetStream(ctx, runID) // 撤过了：所在的尝试作废时不再撤一次
 			}
-			return nil, fmt.Errorf("stream recv: %w", recvErr)
+			return nil, model.WithFailureUsage(fmt.Errorf("stream recv: %w", recvErr), finalUsage, finalSystem, finalModel)
 		}
 		if chunk == nil {
 			continue

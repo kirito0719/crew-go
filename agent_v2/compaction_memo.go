@@ -112,6 +112,7 @@ func writeCompactionAnnotations(h hash.Hash64, m *schema.Message) {
 	for _, key := range [...]string{
 		compose_v2.RunIDAnnotationKey, HistoryTaskAnnotation, HistoryAgentAnnotation,
 		MicroCompactOffloadKeyAnnotation, ToolResultSpillAnnotation, toolResultSpillInfoAnnotation, spillIndexAnnotation,
+		ContextRecoveryNoteAnnotation, ContextRecoveryAnnotation, contextRecoveryScopeAnnotation,
 	} {
 		value, _ := annotations[key].(string)
 		writeAnchorField(h, value)
@@ -148,6 +149,8 @@ type compactionMemoCtx struct {
 	in        *compactionMemo
 	out       *compactionMemo
 	transient bool
+	// 只有本轮实际生成 AutoCompact 摘要才可发布跨 Run 边界；不随备忘继承。
+	boundaryEligible bool
 }
 
 type compactionMemoKey struct{}

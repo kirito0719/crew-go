@@ -14,7 +14,7 @@ func IsFrameworkNote(m *schema.Message) bool {
 	if m == nil || m.Role != schema.RoleUser {
 		return false
 	}
-	if IsBackgroundTaskNotification(m) {
+	if IsBackgroundTaskNotification(m) || isRecoveryView(m) {
 		return true
 	}
 	if reminder, _ := m.Annotations[RepeatToolReminderAnnotation].(bool); reminder {

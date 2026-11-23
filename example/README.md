@@ -50,6 +50,7 @@ curl -N -H 'Content-Type: application/json' http://127.0.0.1:8094/agui \
 
 ```bash
 go run ./example/decision/trajectory_eval -runs 3
+go run ./example/decision/trajectory_eval -runs 3 -records /tmp/trajectory.jsonl
 go run ./example/decision/trajectory_eval -cases /path/to/cases.jsonl -mode qwen -runs 5
 ```
 
@@ -59,6 +60,8 @@ go run ./example/decision/trajectory_eval -cases /path/to/cases.jsonl -mode qwen
 命令也支持 `-mode openai` 使用 Responses，以及用 `-model` 指定模型。真机模式读取对应的
 `QWEN_API_KEY` 或 `OPENAI_API_KEY`。报告包含通过次数、`pass@k`、`pass^k`、P95 和 token 用量，
 给出 `-input-price` 与 `-output-price` 时按每百万 token 单价估算费用。
+`-records` 将每次试验写成一行 JSONL（覆盖目标文件），失败与预期中的挂起也写入。记录包含数据集 SHA-256、模型与运行配置、预期、审批答案、实际路由、审批、工具体参数、最终答复、耗时、费用估算，以及 `observed.rounds` 中每轮的前言、对话和请求配置的钩子视图，实际绑定的工具 schema，以及输出、用量、失败尝试用量与错误。输入视图在压缩前记录，不等同于 provider 的最终 wire 请求。已知的失败用量计入费用；模型未报告用量时不补估 token。
+每次试验完成后立即写入；写入或关闭失败会使命令失败，已完成的记录可单独读取。
 [JSONL 示例](decision/trajectory_eval/cases.jsonl)
 
 ## 常用命令

@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync/atomic"
 
+	"crew-go/model"
 	"crew-go/schema"
 )
 
@@ -23,7 +24,15 @@ type streamGateReceipt struct {
 func peekStream(ctx context.Context, raw *schema.StreamReader[*schema.Message]) (*schema.StreamReader[*schema.Message], error) {
 	sawMessage := false
 	frames := 0
+	var usage *schema.MessageUsage
+	var provider, name string
 	_, err := raw.ReadAhead(ctx, func(msg *schema.Message) bool {
+		if msg != nil && msg.Metadata != nil {
+			if msg.Metadata.Usage != nil {
+				usage = msg.Metadata.Usage
+			}
+			provider, name = msg.Metadata.System, msg.Metadata.Model
+		}
 		sawMessage = sawMessage || msg != nil
 		frames++
 		return visibleStreamChunk(msg) || frames >= streamPeekLimit
@@ -35,7 +44,7 @@ func peekStream(ctx context.Context, raw *schema.StreamReader[*schema.Message]) 
 	if err == nil || errors.Is(err, io.EOF) {
 		err = fmt.Errorf("fallback: model stream returned no message during lookahead: %w", io.ErrUnexpectedEOF)
 	}
-	return nil, err
+	return nil, model.WithFailureUsage(err, usage, provider, name)
 }
 
 func visibleStreamChunk(msg *schema.Message) bool {

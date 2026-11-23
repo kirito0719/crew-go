@@ -155,6 +155,9 @@ type Config struct {
 	// 只留说明 + 头尾预览 + 取回 id，并注入 read_tool_output。经 [WithToolResultSpill] 设，见 tool_spill.go。
 	ToolResultSpill *ToolResultSpillConfig
 
+	// ContextRecovery 启用可取回的上下文折叠；nil 关闭，见 [WithContextRecovery]。
+	ContextRecovery *ContextRecoveryConfig
+
 	// BackgroundTasks 是长时间运行工具的后台执行配置（nil = 关闭）——点名的工具一次调用跑过 YieldAfter 还没返回
 	// 就转入后台、先给模型一个任务 id，结束后作为通知送进对话，并注入 background_task。经 [WithBackgroundTasks]
 	// 设，适用于顶层及框架在图节点内派发的 BasicAgent。

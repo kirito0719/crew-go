@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -115,6 +117,7 @@ func main() {
 	timeout := flag.Duration("timeout", 90*time.Second, "单条用例的最长执行时间")
 	inputPrice := flag.Float64("input-price", 0, "每百万输入 token 单价")
 	outputPrice := flag.Float64("output-price", 0, "每百万输出 token 单价")
+	recordsPath := flag.String("records", "", "逐次试验与逐轮轨迹 JSONL 输出路径")
 	flag.Parse()
 	if *repeats <= 0 || *timeout <= 0 || *inputPrice < 0 || *outputPrice < 0 {
 		log.Fatal("runs and timeout must be positive, and prices must be non-negative")
@@ -137,6 +140,22 @@ func main() {
 		log.Fatal(err)
 	}
 
+	var records *os.File
+	if *recordsPath != "" {
+		records, err = os.OpenFile(*recordsPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	recordModel := *name
+	if recordModel == "" {
+		if named, ok := llm.(model.ModelNamer); ok {
+			recordModel = named.ModelName()
+		}
+	}
+	digest := sha256.Sum256([]byte(data))
+	settings := evaluationSettings{Mode: *mode, Model: recordModel, DatasetSHA256: hex.EncodeToString(digest[:]), Runs: *repeats,
+		TimeoutMS: timeout.Milliseconds(), InputPrice: *inputPrice, OutputPrice: *outputPrice}
 	var anyPassed, allPassed, trialPassed, inTokens, outTokens int
 	var elapsed []time.Duration
 	for _, c := range cases {
@@ -146,7 +165,13 @@ func main() {
 			start := time.Now()
 			o, err := runFixture(ctx, c, llm)
 			cancel()
-			elapsed = append(elapsed, time.Since(start))
+			duration := time.Since(start)
+			elapsed = append(elapsed, duration)
+			if records != nil {
+				if writeErr := writeTrialRecord(records, c, trial, settings, duration, o, err); writeErr != nil {
+					log.Fatal(writeErr)
+				}
+			}
 			inTokens += o.InputTokens
 			outTokens += o.OutputTokens
 			if err != nil {
@@ -164,6 +189,11 @@ func main() {
 			allPassed++
 		}
 	}
+	if records != nil {
+		if err := records.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}
 	slices.Sort(elapsed)
 	p95 := elapsed[int(math.Ceil(float64(len(elapsed))*0.95))-1]
 	fmt.Printf("trials=%d/%d pass@%d=%d/%d pass^%d=%d/%d p95=%s input_tokens=%d output_tokens=%d",
@@ -175,4 +205,42 @@ func main() {
 	if trialPassed != len(elapsed) {
 		os.Exit(1)
 	}
+}
+
+type evaluationSettings struct {
+	Mode          string  `json:"mode"`
+	Model         string  `json:"model"`
+	DatasetSHA256 string  `json:"dataset_sha256"`
+	Runs          int     `json:"runs"`
+	TimeoutMS     int64   `json:"timeout_ms"`
+	InputPrice    float64 `json:"input_price_per_million"`
+	OutputPrice   float64 `json:"output_price_per_million"`
+}
+
+// 每完成一次试验即写一行，失败和中断也保留已经发生的轨迹与用量。
+func writeTrialRecord(w io.Writer, c fixture, trial int, config evaluationSettings, elapsed time.Duration, o observations, runErr error) error {
+	record := struct {
+		Version       int                `json:"version"`
+		Case          string             `json:"case"`
+		Trial         int                `json:"trial"`
+		Config        evaluationSettings `json:"config"`
+		Input         string             `json:"input"`
+		Expect        expectations       `json:"expect"`
+		Answers       []answer           `json:"answers"`
+		Passed        bool               `json:"passed"`
+		ElapsedMS     float64            `json:"elapsed_ms"`
+		EstimatedCost float64            `json:"estimated_cost"`
+		Error         string             `json:"error,omitempty"`
+		Observed      observations       `json:"observed"`
+	}{Version: 1, Case: c.Name, Trial: trial, Config: config,
+		Input: c.Input, Expect: c.Expect, Answers: c.Answers, Passed: runErr == nil,
+		ElapsedMS:     float64(elapsed) / float64(time.Millisecond),
+		EstimatedCost: (float64(o.InputTokens)*config.InputPrice + float64(o.OutputTokens)*config.OutputPrice) / 1_000_000, Observed: o}
+	if runErr != nil {
+		record.Error = runErr.Error()
+	}
+	if err := json.NewEncoder(w).Encode(record); err != nil {
+		return fmt.Errorf("write trial record: %w", err)
+	}
+	return nil
 }

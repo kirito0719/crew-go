@@ -304,6 +304,11 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 // prompt_too_long → ReactiveCompact exhausted error, 业务可观测 (这是 expected
 // behavior — 业务应启 Read tool 让 LLM 重读 offloaded 全文降 token).
 func isProtectedGroup(group []*schema.Message) bool {
+	for _, m := range group {
+		if isRecoveryView(m) {
+			return true
+		}
+	}
 	if sysMsgs, rest := splitSystem(group); len(sysMsgs) > 0 && len(rest) == 0 {
 		return true
 	}

@@ -68,7 +68,17 @@ func (c *ResponsesClient) resultError(api responsesError, status string) error {
 	return c.base.streamError(fmt.Errorf("responses ended with status %q", status))
 }
 
-func (c *ResponsesClient) convert(result *responsesResult, source string) (*schema.Message, error) {
+func (r *responsesResult) schemaUsage() *schema.MessageUsage {
+	if u := r.Usage; u != nil {
+		wire := openaiUsage{PromptTokens: u.Input, CompletionTokens: u.Output, TotalTokens: u.Total, PromptTokensDetails: u.Cached, CompletionTokensDetails: u.Reasoning}
+		return wire.toSchema()
+	}
+	return nil
+}
+
+func (c *ResponsesClient) convert(result *responsesResult, source string) (out *schema.Message, err error) {
+	usage := result.schemaUsage()
+	defer func() { err = model.WithFailureUsage(err, usage, c.base.system, result.Model) }()
 	if result.Status != "completed" {
 		if result.Status == "incomplete" && result.Incomplete.Reason != "" {
 			return nil, c.resultError(responsesError{Code: result.Incomplete.Reason}, result.Incomplete.Reason)
@@ -81,11 +91,7 @@ func (c *ResponsesClient) convert(result *responsesResult, source string) (*sche
 	msg := &schema.Message{Role: schema.RoleAssistant, Metadata: &schema.MessageMetadata{
 		Model: result.Model, System: c.base.system, FinishReason: "stop",
 	}}
-	if u := result.Usage; u != nil {
-		usage := openaiUsage{PromptTokens: u.Input, CompletionTokens: u.Output, TotalTokens: u.Total,
-			PromptTokensDetails: u.Cached, CompletionTokensDetails: u.Reasoning}
-		msg.Metadata.Usage = usage.toSchema()
-	}
+	msg.Metadata.Usage = usage
 	items := make([]json.RawMessage, 0, len(result.Output))
 	seenCalls := make(map[string]bool)
 	var text, reasoning, refusal strings.Builder
@@ -285,14 +291,17 @@ func finalizeResponsesOutput(output []json.RawMessage, done map[int]json.RawMess
 	return output
 }
 
-func (c *ResponsesClient) readStream(ctx context.Context, body io.Reader, source string, send func(*schema.Message)) error {
+func (c *ResponsesClient) readStream(ctx context.Context, body io.Reader, source string, send func(*schema.Message)) (resultErr error) {
+	var usage *schema.MessageUsage
+	var responseModel string
+	defer func() { resultErr = model.WithFailureUsage(resultErr, usage, c.base.system, responseModel) }()
 	decoder := newSSEDecoder(body)
 	var text, reasoning, refusal responsesDeltas
 	items := make(map[int]json.RawMessage)
 	pending := make(map[int]string)
 	for {
 		frame, err := decoder.next()
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && (err != nil || frame.data == "" || strings.TrimSpace(frame.data) == "[DONE]") {
 			return ctx.Err()
 		}
 		if errors.Is(err, io.EOF) || strings.TrimSpace(frame.data) == "[DONE]" {
@@ -318,7 +327,19 @@ func (c *ResponsesClient) readStream(ctx context.Context, body io.Reader, source
 			responsesError
 		}
 		if err := json.Unmarshal([]byte(frame.data), &ev); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return c.base.streamError(fmt.Errorf("decode responses stream event: %w", err))
+		}
+		if u := ev.Response.schemaUsage(); u != nil {
+			usage = u
+		}
+		if ev.Response.Model != "" {
+			responseModel = ev.Response.Model
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		if frame.event == "error" || ev.Type == "error" {
 			return c.resultError(ev.responsesError, "stream error")

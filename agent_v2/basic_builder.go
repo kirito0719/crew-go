@@ -13,7 +13,7 @@ import (
 	"crew-go/hook"
 	"crew-go/internal/panicerr"
 	"crew-go/internal/toolresult"
-	"crew-go/model"
+	providerModel "crew-go/model"
 	"crew-go/schema"
 )
 
@@ -397,7 +397,7 @@ const ToolCallErrCode = "tool_call_error"
 const ToolBatchFailedExtraKey = "batch_failed"
 
 // ModelCallTimeoutErrCode / ModelContentFilteredErrCode 是模型调用失败时 OnError 的 Code：这次调用自身超时（错误链上有
-// context.DeadlineExceeded，或者节点超时把它停下）、provider 内容过滤拦下了它（model.ErrContentFiltered）。其余失败是
+// context.DeadlineExceeded，或者节点超时把它停下）、provider 内容过滤拦下了它（providerModel.ErrContentFiltered）。其余失败是
 // model_call_error。observability 按前两种把这次调用记成 timeout / blocked。
 const (
 	ModelCallTimeoutErrCode     = "model_call_timeout"
@@ -408,7 +408,7 @@ const (
 func modelCallErrCode(callCtx context.Context, err error) string {
 	var nodeTimeout *compose_v2.NodeTimeoutError
 	switch {
-	case errors.Is(err, model.ErrContentFiltered):
+	case errors.Is(err, providerModel.ErrContentFiltered):
 		return ModelContentFilteredErrCode
 	case errors.Is(err, context.DeadlineExceeded) || errors.As(err, &nodeTimeout) || errors.As(context.Cause(callCtx), &nodeTimeout):
 		return ModelCallTimeoutErrCode
@@ -1066,6 +1066,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 处理这次模型调用时做出的上行信号收在一起（钩子与模型里做出的，多数为空）：定下时连同产出记下，续跑重放定下的
 		// 那一轮时交出当时那份（那时钩子不再触发）。
 		sigs, err := compose_v2.CaptureSignals(ctx, func(segCtx context.Context) error {
+			segCtx = providerModel.ResetFailedUsageObserver(segCtx)
 			// 按 compose_v2.CallHook 的规则采纳：钩子返回别处缓存的 ctx 时，模型的答复照样记进
 			// 这次 Run 的会话历史、之后的转交照样交给这次执行（曾经直接换成钩子的，两样都静默丢，实测）。
 			//
@@ -1120,6 +1121,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				// modelFn 绑工具时把这一轮交给模型的那些填进来（见 toolBinding）
 				sink := &toolBinding{}
 				out, err = model(withToolBindingSink(callCtx, sink), modelIn.Preamble, msgs)
+				err = providerModel.ReportFailedUsage(callCtx, err)
 				if sink.Restricted {
 					binding = sink
 				}
@@ -1136,7 +1138,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 					return err
 				}
 				// 只有源自原始消息流的摘要能成为跨 Run 历史。恢复时沿用当次答复确定的边界。
-				if memo.out != nil && !memo.out.Transient {
+				if memo.out != nil && memo.boundaryEligible && !memo.out.Transient {
 					boundary = buildCompactionBoundary(memo.out, msgs, GetHandoffHistoryMode(ctx))
 				}
 				// 模型调用成功那一刻记下原样：OnModelEnd 因为要等人或被叫停停下时，续跑沿用这一份（见 modelCallRecord）。

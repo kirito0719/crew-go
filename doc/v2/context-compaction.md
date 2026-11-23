@@ -18,6 +18,7 @@
 11. [与 LangGraph / eino 的对比](#与-langgraph--eino-的对比)
 12. [FAQ](#faq)
 13. [关键设计权衡（Round 6 审计沉淀）](#关键设计权衡round-6-审计沉淀)
+14. [可取回的上下文折叠](context-recovery.md)
 
 ---
 
@@ -42,6 +43,8 @@ provider 的 context window 限制（typical 200K），同时保留对话语义�
 ---
 
 ## 4 层架构总览
+
+可选的 [`WithContextRecovery`](context-recovery.md) 在 MicroCompact 之前归档已完成的旧 API 消息组，送模视图保留笔记、调用清单和 `read_context` 定位符。它复用 checkpoint 中的压缩备忘，跨 Run 从完整历史重新折叠，原始消息流仍保留；后续压缩保护已有恢复视图。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐

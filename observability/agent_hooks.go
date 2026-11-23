@@ -16,6 +16,7 @@ import (
 	"crew-go/hook"
 	"crew-go/internal/agentcall"
 	"crew-go/internal/inference"
+	"crew-go/model"
 	specModel "crew-go/modules/model"
 	"crew-go/schema"
 )
@@ -284,7 +285,29 @@ func (o *Observability) startModel(ctx context.Context, info *hook.AgentInfo, in
 	if mh.scope != nil {
 		mh.scope.inference.Add(1)
 	}
-	return o.withHandle(ctx, mh), mh
+	ctx = o.withHandle(ctx, mh)
+	ctx = model.WithFailedUsageObserver(ctx, func(c context.Context, failed model.FailedUsage) {
+		u := &failed.Usage
+		attrs := []attribute.KeyValue{AttrUsageInputTokens.Int(int(u.InputTokens)), AttrUsageOutputTokens.Int(int(u.OutputTokens)),
+			AttrUsageCacheReadTokens.Int(int(u.CachedInputTokens)), AttrUsageCacheWriteTokens.Int(int(u.CacheCreationInputTokens)),
+			AttrUsageReasoningTokens.Int(int(u.ThinkTokens))}
+		if failed.Provider != "" {
+			attrs = append(attrs, AttrProviderName.String(failed.Provider))
+		}
+		if failed.Model != "" {
+			attrs = append(attrs, AttrResponseModel.String(failed.Model))
+		}
+		mh.span.AddEvent(EventFailedModelUsage, trace.WithAttributes(attrs...))
+		labels := mh.inferenceLabels(failed.Provider, failed.Model)
+		in := metric.WithAttributes(append(labels, AttrTokenModality.String(mh.inputModality))...)
+		out := metric.WithAttributes(append(labels, AttrTokenModality.String("unknown"))...)
+		addTokens(c, o.inst.usageInput, u.InputTokens, in)
+		addTokens(c, o.inst.usageCacheRead, u.CachedInputTokens, in)
+		addTokens(c, o.inst.usageCacheWrite, u.CacheCreationInputTokens, in)
+		addTokens(c, o.inst.usageOutput, u.OutputTokens, out)
+		addTokens(c, o.inst.usageReasoning, u.ThinkTokens, out)
+	})
+	return ctx, mh
 }
 
 // modelStartContent 按交给模型的输入记 token 模态与（打开内容采集时）输入内容。

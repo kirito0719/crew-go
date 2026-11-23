@@ -85,10 +85,13 @@ func WithGenerateObserver(ctx context.Context, agentName string, observe Generat
 // Generate 用于框架内直接调模型的决策方。安装观测时，经观测层调用同一个模型和同一份选项。
 func Generate(ctx context.Context, m model.ChatModel, msgs []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 	if binding, _ := ctx.Value(generateObserverKey{}).(generateBinding); binding.observe != nil && PurposeFrom(ctx) == Routing {
+		ctx = model.ResetFailedUsageObserver(ctx)
 		in := &schema.ModelInput{Config: model.RequestConfig(m, opts...)}
 		return binding.observe(ctx, binding.agentName, in, func(callCtx context.Context) (*schema.Message, error) {
-			return m.Generate(callCtx, msgs, opts...)
+			reply, err := m.Generate(callCtx, msgs, opts...)
+			return reply, model.ReportFailedUsage(callCtx, err)
 		})
 	}
-	return m.Generate(ctx, msgs, opts...)
+	reply, err := m.Generate(ctx, msgs, opts...)
+	return reply, model.ReportFailedUsage(ctx, err)
 }

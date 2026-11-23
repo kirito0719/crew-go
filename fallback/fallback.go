@@ -513,6 +513,7 @@ func callMemberWithRetry[T any](ctx context.Context, retry PerModelRetry, mem *f
 	}
 	for attempt := startAttempt; attempt <= maxRetries; attempt++ {
 		out, err = call(ctx, mem.model)
+		err = model.ReportFailedUsage(ctx, err)
 		if err == nil {
 			return out, nil, nil, false
 		}

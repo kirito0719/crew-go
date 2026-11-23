@@ -347,7 +347,7 @@ func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts 
 	}
 	turn, err := c.interpret(ctx, resp, nil)
 	if err != nil {
-		return nil, err
+		return nil, model.WithFailureUsage(err, usageOf(resp.Usage), ProviderName, string(resp.Model))
 	}
 	return &schema.Message{
 		Role:             schema.RoleAssistant,

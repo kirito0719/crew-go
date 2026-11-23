@@ -11,6 +11,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 
 	"crew-go/internal/panicerr"
+	"crew-go/model"
 	"crew-go/schema"
 )
 
@@ -23,6 +24,13 @@ import (
 //
 // cancel 取消的是读响应体用的 ctx：消费方 Close 时调它，阻塞在读响应体上的 Next 立刻返回。
 func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, stream *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion], sr *schema.StreamReader[*schema.Message], send func(*schema.Message)) {
+	var acc anthropic.BetaMessage
+	sendError := func(err error) {
+		if acc.ID != "" {
+			err = model.WithFailureUsage(err, usageOf(acc.Usage), ProviderName, string(acc.Model))
+		}
+		schema.SendError(sr, err)
+	}
 	defer schema.CloseSend(sr)
 	defer cancel()
 	defer func() { _ = stream.Close() }() // 关响应体的错误没有下文
@@ -30,7 +38,7 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, s
 	defer func() {
 		if r := recover(); r != nil {
 			pe := panicerr.New(r)
-			schema.SendError(sr, panicerr.WrapOpaque("anthropic consumeStream panic", pe))
+			sendError(panicerr.WrapOpaque("anthropic consumeStream panic", pe))
 			panicerr.Log(ctx, slog.LevelError, "anthropic: 流解析 goroutine 兜住 panic，已作为流错误交给消费方", pe)
 		}
 	}()
@@ -45,7 +53,6 @@ func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, s
 	}()
 
 	var (
-		acc     anthropic.BetaMessage
 		joiner  textJoiner
 		stopped bool
 		// rawInputs 收下每个 tool_use 块参数的原文：SDK 累积时会把截断的参数换成 {}，判断与上报截断要看
@@ -59,7 +66,7 @@ readEvents:
 	for stream.Next() {
 		ev := stream.Current()
 		if err := acc.Accumulate(ev); err != nil {
-			schema.SendError(sr, c.streamError(fmt.Errorf("accumulate %s event: %w", ev.Type, err)))
+			sendError(c.streamError(fmt.Errorf("accumulate %s event: %w", ev.Type, err)))
 			return
 		}
 		switch ev.Type {
@@ -108,15 +115,15 @@ readEvents:
 	}
 	// ctx 取消要作为错误交出去：只闭流的话，消费方的 Recv 可能先读到 io.EOF。
 	if err := ctx.Err(); err != nil {
-		schema.SendError(sr, err)
+		sendError(err)
 		return
 	}
 	if err := stream.Err(); err != nil {
-		schema.SendError(sr, c.streamFailure(err))
+		sendError(c.streamFailure(err))
 		return
 	}
 	if !stopped {
-		schema.SendError(sr, c.streamError(errors.New("stream ended without message_stop")))
+		sendError(c.streamError(errors.New("stream ended without message_stop")))
 		return
 	}
 	raw := make(map[int]string, len(rawInputs))
@@ -125,7 +132,7 @@ readEvents:
 	}
 	turn, err := c.interpret(ctx, &acc, raw)
 	if err != nil {
-		schema.SendError(sr, err)
+		sendError(err)
 		return
 	}
 	send(&schema.Message{

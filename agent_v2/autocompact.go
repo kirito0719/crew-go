@@ -633,6 +633,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		return messages, err
 	}
 	resp, err := cfg.Model.Generate(summaryCtx, callInput)
+	err = model.ReportFailedUsage(summaryCtx, err)
 	if hasEventSink(ctx) {
 		generateAction := &CompactionGenerateAction{
 			Attempt:  1,
@@ -835,6 +836,9 @@ func splitProtectedGroups(earlyGroups [][]*schema.Message) (protectedMsgs, summa
 // MicroCompactOffloadedAnnotation）的 message。含 system 不在这里判：那只保 system 本身（见 splitProtectedGroups）。
 func groupContainsProtectedMarker(group []*schema.Message) bool {
 	for _, m := range group {
+		if isRecoveryView(m) {
+			return true
+		}
 		if m == nil || m.Annotations == nil {
 			continue
 		}
