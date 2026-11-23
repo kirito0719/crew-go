@@ -6,6 +6,25 @@
 
 **证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，剩余目标 CI、真实 provider 和业务数据验收见 A02、A03、A05–A07。
 
+## 2026-11-23 会话历史与评测复核
+
+基线为本地及远端 `test` 的 `7ebad49`。两个历史探针均走生产 GraphAgent 或 BasicAgent，分别使用内存和 SQLite HistoryStore。探针通过 Go overlay 运行。
+
+**A16 · 独立产出的归属。** 父图依次通过 `RunSubAgent` 调用 `s1` 和 `s2`，记录两个节点的实际入参、执行次数和历史里的回复归属。每个后端上四组场景各跑 12 次，两节点每次各执行一次，两种后端读出的归属一致。[边界补记](../../agent_v2/history_slot.go) · [图与真实透传的既有用例](../../agent_v2/history_graphagent_shapes_test.go)
+
+| 第二个成员接收的输入 | 第二个成员返回的消息 | 历史里的回复归属 |
+| --- | --- | --- |
+| 独立请求 | 相同正文，新对象、新 ID | `s1`、`s2` |
+| 独立请求 | 两个成员共用的回复对象 | 仅 `s1` |
+| 独立请求 | 新对象，沿用第一份回复的 ID | 仅 `s1` |
+| 第一份回复 | 原样返回输入 | 仅 `s1` |
+
+中间两组缺少 `s2` 的独立回复，A16 由验收改列 P3 缺陷。修复时保留第一组的双归属和最后一组的单归属，并复跑跨 Resume 的透传回归。[父图续跑时的产出归属](../../agent_v2/history_graphagent_scope_test.go)
+
+**Q17 · 晚到前文的查询次数。** BasicAgent 先生成一个已确认的摘要边界，再写入 0、1、16、64 条不同 ID 的调用方前文。下一次 Run 用 Rewrite 视图读取，内存和 SQLite 上都对应 0、1、16、64 次按消息 ID 回查边界之前的 `Load`。这个计数只含去重查询。模型请求里保留了原摘要，每条新前文恰好出现一次。SQL 后端每次这样的读取执行一条查询。部署数据库的延迟和批量读取收益留给 Q17 实测。[前文去重](../../agent_v2/history_read.go) · [SQL 读取](../../sql/history.go) · [三种视图回归](../../agent_v2/compaction_boundary_test.go)
+
+**调研建议的交付状态。** 行业调研文档提交 `40957c3` 以 `85a140b` 为基线，核对时仍在独立分支。`bb3749c` 已覆盖失败用量、逐轮轨迹及可取回的上下文折叠。本次用内置 mock 的 4 个场景各跑 3 次，12/12 通过，JSONL 写出 12 条试验记录、共 18 轮。复杂业务任务的产物验收和 A03 的真实路由门槛仍需各自的样本。[评测入口](../../example/decision/trajectory_eval/main.go) · [失败尝试的观测](../../observability/failed_usage_test.go) · [折叠与恢复](../v2/context-recovery.md)
+
 ## 2026-11-17 合入 test 后的核验
 
 核对 `test` 从 `4d7aeec` 到 `0588906` 的改动及已有回归。`0f72f6b` 和 `0588906` 已推至 `origin/test`。合并态四个模块的 `make test` 以及 `make cover` 均通过，总覆盖率 88.2%。 A12 在 `b3f6b93` 已从待办表移除。逐行重算后，开放项为 66 项。
@@ -531,7 +550,7 @@ OpenAI 真实服务端冒烟四项通过，A04 已完成。GitLab PostgreSQL/MyS
 | L425 | 🟢 压缩边界的体量与备忘指纹的覆盖面（2026-10-20，9d058b7f / a96c2cba 的已知代价）：(a) 边界带着那一刻的完整替代历史（受保护的组 + 摘要 +… | ⬜ OPEN | 部分开放 | Q17、A01 | 可保护上下文增长尚需量测。552685b 扩备忘覆盖已知标注，fb1f22e 审批绑定实际送模请求。 · 基线关联提交 552685b（fix: 修复合并复审中的取消补偿与续跑回归） · 现存回归 [TestAutoCompact_PrefixToolArgsOrReasoningRewritten_MemoNotUsed](../../agent_v2/compaction_memo_test.go#L238) · 定义 0facd299 · 现存入口 [agent_v2/compaction_boundary.go](../../agent_v2/compaction_boundary.go)、[doc/v2/context-compaction.md](../../doc/v2/context-compaction.md) · 基线缺旧引用 9d058b7f、a96c2cba · 原文溯源 552685b0（仅文档溯源） |
 | L426 | 🟡 EstimateMessageTokens 把工具结果估成两倍 已修（2026-10-28）（2026-10-21 写增量摘要用例时发现，改动前就有）：schema.Too… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [compose_v2/token_estimate.go](../../compose_v2/token_estimate.go) · 原文溯源 82c0802c（仅文档溯源） |
 | L427 | 🟢 转存：被批内裁决换掉的那几条按替换消息自己的失败标注处理，没有专门用例 已补（2026-10-21，6dd56b57）：TestToolResultSpill_Supers… | ✅ 已做 | 完成（当前回归） | — | 原行已关闭，当前树仍有对应回归入口。 · 现存回归 [TestToolResultSpill_SupersededBigResult_Spilled](../../agent_v2/tool_spill_hook_test.go#L150) · 定义 0facd299 · 现存入口 [agent_v2/basic_builder.go](../../agent_v2/basic_builder.go) · 基线缺旧引用 6dd56b57 · 原文溯源 0facd299（仅文档溯源） |
-| L428 | 🟢 同一个任务里两个归属返回同一个消息对象时，后一个的回复不进会话历史（2026-10-21 审计时发现，改动前就有：基线与本分支跑同一个探针结果相同）：Sequential … | ⬜ OPEN（低优先：执行体复用消息对象少见） | 观察 | A16 | 跨归属异常复用同一 Message 指针的历史去重契约，需当前路径复测。 · 现存入口 [agent_v2/history_slot.go](../../agent_v2/history_slot.go) · 基线缺旧引用 7f0958b5 · 原文溯源 0facd299（仅文档溯源） |
+| L428 | 🟢 同一个任务里两个归属返回同一个消息对象时，后一个的回复不进会话历史（2026-10-21 审计时发现，改动前就有：基线与本分支跑同一个探针结果相同）：Sequential … | ⬜ OPEN（低优先：执行体复用消息对象少见） | 已复现 | A16 | `7ebad49` 的内存和 SQLite 均复现，两个独立输入共用回复 ID 时缺第二份归属。[四组对照](#2026-11-23-会话历史与评测复核) · [历史归属](../../agent_v2/history_slot.go) · 基线缺旧引用 7f0958b5 · 原文溯源 0facd299（仅文档溯源） |
 | L429 | 🟡 节点体成功之后、提交之前作废时，tools 节点写的会话历史记两份 已修（2026-10-21）：tools 节点另记「这一批已记过会话历史」、model 节点把模型调用记… | ✅ 已做 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/basic_builder.go](../../agent_v2/basic_builder.go)、[agent_v2/model_call_record.go](../../agent_v2/model_call_record.go) · 原文溯源 0facd299（仅文档溯源） |
 | L430 | 🟡 顶层 BasicAgent 不读 WithHistoryCtx 已修（2026-10-21）：BasicAgent 用 historyCfgFor——ctx 声明了就以它为… | ✅ 已做 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/history.go](../../agent_v2/history.go)、[agent_v2/basic_agent.go](../../agent_v2/basic_agent.go) · 原文溯源 0facd299（仅文档溯源） |
 | L431 | 🟢 只保得住字符串标注的后端过得了 conformance，框架的布尔标注在它上面失效 已修（2026-10-21）：MessageFields 加布尔、数字、数组、对象四种标… | ✅ 已做 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/history_conformance](../../agent_v2/history_conformance) · 原文溯源 0facd299（仅文档溯源） |
