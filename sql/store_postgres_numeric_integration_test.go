@@ -5,6 +5,7 @@ package sql_test
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -29,6 +30,7 @@ func checkPostgresStoreNumericDomain(t *testing.T, db *sql.DB) {
 		after    = "18446744073709551617"
 		fraction = "0.10000000000000000001"
 	)
+	largeFraction := "1" + strings.Repeat("0", 400) + ".25"
 	for _, tc := range []struct{ group, key, number, stored string }{
 		{"wide", "before", before, before},
 		{"wide", "max", maximum, maximum},
@@ -39,6 +41,8 @@ func checkPostgresStoreNumericDomain(t *testing.T, db *sql.DB) {
 		{"fraction", "tenth", "0.1", "0.1"},
 		{"fraction", "precise", fraction, fraction},
 		{"fraction", "higher", "0.10000000000000000002", "0.10000000000000000002"},
+		{"beyond", "exponent", "1.5e400", "15" + strings.Repeat("0", 399)},
+		{"beyond", "fraction", largeFraction, largeFraction},
 	} {
 		ns := store.NS(tc.group)
 		if err := st.Put(ctx, ns, tc.key, map[string]any{"n": json.Number(tc.number)}); err != nil {
@@ -69,7 +73,19 @@ func checkPostgresStoreNumericDomain(t *testing.T, db *sql.DB) {
 		{"fraction", "$gt", json.Number(fraction), []string{"higher"}},
 		{"fraction", "$lt", json.Number(fraction), []string{"tenth", "tiny", "zero"}},
 		{"fraction", "$lte", json.Number("1e-400"), []string{"tiny", "zero"}},
+		{"beyond", "$eq", json.Number("1.5e400"), []string{"exponent"}},
+		{"beyond", "$gt", json.Number("1e308"), []string{"exponent", "fraction"}},
 	} {
 		checkStoredNumericKeys(t, st, tc.group, tc.op, tc.value, tc.keys)
+	}
+	for _, group := range []string{"beyond", "empty"} {
+		for _, threshold := range []string{"1.5e400", largeFraction} {
+			_, err := st.Search(ctx, store.NS(group), store.WithFilter(map[string]any{
+				"n": map[string]any{"$gt": json.Number(threshold)},
+			}))
+			if !errors.Is(err, store.ErrFilterTypeMismatch) {
+				t.Fatalf("范围阈值超出公共校验范围，namespace=%s err=%v", group, err)
+			}
+		}
 	}
 }

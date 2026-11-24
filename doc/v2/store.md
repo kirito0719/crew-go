@@ -344,9 +344,13 @@ backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
 - **持久化**: Redis 默认 `appendonly no` 业务 crash 丢 1h cp. 必读 `redis/doc.go`
   "Redis 持久化配置" 章节.
 
+所有后端都先用 `store.ValidateFilter` 校验 `$gt`、`$gte`、`$lt` 和 `$lte` 的阈值。若 `json.Number.Float64()` 报溢出，`Search` 返回 `store.ErrFilterTypeMismatch`，空 namespace 也一样。通过校验后，SQL Store 将原始 JSON 数字文本交给内建 PostgreSQL 和 MySQL 方言。SQLite 和自定义方言接收 Go 数值，自定义方言嵌入内建方言时同样适用。
+
 #### PostgreSQL JSONB 数值的写入与过滤
 
-PostgreSQL 按 `numeric` 精度保存 JSONB 数字，范围查询的阈值也从原始数字文本转为 `numeric`。例如，`$gt 18446744073709551615` 能区分该无符号整数上界与更大的两个相邻整数。`0.10000000000000000001` 和 `0.10000000000000000002` 分别保存，前者作 `$gt` 阈值时只命中两者中的后者。`1e-400` 也保留为大于零的数。这些用例在 PostgreSQL 16.9 上覆盖 pgx 的语句缓存、`exec` 和简单查询协议。[PostgreSQL 数值集成测试](../../sql/store_postgres_numeric_integration_test.go)
+PostgreSQL 按 `numeric` 精度保存 JSONB 数字。在 PostgreSQL 16.9 上实测，`1e131071`（整数部分 131072 位）和 `1e-16383`（小数点后 16383 位）可转为 JSONB，`1e131072` 和 `1e-16384` 转换时均返回 SQLSTATE `22003`。[PostgreSQL 数值范围](https://www.postgresql.org/docs/16/datatype-numeric.html)
+
+Store 可精确写入、读回并用 `$eq` 匹配 `1.5e400`。用 `$gt 1e308` 能查到该行，用 `$gt 1.5e400` 则会触发公共阈值校验。通过校验的范围阈值按原始数字文本转为 `numeric`，所以 `$gt 18446744073709551615` 能命中更大的两个相邻整数。`0.10000000000000000001` 和 `0.10000000000000000002` 也分别保存，前者作 `$gt` 阈值时只命中后者。`1e-400` 保留为大于零的数。这些用例覆盖 pgx 的语句缓存、`exec` 和简单查询协议。[PostgreSQL 数值集成测试](../../sql/store_postgres_numeric_integration_test.go)
 
 #### MySQL JSON 数值的写入与过滤
 

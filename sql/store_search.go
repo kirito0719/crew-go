@@ -133,7 +133,7 @@ var rangeOpSQL = map[string]string{
 //
 //   - `{"key": v}` / `{"key": {"$eq": v}}` → dialect.JSONFieldEquals, 参数 = v 的 JSON 文本
 //   - `{"key": {"$ne": v}}` → (JSONFieldExists AND NOT (JSONFieldEquals)), 参数同上
-//   - 范围操作经 Dialect.JSONFieldNumericCompare 下推。PostgreSQL 和 MySQL 接收 JSON 数字原文，其他方言默认绑 Go 数值。
+//   - 范围操作经 Dialect.JSONFieldNumericCompare 下推。内建 PostgreSQL 和 MySQL 方言接收 JSON 数字原文，SQLite 和自定义方言接收 Go 数值。
 //   - 字段名由方言绑定成参数。
 //   - op map 里出现非 `$` 键 (嵌套 filter) → ErrUnsupportedFilterOp
 //
@@ -154,8 +154,10 @@ func (s *Store) buildFilterSQL(filter map[string]any, paramOffset int) (string, 
 
 	binder := &paramBinder{dialect: s.dialect, offset: paramOffset}
 	rangeArg := numericArg
-	if d, ok := s.dialect.(interface{ numericRangeArg(any) (any, bool) }); ok {
-		rangeArg = d.numericRangeArg
+	// 限定具体类型，自定义方言即使嵌入内建方言也能按公开契约接收 Go 数值。
+	switch s.dialect.(type) {
+	case Postgres, *Postgres, MySQL, *MySQL:
+		rangeArg = jsonNumericArg
 	}
 
 	equals := func(key string, want any) error {

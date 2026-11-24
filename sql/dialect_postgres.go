@@ -77,11 +77,6 @@ func (Postgres) JSONFieldEquals(col, field, valueJSON string, _ JSONKind, b Para
 	return fmt.Sprintf("%s->%s = %s::jsonb", col, pf, pv)
 }
 
-// numericRangeArg 让 PostgreSQL 按 numeric 精度解析范围阈值，大整数和小数都保留有效数字。
-func (Postgres) numericRangeArg(v any) (any, bool) {
-	return jsonNumericArg(v)
-}
-
 // JSONFieldNumericCompare 返
 //
 //	(CASE WHEN jsonb_typeof(col->'field') = 'number' THEN (col->>'field')::numeric END) <op> $n::numeric

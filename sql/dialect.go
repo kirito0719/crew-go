@@ -94,7 +94,8 @@ type Dialect interface {
 	JSONFieldEquals(col, field, valueJSON string, kind JSONKind, b ParamBinder) string
 
 	// JSONFieldNumericCompare 返「JSON 列 col 的顶级字段 field 是 JSON 数值且与参数
-	// 比较为真」的 WHERE 子句。默认参数为可绑定的 Go 数值。PostgreSQL 和 MySQL 使用 JSON 数字文本保留阈值精度。
+	// 比较为真」的 WHERE 子句。Store 向自定义方言传入可绑定的 Go 数值，嵌入内建方言时也适用。
+	// 直接使用 [Postgres]、[MySQL] 或其指针时，Store 传原始 JSON 数字文本以保留阈值精度。
 	//
 	// 语义必须与 [store.MatchFilter] 的范围 op 一致 (type bracketing): 字段是字符串 /
 	// bool / null / 数组 / 对象或缺失 ⟹ **不命中、不报错**——不允许把字符串 cast 成数

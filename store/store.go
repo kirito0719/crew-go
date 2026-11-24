@@ -384,10 +384,12 @@ type searchConfig struct {
 //     `user-id` / `a.b` / `用户` 这类完全合法的 JSON 字段名换后端就从「有结果」变成
 //     「报错」。现在字段名一律**绑参**，注入面从结构上消失、字符集限制随之取消；
 //     conformance 的 `Search_WithFilter_NonIdentifierFieldNames` 六后端逐格钉
-//   - **数值精度**：客户端使用 big.Int 比较整数，SQL 范围比较同时受后端存储精度和阈值绑定类型影响。
+//   - **数值精度**：所有后端先用 [ValidateFilter] 校验范围阈值。如果 [encoding/json.Number.Float64] 报溢出，
+//     Search 返回 [ErrFilterTypeMismatch]，即使 namespace 为空。PostgreSQL 仍可保存并用 `$eq` 匹配 1.5e400。
+//     客户端使用 big.Int 比较整数，SQL 范围比较同时受后端存储精度和阈值绑定类型影响。
 //     MySQL 范围阈值与存储都使用 JSON 数字，可精确保留到最大 uint64，再大的整数可能舍入为 DOUBLE。
 //     PostgreSQL 范围阈值按 numeric 解析，能保留大整数和高精度小数。小数也因后端而异，
-//     PG 的 jsonb 是任意精度 numeric、MySQL JSON 是 DOUBLE、SQLite `json_extract` 出
+//     PG 的 jsonb 使用 numeric、MySQL JSON 小数使用 DOUBLE、SQLite `json_extract` 出
 //     REAL，客户端过滤走 float64。于是 `$eq 0.1` 这种在 PG 上只命中真正的 0.1，在其余
 //     后端上会把 0.1 与 0.1000…001 当成同一个值。**别用 filter 做高精度小数的相等判定**。
 //     ⚠️ 整数那半也有一个**在进 store 之前**就丢精度的坑：业务用 `json.Unmarshal` 解到

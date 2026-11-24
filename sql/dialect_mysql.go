@@ -83,11 +83,6 @@ func (MySQL) JSONFieldEquals(col, field, valueJSON string, _ JSONKind, b ParamBi
 	return fmt.Sprintf("JSON_EXTRACT(%s, %s) = CAST(%s AS JSON)", col, pf, pv)
 }
 
-// numericRangeArg 保留阈值的 JSON 数字文本，使 MySQL 能精确解析 uint64 范围内的无符号整数。
-func (MySQL) numericRangeArg(v any) (any, bool) {
-	return jsonNumericArg(v)
-}
-
 // JSONFieldNumericCompare 返
 //
 //	(JSON_TYPE(JSON_EXTRACT(col, '$.field')) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(col, '$.field') <op> CAST(? AS JSON))
