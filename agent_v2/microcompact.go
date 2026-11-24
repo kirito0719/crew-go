@@ -1,6 +1,7 @@
 package agent_v2
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -59,17 +60,14 @@ type MicroCompactConfig struct {
 	// **why 配了才拼**：这个工具是**业务自己注册**的，框架不铸它。没配却写一句
 	// 「用 X 读回全文」等于给模型一条它执行不了的指令——比不写更糟。
 	//
-	// ⚠️ 同时开了 `Config.ToolResultMaxBytes` 时，卸载出去的**已经是截断版**
-	// （闸在工具结果进消息流之前就截了），这句「全文」会名不副实。见 doc/code/todo.md。
+	// 文案提示模型取回已存的工具输出。配置 [WithToolResultMaxBytes] 时该输出可能已截断。
 	OffloadReadToolName string
 
 	// OffloadEnabled 是否启用 offload-to-store 模式 (HIGH-2): 清前先把当时的 tool_result
 	// 写入 store, messages 留 "[offloaded:key] preview: <head 200 char>" 占位符让 LLM
 	// 看到预览 + 业务可通过 store.Get(NS, key) 取回做审计/重读.
 	//
-	// ⚠️ **取回来的不一定是「全文」**: 开了 `Config.ToolResultMaxBytes` 时闸在工具结果进
-	// 消息流之前就截过了, 存进去的就是截断版; 且读回来是 `map[string]any`(store 按值的 JSON 形状存,
-	// 每个后端都一样, 见 store.Item), 不是 `*schema.Message`, 要自己 decode.
+	// 业务可用 [MicroCompactConfig.LoadOffloadedToolResult] 恢复消息。存档内容以压缩前的消息为准。
 	//
 	// 默认 false——纯替占位符行为不变 (跟 OffloadEnabled=false / store 未注入 时
 	// 等价). true 时:
@@ -85,6 +83,11 @@ type MicroCompactConfig struct {
 	// **业务侧**: 想让 LLM 主动重读 offloaded 内容需注册类似 `read_offloaded_result`
 	// tool (业务自管). 框架不自动 inject (业务责任).
 	OffloadEnabled bool
+
+	// OffloadTTL 设置卸载记录的保留时长。正值要求 Store 接受 [store.WithTTL]。
+	// 未配置期限时由应用清理。读到的引用可在到期后返回空结果。
+	// 临时记录与永久记录使用不同的 key。
+	OffloadTTL time.Duration
 
 	// OffloadNS 是 offload store key 的 namespace. 空时默认按 ctx sid 自动派生
 	// per-sid 隔离 NS `store.NS("_micro_offload", sid)` (sid 取自
@@ -132,10 +135,7 @@ var defaultMicroCompactOffloadNS = store.NS("_micro_offload")
 // 派生：cfg.OffloadNS 非空 → 用它；否则按 ctx sid per-sid 隔离 store.NS("_micro_offload", sid)，
 // ctx 无 sid 时 fallback 全局 defaultMicroCompactOffloadNS。
 //
-// **业务取回 offloaded 内容**：占位符 message 的 Annotations[MicroCompactOffloadKeyAnnotation]
-// 存 key；业务注册的 read_offloaded_result 类工具内 store.Get(ctx, cfg.OffloadNamespace(ctx), key)
-// 取回——NS 走本方法，不必知道内部 "_micro_offload"/sid 派生规则。⚠️ 读回是 `map[string]any`
-// 不是 `*schema.Message`（store 按值的 JSON 形状存），业务别写死类型断言。
+// 业务可用 [MicroCompactConfig.LoadOffloadedToolResult] 按消息标注里的原 key 解码。
 func (cfg *MicroCompactConfig) OffloadNamespace(ctx context.Context) store.Namespace {
 	if len(cfg.OffloadNS) > 0 {
 		return cfg.OffloadNS
@@ -144,6 +144,37 @@ func (cfg *MicroCompactConfig) OffloadNamespace(ctx context.Context) store.Names
 		return store.NS("_micro_offload", sid)
 	}
 	return defaultMicroCompactOffloadNS
+}
+
+// LoadOffloadedToolResult 从当前 ctx 的 Store 和 [MicroCompactConfig.OffloadNamespace] 取回已卸载的工具消息。
+// key 取自 [MicroCompactOffloadKeyAnnotation]。无记录或到期返回 (nil, nil)。
+// 应用将该入口暴露给工具时，按已认证的调用方绑定 Store 和任务 namespace。
+func (cfg *MicroCompactConfig) LoadOffloadedToolResult(ctx context.Context, key string) (*schema.Message, error) {
+	if cfg == nil || key == "" {
+		return nil, errors.New("microcompact: offload config and key are required")
+	}
+	st := store.FromContext(ctx)
+	if isFrameworkNil(st) {
+		return nil, errors.New("microcompact: offload store is required")
+	}
+	item, err := st.Get(ctx, cfg.OffloadNamespace(ctx), key)
+	if err != nil || item == nil {
+		return nil, err
+	}
+	data, err := json.Marshal(item.Value)
+	if err != nil {
+		return nil, fmt.Errorf("encode stored tool result: %w", err)
+	}
+	var message schema.Message
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&message); err != nil {
+		return nil, fmt.Errorf("decode stored tool result: %w", err)
+	}
+	if message.Role != schema.RoleTool {
+		return nil, errors.New("microcompact: stored record is not a tool message")
+	}
+	return &message, nil
 }
 
 // microCompactPreviewBytes 是 offload 占位符内 preview 头部字节数.
@@ -295,7 +326,7 @@ func MicroCompactRun(ctx context.Context, messages []*schema.Message, cfg *Micro
 			continue
 		}
 		if offloadStore != nil && m.Annotations[backgroundScopedResult] != true {
-			key, err := putMicroCompactOffload(ctx, offloadStore, offloadNS, m, hasSink)
+			key, err := putMicroCompactOffload(ctx, offloadStore, offloadNS, m, cfg.OffloadTTL, hasSink)
 			if err == nil {
 				out[i] = cloneToolResultWithOffloadRef(m, key, microCompactPreviewBytes, cfg.OffloadReadToolName)
 				continue
@@ -410,14 +441,19 @@ func cloneToolResultWithOffloadRef(m *schema.Message, key string, previewBytes i
 }
 
 // putMicroCompactOffload 按实际写入的内容派生 key，只为真实写入记录 Store 事件。
-func putMicroCompactOffload(ctx context.Context, st store.Store, ns store.Namespace, m *schema.Message, hasSink bool) (string, error) {
+func putMicroCompactOffload(ctx context.Context, st store.Store, ns store.Namespace, m *schema.Message, ttl time.Duration, hasSink bool) (string, error) {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return "", fmt.Errorf("encode tool result: %w", err)
 	}
-	key := fmt.Sprintf("mco-%x", sha256.Sum256(data))
+	hash := sha256.New()
+	if ttl > 0 {
+		_, _ = fmt.Fprintf(hash, "ttl:%d\x00", ttl) // hash 写入总能成功。
+	}
+	_, _ = hash.Write(data) // hash 写入总能成功。
+	key := fmt.Sprintf("mco-%x", hash.Sum(nil))
 	start := time.Now()
-	attempted, err := offloadDedupFrom(ctx).put(ctx, st, ns, key, m)
+	attempted, err := offloadDedupFrom(ctx).put(ctx, st, ns, key, m, ttl)
 	if hasSink && attempted {
 		action := &StorePutAction{
 			NS:             ns.String(),
@@ -451,33 +487,56 @@ type offloadAddress struct {
 }
 
 type offloadWrite struct {
-	done chan struct{}
-	err  error
+	done      chan struct{}
+	expiresAt time.Time
+	err       error
 }
 
 var errOffloadIncomplete = errors.New("offload write did not complete")
 
-func (d *offloadDedup) put(ctx context.Context, st store.Store, ns store.Namespace, key string, value *schema.Message) (bool, error) {
+func (d *offloadDedup) put(ctx context.Context, st store.Store, ns store.Namespace, key string, value *schema.Message, ttl time.Duration) (bool, error) {
+	var opts []store.PutOption
+	if ttl > 0 {
+		opts = append(opts, store.WithTTL(ttl))
+	}
 	if d == nil || !reflect.ValueOf(st).Comparable() || ns.Validate() != nil {
-		return true, st.Put(ctx, ns, key, value)
+		return true, st.Put(ctx, ns, key, value, opts...)
 	}
 	addr := offloadAddress{store: st, namespace: ns.String(), key: key,
 		owner: compose_v2.GetOwner(ctx), member: IsSubAgentStoreScope(ctx)}
-	d.mu.Lock()
-	if previous := d.writes[addr]; previous != nil {
+	var current *offloadWrite
+	for ctx.Err() == nil {
+		d.mu.Lock()
+		previous := d.writes[addr]
+		if previous == nil {
+			// 保守地从写入开始计算有效期。后端在写成时计时。
+			current = &offloadWrite{done: make(chan struct{}), err: errOffloadIncomplete}
+			if ttl > 0 {
+				current.expiresAt = time.Now().Add(ttl)
+			}
+			d.writes[addr] = current
+			d.mu.Unlock()
+			break
+		}
 		d.mu.Unlock()
 		select {
 		case <-previous.done:
-			return false, previous.err
+			if previous.err != nil || previous.expiresAt.IsZero() || time.Now().Before(previous.expiresAt) {
+				return false, previous.err
+			}
 		case <-ctx.Done():
 			return false, ctx.Err()
 		}
+		d.mu.Lock()
+		if d.writes[addr] == previous {
+			delete(d.writes, addr)
+		}
+		d.mu.Unlock()
 	}
-
+	if current == nil {
+		return false, ctx.Err()
+	}
 	// Put 发生 panic 或 Goexit 时也要释放等待者，后续调用可以重试。
-	current := &offloadWrite{done: make(chan struct{}), err: errOffloadIncomplete}
-	d.writes[addr] = current
-	d.mu.Unlock()
 	defer func() {
 		d.mu.Lock()
 		defer d.mu.Unlock()
@@ -486,7 +545,7 @@ func (d *offloadDedup) put(ctx context.Context, st store.Store, ns store.Namespa
 		}
 		close(current.done)
 	}()
-	current.err = st.Put(ctx, ns, key, value)
+	current.err = st.Put(ctx, ns, key, value, opts...)
 	return true, current.err
 }
 

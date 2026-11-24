@@ -39,6 +39,22 @@ if err != nil {
 
 `Cancel` 持久化取消意图。待执行和挂起任务可由工作进程直接结算，在跑的任务先取消 ctx，再等待 Agent 返回。取消意图与结算按记录版本协调，以先提交的终态或取消意图为准。Agent 和工具应响应 ctx 取消。
 
+## 阶段进度与证据
+
+后台子 Agent 的节点和工具可调用 `background.ReportProgress(ctx, progress)`。用业务稳定分配的递增正整数作为 `background.Progress.Version`。`Stage` 是阶段名称，`Evidence` 保存应用可授权读取的引用。父任务用原先的 `Parent` 和句柄调用 `Manager.Get`，取得最新的 `Task.Progress`。
+
+写入确认丢失时，以相同版本、阶段和证据顺序重报。较早版本的重放保留已提交的新阶段。同版本内容变化返回 `background.ErrProgressConflict`。任务记录与进度共用版本检查，上报资格绑定到当前工作进程的任务、主体和租约。挂起、补答、接手和终态均保留最近已提交的阶段。取消意图或终态先提交时会拒绝在途上报。执行返回后，原执行上下文失去上报资格。
+
+```go
+err := background.ReportProgress(ctx, background.Progress{
+    Version:  1,
+    Stage:    "数据已核验",
+    Evidence: []string{"report/input-verification"},
+})
+```
+
+进度供轮询。完成通知和父任务的 `Await` 继续在任务终态后交付。证据本身的读权限和保留期由应用管理。
+
 ## 唤醒父任务
 
 ```mermaid

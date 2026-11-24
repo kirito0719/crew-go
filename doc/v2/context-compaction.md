@@ -136,8 +136,10 @@ type MicroCompactConfig struct {
     // R6-M HIGH-2 补：production stable 但之前文档漏写——offload-to-store 模式
     // 让 tool_result 不直接替占位符，而是 store.Put 到外部 store + 留指针，
     // 业务后续可按指针回溯原始 tool_result。学 eino reduction.tool_result_offload 设计。
-    OffloadEnabled bool         // 默认 false（纯占位符替换不变）
-    OffloadNS      store.Namespace  // 空时默认 per-sid 隔离 store.NS("_micro_offload", sid)（sid 取 compose_v2.GetSessionID(ctx)）；ctx 无 sid 时才 fallback store.NS("_micro_offload")
+    OffloadEnabled      bool            // 默认 false
+    OffloadNS           store.Namespace // 默认从任务 ID 派生
+    OffloadTTL          time.Duration   // 正数指定保留期，零值永久
+    OffloadReadToolName string          // 应用注册的读取工具名
 }
 ```
 
@@ -146,10 +148,12 @@ type MicroCompactConfig struct {
 - `OffloadEnabled = true` 且已配置 Store 时，按消息的 JSON 内容派生新 key。写入成功后用 `[offloaded:<key>] preview: <前 200 字节>` 替换正文，预览在 UTF-8 字符边界截断。按 `MicroCompactOffloadKeyAnnotation` 里的 key 取回，旧版引用也继续使用各自记录的 key。未配置 Store 或写入失败时使用纯占位符。
 - 详见 [`agent_v2/microcompact.go::MicroCompactRun`](../../agent_v2/microcompact.go) `cloneToolResultWithOffloadRef` 路径。
 
-**Offload 模式的两项业务责任**（启用 `OffloadEnabled` 前必读）：
+**转存保留与恢复**
 
-1. **自管 cleanup**——offload 到 store 的数据**不**走 cp `DeleteSubtree` 自动清理（cp 清理只管 checkpoint，不碰业务 store）。长跑 / 高 QPS 场景 offload data 会在 store 持续累积，业务需自行清理（Run 结束后按 `cfg.OffloadNamespace(ctx)` 算出的 NS 用 `Search` + `Delete` 批量清；⚠️ 这个 ctx 必须带 sid（`compose_v2.WithSessionIDCtx`）——不带时它回落全局 `_micro_offload`，按前缀清会扫到所有会话的数据）。框架的 offload `Put` 按永久条目写入，SQL TTL 和 Redis TTL 都按条目指定期限。压缩产物的回收策略见 [中心 backlog](../code/todo.md)。默认 per-sid 隔离 NS 正是为了让业务能按 sid 批量清。
-2. **LLM 重读需业务注册工具**——占位符 `[offloaded:<key>] preview: <前 200 字节>` 只给 LLM 看预览。想让 LLM 取回实际卸载的 tool_result（已截断时为截断版），业务需注册一个类似 `read_offloaded_result(key)` 的工具，内部 `store.Get(ctx, cfg.OffloadNamespace(ctx), key)` 取回（ctx 同样要带 sid；key 从占位符文本或 `MicroCompactOffloadKeyAnnotation` marker 拿；**别用裸 `cfg.OffloadNS`**——默认档它为空，实际写入 NS 按 sid 派生）。注册之后把工具名填进 `MicroCompactConfig.OffloadReadToolName`，占位符会提示模型用它读回。⚠️ 两点（2026-09-18 核验）：持久后端（redis / sql）读回的是 `map[string]any`（JSON 往返）不是 `*schema.Message`，自己 decode；开了 `WithToolResultMaxBytes` 时存进去的已是截断版。框架**不内置**此工具——offload 默认假设"预览足够，极少需要回溯完整内容"。
+- 默认保留转存条目，由应用在任务无法再续跑、业务无需复查时，按该任务的 `OffloadNamespace(ctx)` 清理。业务 Store 的数据独立于 Checkpointer，图存档清理不会清除工具原文。
+- 配置正数 `MicroCompactConfig.OffloadTTL` 后，Store 按该时长保留记录。Redis 和通过 `sql.NewTTLStore` 创建的 Store 支持期限。写入失败时模型收到普通占位符。期限不同的写入有各自的 key，已有永久引用仍可读。同一次运行复用未到期的写入结果，下一次确需转存时可重写已到期的记录。
+- 应用可在已授权的任务上下文中，用 `cfg.LoadOffloadedToolResult(ctx, key)` 恢复工具消息。key 取自 `MicroCompactOffloadKeyAnnotation`。记录到期或缺失时返回 `(nil, nil)`。保留期从最近一次成功写入起算，可覆盖任务挂起窗口。原工具结果已截断时，取回的是当时进入消息流的内容。
+- 向模型提供重读时，由应用注册工具，再设置 `OffloadReadToolName` 提示调用。读取使用相同的 Store 与 namespace，应用从已认证的会话和任务确定它们。
 
 ### 不做的
 
@@ -354,6 +358,8 @@ type AutoCompactConfig struct {
 
 ## 第 3 层：ReactiveCompact 被动压缩
 
+首次模型调用已使用当轮的 MicroCompact 和 AutoCompact 结果。被动压缩从这份实际送模视图开始，保留其中的摘要、工具回执等受保护内容。遇到超窗时仅裁短本次重试输入。需要保留具体证据时，可配置[原文恢复](context-recovery.md)。
+
 **目标**：当 LLM 调用返回 "prompt too long" 错误时，回退式压缩并重试——这是
 AutoCompact 没拦住的兜底路径。
 
@@ -396,8 +402,7 @@ AutoCompact 没拦住的兜底路径。
 5. 达到 MaxAttempts → 报错给 caller，不再重试
 ```
 
-> v2 当前实现走「删最旧消息组」路径；一组也丢不动时，先把超过 2000 字节的 tool_result 就地挖空（`3eebc447`，从整条消息流里挑）；不复用 AutoCompact 摘要——原 PoC 设计的
-> `PreferAutoCompact` 优先逻辑未实现、也没决策（已进中心 backlog；详见 §关键设计点）。
+> 本轮已应用的 AutoCompact 摘要继续随输入保留。ReactiveCompact 在当前视图上删最旧的可裁剪消息组，或在没有可删组时缩短过长的工具结果。失败重试期间沿用已有摘要。
 
 ### 「删最旧消息组」抢救算法
 
@@ -450,7 +455,7 @@ type ReactiveCompactConfig struct {
 
 ### 关键设计点
 
-1. **抢救式删消息组**：ReactiveCompact 走「删最旧消息组」路径（`emergencyDropOldestGroups`），一组也丢不动时先把超过 2000 字节的 tool_result 就地挖空（`3eebc447`，从整条消息流里挑，不限受保护组）——不复用 AutoCompact 摘要。原 PoC 设计的 PreferAutoCompact 优先逻辑未实现。丢掉的组里带转存取回 id 的（转存过的结果、摘要附的索引），补一条索引消息放在最前——全文还在 store 里，不留 id 模型就取不回（见 [tool-output-spill.md](tool-output-spill.md) §2.6）
+1. **抢救式删消息组**：ReactiveCompact 走「删最旧消息组」路径（`emergencyDropOldestGroups`），一组也丢不动时先把超过 2000 字节的 tool_result 就地挖空（`3eebc447`，从整条消息流里挑）。已有 AutoCompact 摘要所在的组受到保护。丢掉的组里带转存取回 id 的（转存过的结果、摘要附的索引），补一条索引消息放在最前——全文还在 store 里，不留 id 模型就取不回（见 [tool-output-spill.md](tool-output-spill.md) §2.6）
 2. **API 不变量保护**：删消息组时按 `Annotations["run_id"]` 分组（user 开新组，同 RunID 的 assistant + thinking + tool_use 不分离）；首条 assistant 时补 user marker
 3. **断路器**：MaxAttempts 是硬上限——避免压完还是太长时无限重试
 
@@ -814,6 +819,8 @@ Group 后:
 
 > **注**：`AdjustIndexToPreserveAPIInvariants` 是 **index 级**切割 helper。第 1-3 层（组级删除）**不调用**它——那三层走 §分组的**组级** `GroupMessagesByAPIRound` + `FlattenGroups`（配对天然在组边界保全）。它的现役调用点是**第 0 层**：`truncatePriorPreservingMarkers` 按 `MaxHistoryPairs` 截断跨 Run 历史时用它把切点拉回配对边界（默认 20 对、默认开启）。
 
+跨 Run 裁剪会保留必要的 Reflect 评语、Plan 步骤说明等调用输入，条件是该成员同一次调用的产出或工具结果仍在保留窗口内。分页按原顺序补读，遇到已确认的压缩边界时使用该处的替代历史。
+
 ```go
 // AdjustIndexToPreserveAPIInvariants 调整切点保 tool 配对 + thinking 完整性。
 //
@@ -1083,8 +1090,7 @@ A：需要用户显式配置摘要 Model（推荐用更便宜的 model 省钱）
 框架不替用户做"用哪个 model 摘要"的决定。
 
 **Q：ReactiveCompact 不需要 Model 吗？**
-A：不需要——v2 当前实现走「删最旧消息组」抢救路径（`emergencyDropOldestGroups`；一组也丢不动时就地挖空超过 2000 字节的 tool_result），不复用
-AutoCompact 摘要。原 PoC 设计的 PreferAutoCompact 优先逻辑未实现。
+A：这一层直接对当前模型视图调用 `emergencyDropOldestGroups`。已有摘要和受保护组继续随输入发送，模型重试只使用本轮收缩后的视图。
 
 **Q：和 ISSUE-44 的 SelfHistory 冲突吗？**
 A：不冲突。压缩只改本次 LLM 调用的入参切片（modelFn 局部变量，不经 channel），

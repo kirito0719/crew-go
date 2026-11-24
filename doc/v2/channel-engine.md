@@ -705,6 +705,10 @@ Resume 合并这些成员已确定的出边与投递，成功成员无需重跑�
 | ctx cancel | **兄弟也收到 cancel**（共享 ctx） | superstep 整体错 | ✅ |
 | `InterruptError`（HITL） | 不 cancel 继续跑完 | superstep 整体挂起 | ✅（含 PendingInterrupts，**多分支中断全部收集** R10-D 修） |
 
+子档写入发生身份冲突时，错误仍按存档失败报告。如果父档成功保存，低阶调用者可在确认请求归属、存储分区、原 session ID、确切父 namespace 与任务世代后，用 `Checkpointer.LoadNS` 读取该父档的 `PendingInterrupts`，通过原图的恢复入口提交答案。引擎继续核对存档身份与续跑准入。健康兄弟分支可先执行和提交，冲突分支仍可能等待原所有者释放存档。普通存档失败触发终局清理时，已清理的问题随任务结束。
+
+AG-UI 与 A2A 对这次执行报告失败。应用服务需要保留原父任务的可恢复身份才能提供低阶补答入口。按整个 session 枚举的子槽可能属于别的图，不能合成同一批提示。清理事件的 `DeletedCount` 计存档条数。
+
 **Best-effort 等兄弟跑完的设计动机**：
 - 已花的 LLM tokens 不浪费——成功分支产出存进 cp，Resume 时直接 replay
 - 失败分支可仔细处理（Replan / Continue / Abort），不影响成功分支

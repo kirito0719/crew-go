@@ -160,7 +160,9 @@ func (m *Manager) advance(workerCtx context.Context, id string) (err error) {
 	}
 
 	runCtx = compose_v2.WithDurabilityCtx(runCtx, compose_v2.DurabilitySync)
+	runCtx = context.WithValue(runCtx, progressKey{}, progressWriter{manager: m, taskID: task.ID, owner: task.Parent.Owner, done: runCtx.Done()})
 	events, runErr := m.call(runCtx, cancel, task, agent, !first)
+	cancel() // 执行返回即撤销阶段上报权限。结算使用外层租约。
 	if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
 		return err
 	}

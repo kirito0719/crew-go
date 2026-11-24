@@ -29,6 +29,8 @@ type startScope struct {
 // Observer 属于一次宿主执行，只有这个订阅方可以登记等待提交的展示。
 type Observer struct {
 	Deliver func(context.Context, *schema.ToolOutput)
+	// DeliverSkipped 收尾此前已展示、这次由框架直接拒绝的调用。宿主核对该调用的展示记录。
+	DeliverSkipped func(context.Context, *schema.ToolOutput)
 }
 
 // WithObserver 为本次执行注册已提交工具结果的观察者。

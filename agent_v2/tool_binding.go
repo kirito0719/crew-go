@@ -2,8 +2,10 @@ package agent_v2
 
 import (
 	"context"
+	"slices"
 
 	"crew-go/compose_v2"
+	"crew-go/schema"
 )
 
 // ToolNotAvailableErrCode 是「这个工具这一轮没有交给模型」的 tool error code：[WithToolFilter] 这一轮没放行它，模型
@@ -52,31 +54,80 @@ func (b *toolBinding) allows(name string) bool {
 	return false
 }
 
+// toolSelection 把同一轮的执行名单和候选名单配在一起。候选名单随模型答复保存，工具绑定通道的类型保持不变。
+type toolSelection struct {
+	binding     *toolBinding
+	searchNames *[]string
+}
+
+func (s toolSelection) restricted() bool {
+	return s.binding != nil && s.binding.Restricted
+}
+
+func (s toolSelection) allows(name string) bool {
+	return s.binding.allows(name)
+}
+
+func (s toolSelection) allowsSearch(name string) bool {
+	if s.searchNames != nil {
+		return slices.Contains(*s.searchNames, name)
+	}
+	return s.allows(name)
+}
+
+const toolSearchScopeAnnotation = "_crew_tool_search_scope"
+
+// stampToolSearchScope 在钩子处理完成之后写入框架确定的名单。空名单和旧档缺少名单的语义不同。
+func stampToolSearchScope(message *schema.Message, searchNames *[]string) {
+	delete(message.Annotations, toolSearchScopeAnnotation)
+	if searchNames != nil {
+		message.Annotations[toolSearchScopeAnnotation] = slices.Clone(*searchNames)
+	}
+}
+
+func readToolSearchScope(message *schema.Message) *[]string {
+	switch value := message.Annotations[toolSearchScopeAnnotation].(type) {
+	case []string:
+		return &value
+	case []any:
+		names := make([]string, 0, len(value))
+		for _, item := range value {
+			name, ok := item.(string)
+			if !ok {
+				return nil
+			}
+			names = append(names, name)
+		}
+		return &names
+	}
+	return nil
+}
+
 // basicToolBindingCh 是这一轮交给模型的工具（见 toolBinding）。model 节点每一轮都写（没有裁剪时写 nil），
 // 所以 tools 节点读到的总是产出这一批 tool_call 的那一轮的绑定。
 var basicToolBindingCh = compose_v2.LastValue[*toolBinding]("__basic_agent_tool_binding__")
 
-// toolBindingSinkKey：model 节点交给 modelFn 一个空的 toolBinding，modelFn 绑工具时填进去（[BasicAgentModelFn] 的
+// toolBindingSinkKey：model 节点交给 modelFn 一个空的 toolSelection，modelFn 绑工具时填进去（[BasicAgentModelFn] 的
 // 签名拿不到 channel，同 revealedChKey 的理由）。
 type toolBindingSinkKey struct{}
 
-func withToolBindingSink(ctx context.Context, b *toolBinding) context.Context {
+func withToolBindingSink(ctx context.Context, b *toolSelection) context.Context {
 	return context.WithValue(ctx, toolBindingSinkKey{}, b)
 }
 
-func toolBindingSink(ctx context.Context) *toolBinding {
-	b, _ := ctx.Value(toolBindingSinkKey{}).(*toolBinding)
+func toolBindingSink(ctx context.Context) *toolSelection {
+	b, _ := ctx.Value(toolBindingSinkKey{}).(*toolSelection)
 	return b
 }
 
-// toolBindingKey：tools 节点把 basicToolBindingCh 读出来放进 ctx，toolsFn 的执行闸据它判。
+// toolBindingKey：tools 节点把这轮的工具选择放进 ctx，供工具执行和检索共用。
 type toolBindingKey struct{}
 
-func withToolBinding(ctx context.Context, b *toolBinding) context.Context {
-	return context.WithValue(ctx, toolBindingKey{}, b)
+func withToolBinding(ctx context.Context, selection toolSelection) context.Context {
+	return context.WithValue(ctx, toolBindingKey{}, selection)
 }
 
-func toolBindingFrom(ctx context.Context) *toolBinding {
-	b, _ := ctx.Value(toolBindingKey{}).(*toolBinding)
+func toolBindingFrom(ctx context.Context) toolSelection {
+	b, _ := ctx.Value(toolBindingKey{}).(toolSelection)
 	return b
 }

@@ -452,6 +452,10 @@ memo 命中 → 渐进披露 gate → 审批 → [ 中间件链 ] → 工具
 > 在每次执行时注入（也不落盘，但它改的参数不经审批）。代价：改写让这次调用出错时，修好钩子再续跑也不生效——这一批
 > 按第一次的内容执行，恢复办法是放弃这个任务、`sess.NextTask()` 重开。
 
+### 子 Agent 的工具错误
+
+`AgentAsTool` 把普通失败转成父模型可读的通用工具结果。业务可用 `WithAgentToolErrorMapper` 提供可公开的错误码和提示，映射器能读取原错误。未匹配的错误沿用框架文案。路由未决有单独的可识别提示。中断、调用方取消和存档控制流按原错误链向上交付。
+
 ### 工具级渐进披露（BasicAgent，可选）
 
 工具多到全量 schema 喂 LLM 爆 context 时，`WithToolSearch` 让 deferred 工具初始不进 bind list，LLM 先调 `tool_search(query)` 检索解锁再调用。常用 `Deferred: mcp.IsRemoteTool` 延迟所有 MCP 工具。完整设计 / API / 边界见 [`toolsearch.md`](toolsearch.md)。
@@ -1151,7 +1155,7 @@ events, _ := ag.Run(ctx, sess, input)             // sessionID = sess.RunID 自�
 | 参数 | 维度 | 默认值 | <=0 行为 | 作用对象 |
 |---|---|---|---|---|
 | `MaxRounds` | **ReAct 循环上限**（轮次）| 10 | `WithMaxRounds(0)` 兜底 1 | 单次 Run 内 model→tools 循环次数 |
-| `MaxHistoryPairs` | **跨 Run 历史截断对数** | 20（默认开启，`defaultMaxHistoryPairs`）；配 HistoryCompactor 时 `MaxHistoryPairs<=0` 用 hint 20 | `WithMaxHistoryPairs(0)` 显式禁用（行为：`MaxHistoryPairs>0` 且 `len(prior)>MaxHistoryPairs*2` 时简单截断 prior 保留最后 N 对，**但保护带 `SkillBodyAnnotation` marker 的消息不被截**——grep `basic_agent.go` 内 `truncatePriorPreservingMarkers` 看实际逻辑）| 第 0 层 prior 截断（前 N 对 user/assistant）|
+| `MaxHistoryPairs` | **跨 Run 历史截断对数** | 20（默认开启，`defaultMaxHistoryPairs`）；配 HistoryCompactor 时 `MaxHistoryPairs<=0` 用 hint 20 | `WithMaxHistoryPairs(0)` 显式禁用（正值从最近 `2*N` 条普通消息起，补齐工具配对、受保护消息和仍有产出保留的成员输入）| 第 0 层 prior 截断|
 | `SearchLimit` | **StoreMemory.Search Item 数** | 5 | 兜底 5 | preamble 注入的 store 长期记忆 Item 数 |
 
 **精确触发位置**：

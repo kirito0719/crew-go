@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"crew-go/schema"
@@ -111,4 +112,49 @@ func TestMicroCompactOffload_ConcurrentFailureWaitsAndRetries(t *testing.T) {
 	if key == "" || err != nil || item == nil || st.attempts.Load() != 2 {
 		t.Fatalf("后续应重试一次并生成可读引用，key=%q item=%v err=%v 尝试=%d", key, item, err, st.attempts.Load())
 	}
+}
+
+type ttlOffloadProbeStore struct {
+	store.Store
+	attempts atomic.Int32
+}
+
+func (s *ttlOffloadProbeStore) Put(ctx context.Context, ns store.Namespace, key string, value any, opts ...store.PutOption) error {
+	if store.ParsePutOptions(opts...).TTL != time.Second {
+		return errors.New("missing requested ttl")
+	}
+	if s.attempts.Add(1) > 1 {
+		// 刷新尚未提交时，让其他读取同时尝试复用该槽。
+		time.Sleep(time.Millisecond)
+	}
+	return s.Store.Put(ctx, ns, key, value)
+}
+
+func TestMicroCompactOffload_ExpiredDedupRefreshesOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := &ttlOffloadProbeStore{Store: store.NewInMemoryStore()}
+		ctx := withOffloadDedup(t.Context())
+		dedup := offloadDedupFrom(ctx)
+		ns := store.NS("task")
+		result := schema.ToolResultMessage("old", "旧结果")
+		if written, err := dedup.put(ctx, st, ns, "ref", result, time.Second); err != nil || !written {
+			t.Fatalf("首次转存应成功，写入=%v 错误=%v", written, err)
+		}
+		if written, err := dedup.put(ctx, st, ns, "ref", result, time.Second); err != nil || written {
+			t.Fatalf("到期前应复用，写入=%v 错误=%v", written, err)
+		}
+		time.Sleep(time.Second)
+		var callers sync.WaitGroup
+		for range 12 {
+			callers.Go(func() {
+				if _, err := dedup.put(ctx, st, ns, "ref", result, time.Second); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		callers.Wait()
+		if n := st.attempts.Load(); n != 2 {
+			t.Fatalf("首次写入及到期后的并发刷新应共写入两次，实际 %d 次", n)
+		}
+	})
 }

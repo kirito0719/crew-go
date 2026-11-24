@@ -134,11 +134,13 @@ func TestSoftLanding_HardToolCallNotExecuted(t *testing.T) {
 	var n atomic.Int32
 	m := &landingModel{hardCall: "noop"}
 	h := &toolEndRecorder{}
+	history := agent_v2.NewInMemoryHistoryStore()
+	ctx := compose_v2.WithThreadIDCtx(t.Context(), "landing")
 	ag := agent_v2.NewBasicAgent(
 		agent_v2.WithName("sl"), agent_v2.WithModel(m), agent_v2.WithHooks(h),
-		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2))
+		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(2), agent_v2.WithHistory(history, "tenant"))
 
-	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
+	_, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("干活"))
 
 	if rounds, _ := m.seen(); len(rounds) != 3 {
 		t.Fatalf("fixture 没搭对：maxRounds=2 应调模型 3 次，实际 %d 次", len(rounds))
@@ -146,8 +148,15 @@ func TestSoftLanding_HardToolCallNotExecuted(t *testing.T) {
 	if got := n.Load(); got != 2 {
 		t.Errorf("软降落轮模型硬调的 noop 不该执行：应只在前两个工具轮各执行 1 次，实际执行 %d 次", got)
 	}
-	if res := h.snapshot(); len(res) != 3 || res[2].Success || res[2].ErrorCode != "round_budget_exhausted" {
-		t.Errorf("软降落轮那次调用应以失败结果（round_budget_exhausted）交回，实际每次的结果 %+v", res)
+	if res := h.snapshot(); len(res) != 2 {
+		t.Errorf("仅实际派发的两次调用触发工具结束钩子，实际 %+v", res)
+	}
+	messages, loadErr := agent_v2.LoadAllHistory(ctx, history, agent_v2.HistoryKey{Owner: "tenant", ConvID: "landing"})
+	if loadErr != nil || !slices.ContainsFunc(messages, func(message *schema.Message) bool {
+		return message.Role == schema.RoleTool && schema.GetToolResultID(message) == "tc" &&
+			strings.HasPrefix(message.Content, "[round_budget_exhausted]")
+	}) {
+		t.Fatalf("超出预算的调用应保留成配对的失败结果，历史读取错误 %v", loadErr)
 	}
 	var mie *compose_v2.MaxIterationsError
 	if !errors.As(err, &mie) {
@@ -171,15 +180,13 @@ func (h askOnToolsRound) OnToolStart(ctx context.Context, info *hook.AgentInfo, 
 	return ctx, nil
 }
 
-// TestSoftLanding_HardToolCallNotExecutedAfterResume：软降落轮那一批停在中断（这里是 OnToolStart 里问用户），续跑直接
-// 进 tools 节点——产出这批调用的那次模型调用不再重跑，「是不是软降落轮」要从存档里读回来，硬调的工具照样不执行。这个
-// 标记只放在内存里的话，续跑时读到的是零值，那次调用就被执行了。
+// TestSoftLanding_HardToolCallNotExecutedAfterResume 验证恢复软降落的模型答复后，跳过无法执行的工具及其审批。
 func TestSoftLanding_HardToolCallNotExecutedAfterResume(t *testing.T) {
 	var n atomic.Int32
 	// maxRounds=1：第 1 轮调 noop（tools 节点 Round=1），第 2 轮是软降落轮、硬调 noop（tools 节点 Round=2）。
 	ag := agent_v2.NewBasicAgent(
 		agent_v2.WithName("slr"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
-		agent_v2.WithHooks(askOnToolsRound{round: 2}),
+		agent_v2.WithHooks(hook.NewChainHooks(askOnRoundEnd{round: 1}, askOnToolsRound{round: 2})),
 		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))), agent_v2.WithMaxRounds(1))
 	ctx := compose_v2.WithCheckpointerCtx(context.Background(), compose_v2.NewInMemoryCheckpointer())
 	sess := agent_v2.NewRunSession()
@@ -187,7 +194,7 @@ func TestSoftLanding_HardToolCallNotExecutedAfterResume(t *testing.T) {
 	_, err := ag.Run(ctx, sess, schema.UserMessage("干活"))
 	ie, ok := compose_v2.IsInterrupt(err)
 	if !ok {
-		t.Fatalf("fixture 没搭对：软降落轮那一批应停在 OnToolStart 的提问上，实际 %v", err)
+		t.Fatalf("fixture 没搭对：软降落轮应停在 OnModelEnd 的提问上，实际 %v", err)
 	}
 	if got := n.Load(); got != 1 {
 		t.Fatalf("fixture 没搭对：中断前 noop 应只在第 1 轮执行过 1 次，实际 %d 次", got)
@@ -796,20 +803,15 @@ func (h *hookErrAtNth) OnToolStart(ctx context.Context, _ *hook.AgentInfo, _ *sc
 // TestSoftLanding_BudgetMessageDoesNotMisattribute：预算耗尽的正文**只陈述本 agent 能确定的事**，不把
 // 别人的 MaxIterationsError 说成「我的软降落轮模型硬调了工具」。
 //
-// 可达窗口（审计实测）：软降落轮的 tools 节点里业务 OnToolStart 对被拦下的那一批**照样 fire**，钩子返错
-// 让节点失败，而那个错里可以包着钩子自己调起的子 agent 的 MaxIterationsError。此刻 round 恰好是 mr+1，
-// 于是出口判据 `errors.As(err, &mie)` 成立 —— 但它问的是「链上任何位置有没有」，不足以支撑那句断言。
-//
-// ⚠️ 这条钉的是「正文不做假陈述」+「数字是自己的」两件事。断言挑的是**会随这个 bug 变**的量：
-// 正文里不许出现「仍硬调了工具」这种对本 agent 的断言式陈述，而「跑满 N 轮」必须是本 agent 的 3 而不是
-// 钩子里那个 99。af7c45a 的版本实测报出 `…模型仍硬调了工具…: 达到最大迭代：99`。
+// 收尾轮可执行框架的结构化输出工具。它的业务钩子仍可以返回子 Agent 的错误。
+// 错误链保留真实原因，出口报告本次运行的轮次数。
 func TestSoftLanding_BudgetMessageDoesNotMisattribute(t *testing.T) {
 	var n atomic.Int32
 	ag := agent_v2.NewBasicAgent(
-		agent_v2.WithName("parent"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithName("parent"), agent_v2.WithModel(&landingModel{hardCall: agent_v2.FinalOutputToolName}),
 		agent_v2.WithHooks(&hookErrAtNth{nth: 3}), // maxRounds=2 ⟹ tools 跑 3 次，第 3 次是软降落轮
 		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
-		agent_v2.WithMaxRounds(2))
+		agent_v2.WithOutputSchema("answer", answerSchema()), agent_v2.WithMaxRounds(2))
 	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
 	if err == nil {
 		t.Fatal("fixture 没搭对：钩子在软降落轮返错，应以错误收尾")
@@ -836,10 +838,10 @@ func TestSoftLanding_BudgetMessageSkipsInterrupt(t *testing.T) {
 		InterruptID: "probe-id", Question: "批准吗",
 	}}
 	ag := agent_v2.NewBasicAgent(
-		agent_v2.WithName("p"), agent_v2.WithModel(&landingModel{hardCall: "noop"}),
+		agent_v2.WithName("p"), agent_v2.WithModel(&landingModel{hardCall: agent_v2.FinalOutputToolName}),
 		agent_v2.WithHooks(&hookErrAtNth{nth: 3, extra: ie}),
 		agent_v2.WithToolkit(kitOf(namedBizTool("noop", &n, "ok"))),
-		agent_v2.WithMaxRounds(2))
+		agent_v2.WithOutputSchema("answer", answerSchema()), agent_v2.WithMaxRounds(2))
 	_, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("干活"))
 	got, isInt := compose_v2.IsInterrupt(err)
 	if !isInt {

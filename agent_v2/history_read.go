@@ -255,7 +255,7 @@ var errHistoryCursorStuck = fmt.Errorf("history: backend reported More but the c
 // 返回的记录再按 filter 核一遍，不满足的不交给 visit：后端没实现过滤条件时（照旧接口写的，新字段被忽略），
 // 框架拿到的是整页原样——不核的话「这个任务里记过这条没有」把任何一条记录都当命中，每条输入都判成记过、一条
 // 不记。核了之后只是慢（按条件查退化成往前翻整场会话），并告警一次。
-func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, firstPage int, grow bool, visit func(m *schema.Message, boundaryCursor HistoryCursor) bool, afterPage func(*HistoryQuery) bool) error {
+func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, firstPage int, grow bool, visit func(m *schema.Message, boundaryCursor HistoryCursor) bool, afterPage func(*HistoryQuery, HistoryCursor) bool) error {
 	if firstPage < historyPageMin {
 		firstPage = historyPageMin
 	}
@@ -288,7 +288,7 @@ func (s historySource) scanBackward(ctx context.Context, filter HistoryQuery, fi
 		if len(page.Messages) == 0 || page.Start == "" || page.Start == before {
 			return errHistoryCursorStuck
 		}
-		if afterPage != nil && afterPage(&filter) {
+		if afterPage != nil && afterPage(&filter, page.Start) {
 			return nil
 		}
 		before = page.Start
@@ -317,8 +317,8 @@ func warnUnfilteredHistoryBackend(ctx context.Context, hs HistoryStore) {
 //
 // need > 0 时只读**最近一段**：读到第 0 层截断（[truncatePriorPreservingMarkers]）在这一段上的切点
 // 落在段内为止——凑够 need 条不带 skill 正文标记的视图消息，并且切点往前对齐 tool_call 配对之后
-// 仍没碰到这一段的开头（见 [priorWindowSatisfied]）。在这一段上截与在整个视图上截结果相同（只差
-// 更早激活的 skill 正文，见下）。need <= 0 读到会话开头（调用方明确不截断时）。
+// 仍没碰到这一段的开头（见 [priorWindowSatisfied]）。若仍保留本成员的产出但缺少调用输入，继续按原顺序翻页
+// 直到读到输入或已验证的压缩边界。need <= 0 读到会话开头或压缩边界。
 //
 // ⚠️ 只读最近一段有一个可见的语义变化：**比这一段更早激活的 skill 正文不再进 prior**。第 0 层截断
 // 原先会把整场会话里所有激活过的 skill 正文都保下来（随激活次数线性增长、没有上限）；现在保的是读到的
@@ -348,7 +348,8 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 	var base []*schema.Message    // 遇到的本 agent、同视图的压缩边界里的替代历史
 	var callers []*schema.Message // 写进历史层的前文（新 → 旧），见 callerFirst
 	counted := 0
-	satisfied := false // 读够了：这一段上的第 0 层截断已经跟整个视图上的一样
+	satisfied := false // 读够了：普通历史只需这一段。
+	var inputAnchors map[historyInvocation]string
 	first := historyPageMin
 	if need > 0 && 2*need > first {
 		first = 2 * need
@@ -382,15 +383,35 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			return false
 		}
 		rev = append(rev, v)
+		if len(inputAnchors) != 0 && invocationInput(v) && v.ID != "" {
+			key := historyInvocationOf(v)
+			if inputAnchors[key] == v.ID {
+				delete(inputAnchors, key)
+			}
+		}
 		if !isPriorProtected(v) {
 			counted++
 		}
 		return false
-	}, func(_ *HistoryQuery) bool {
+	}, func(_ *HistoryQuery, pageStart HistoryCursor) bool {
+		if inputAnchors != nil {
+			satisfied = len(inputAnchors) == 0
+			return satisfied
+		}
 		if need <= 0 || counted <= need {
 			return false
 		}
-		satisfied = priorWindowSatisfied(reversed(rev), need)
+		prior := reversed(rev)
+		if !priorWindowSatisfied(prior, need) {
+			return false
+		}
+		anchors, err := src.locateInvocationInputs(ctx, prior, ownerAgentName, need, pageStart)
+		if err != nil {
+			slog.WarnContext(ctx, "agent_v2: 定位历史调用输入失败，沿用已读取的窗口",
+				"key", src.key.String(), "err", err)
+		}
+		inputAnchors = anchors
+		satisfied = len(inputAnchors) == 0
 		return satisfied
 	})
 	if err != nil {
@@ -460,7 +481,7 @@ func (s historySource) callersAfterBoundary(ctx context.Context, reversedCallers
 				remaining--
 			}
 			return remaining == 0
-		}, func(next *HistoryQuery) bool {
+		}, func(next *HistoryQuery, _ HistoryCursor) bool {
 			if remaining == len(next.ids.values) {
 				return false
 			}

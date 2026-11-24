@@ -202,6 +202,10 @@ func runBackgroundTaskScenarios(t *testing.T, dialect crewsql.Dialect, open func
 		}
 	})
 
+	t.Run("durable_phase_progress", func(t *testing.T) {
+		checkBackgroundProgress(t, dialect, open)
+	})
+
 	t.Run("current_answer_batch", func(t *testing.T) {
 		storeA, storeB := openBackgroundStore(t, dialect, open)
 		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)

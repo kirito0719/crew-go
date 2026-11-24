@@ -62,6 +62,8 @@ type modelCallRecord struct {
 	Boundary *schema.Message `json:"boundary,omitempty"`
 	// Binding 是这一轮交给模型的工具（见 toolBinding）：沿用这份答复时，执行它的 tool_call 照这一份判。
 	Binding *toolBinding `json:"binding,omitempty"`
+	// SearchNames 供原样答复重放。定稿后这份名单随答复进入工具节点。
+	SearchNames *[]string `json:"search_names,omitempty"`
 	// Final 报这一轮已经处理完、定下了。
 	Final bool `json:"final,omitempty"`
 	// FinalRound 报这份答复是不是在软降落轮生成的（模型被告知 tool_choice=none / 只留 final_output 的那一轮，见

@@ -26,7 +26,7 @@
 
 ### crew-go：裁剪落在 modelFn bind list + 框架工具豁免
 
-- **`WithToolFilter(fn)`**（业务工具裁剪）：每轮 model 调用前调 `fn(ctx, input) []string` 拿业务工具白名单，`filterToolsByName`（`agent_v2/tool_search.go:158`）在 `llm.WithTools` 前裁 `ToolInfos`（调用点 `agent_v2/basic_agent.go:1214`）。与 ToolSearch 的 `filterVisibleTools` 同位置正交叠加（先 ToolSearch 揭示、后 ToolFilter 裁）。`fn` 返 nil = 不裁、返子集 = 只留这些业务工具。
+- **`WithToolFilter(fn)`**（业务工具裁剪）：每轮 model 调用前调 `fn(ctx, input) []string` 拿业务工具白名单，`filterToolsByName` 在 `llm.WithTools` 前裁 `ToolInfos`。与 ToolSearch 叠加时先形成同轮业务允许名单，再决定已解锁并可绑定的工具。`fn` 返 nil = 不裁、返子集 = 只留这些业务工具。
 - **`WithAllowedTools(names...)`**（model 层白名单）：openai client（`model/openai/client.go:196`）构建 `req.Tools` 时按名过滤——**客户端裁 tools 列表**，provider-agnostic（qwen / deepseek 等都生效）。是给"直接用 model"或其他编排的底层原语；BasicAgent 走 ToolFilter，两者独立。
 - **框架工具豁免**：`filterToolsByName` 查绑定那份工具表里这个名字下挂的实例带不带「框架铸的」封闭标记（`isFrameworkMintedIn`，`agent_v2/framework_tool.go`），框架工具恒保留——与审批层豁免同一判定。**按实例不按名字**（2026-10-12 改）：原先是 9 个名字的名单（含规划器的内部名 `plan` / `respond`），业务工具恰好叫这些名字就绕过白名单、审批、工具账（实测）。
 
@@ -54,3 +54,8 @@
 3. **ToolFilter 豁免框架工具（footgun 修复，2026-06）**：我们把 skill / toolsearch / ask_user / approval 做成框架内置一等工具，它们与业务工具**同在 modelFn bind list**——业务 filter 漏带框架工具名会静默关掉搜索 / 技能 / 问用户 / 路由。eino（框架能力在中间件层、与裁剪正交）、LangGraph（核心无框架工具）都无此场景，**无现成可抄**；按我们审批层已有的框架工具豁免先例统一（当时那道豁免按名字判，2026-10-12 起两处一起改成按实例判）：ToolFilter 只裁业务工具，框架工具恒留。选"豁免"而非"全裁"是为与 approval 一致（全裁会让同一批框架工具上 approval 豁免、ToolFilter 能裁，态度分裂）。
 4. **业务强制的 tool_choice=required 只管到模型第一次调工具（2026-10-13 定）**：同 OA 的 `reset_tool_choice` 与 MAF 的 `_reset_required_tool_choice`——调过之后还强制，模型永远不能以文本收尾。「调过工具」按**模型发起过调用**算、不看结果：失败、被拒、调了不存在的名字都算（MAF 处理完一批调用就复位，报错与未知工具名照样；OA 按 `ToolCallItem` 记、不看输出）。**框架的 tool_search 只在第一批（全是检索、且解锁了新工具）不算，之后的都算**。OA 把托管的 tool_search 整个排除（`tool_use_tracker.py` 的 `_TOOL_USE_RESET_TRACKING_ITEM_TYPES`），前提是它的检索在服务端、跟随后的调用发生在模型同一次响应里（runner 不支持客户端执行的 tool_search，`turn_resolution.py` 直接报错）；我们的 tool_search 是客户端工具、每次占一整轮，照搬整个排除时检索不到就每轮再检索、被逼到软降落轮（`df350bc0` 审计实测 6 次模型调用、改动前 2 次）。同日先定的是「每批解锁了新工具都不计」，审计实测工具库比轮次预算大时（8 个被延迟工具、预算 6 轮）照样被逼到软降落——MCP Hub 几十上百个工具、关键词检索几乎什么词都命中，正是渐进披露的主场景；改为只豁免第一批，多强制至多一轮，与工具库规模无关。代价是第一次检索解锁的不是要的工具时，第二次检索就用掉了额度（之后不再强制，模型仍可自己去调）。eino 不复位。
 5. **裁掉的工具执行侧同样拦（2026-10-23 定）**：原来 `WithToolFilter` 只裁 bind list，模型凭上文记得的名字硬调被裁掉的工具照样执行（探针实测执行 1 次）——裁剪只是建议。各家在这一点上一致：模型调了这一轮没给它的工具就报「找不到 / 不可用」、不执行（OpenAI Agents SDK 的 `is_enabled` 关掉的工具不进本轮工具表、调用即报错；eino `ToolsNode` 按本轮工具表派发、表外报错；我们自己的 `tool_search` 对未解锁的也是 fail-closed `tool_not_revealed`）。我们照此：model 节点把这一轮交给模型的工具名记进图状态（`basicToolBindingCh`，也记进模型调用记录），tools 节点对表外的工具回 `tool_not_available` 失败结果、不执行，排在渐进披露的闸之后、审批之前（不让人去批一个本轮不可用的工具）。判的是产出这一批的**那一轮**的绑定：续跑时 tools 节点直接从存档进、不重算回调——回调看的是此刻的环境，跟模型当时看到的未必一样。判据只有一条「执行的就是绑定的」：第 3 条豁免的框架工具留在绑定里、照常执行；软降落轮连框架工具一起摘（只留 `final_output`），它们不在绑定里、同样拦——第一版按第 3 条的口径对框架工具一律放行，审计实测最后一轮模型硬调 `ask_user` 照样去问人、答完被丢掉（软降落要摘的正是它们，见 `keepOnlyTools` 的说明），撤掉；钩子改写工具名时判改写后的名字（同 `tool_not_revealed`）。软失败不 abort，模型换工具或直接回答。
+
+
+### 2026-11-24 共享目录的授权和配额
+
+本地 ADK 快照在返回 MCP 缓存目录前重新应用本次上下文的工具筛选。crew-go 的 Handoff 授予决定可转交目标，成员的 `WithToolFilter` 决定当轮能发现和调用的业务工具，审批按成员归属记录。两个同名成员共用 MCP Hub 的回归覆盖了互斥候选、共享工具、常准后另一成员仍独立请批，以及显式信任只读提示后的行为。[ADK MCP 工具集](https://github.com/google/adk-python/blob/2b90353cd2f1ee0a8a52262a7843333b6f7d2c8d/src/google/adk/tools/mcp_tool/mcp_toolset.py) · [共享目录回归](../../../agent_v2/tool_search_member_policy_test.go)

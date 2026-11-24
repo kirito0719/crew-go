@@ -119,6 +119,7 @@ func newSSEAdapter(w eventWriter, runID string, input []AGUIMessage) *sseAdapter
 	a := &sseAdapter{w: w, runID: runID, openMsgs: map[string]bool{}, byID: map[string]*emittedMessage{},
 		inputIDs: map[string]bool{}, inputCallIDs: map[string]bool{}, voidedToolProducers: map[string]bool{}}
 	a.resultObserver.Deliver = a.emitCommittedToolResult
+	a.resultObserver.DeliverSkipped = a.emitCommittedSkippedToolResult
 	for _, m := range input {
 		if len(m.raw) == 0 {
 			continue
@@ -439,6 +440,14 @@ func (a *sseAdapter) emitCommittedToolResult(startCtx context.Context, out *sche
 		}
 	}
 	a.emitToolResult(out)
+}
+
+// emitCommittedSkippedToolResult 补齐升级前已展示的调用。新跳过的调用没有展示记录。
+func (a *sseAdapter) emitCommittedSkippedToolResult(startCtx context.Context, out *schema.ToolOutput) {
+	callID, _ := wireToolCallID(out.Extra, out.CallId)
+	if sent, ok := compose_v2.GetStepResult[string](startCtx, toolCallStartedStep); ok && sent == callID {
+		a.emitToolResult(out)
+	}
 }
 
 // emitToolResult 把接受的工具结果映射为 ToolCallResult，沿用调用的线上 ID。

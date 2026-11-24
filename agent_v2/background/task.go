@@ -52,6 +52,7 @@ type Task struct {
 	Answers         map[string]*schema.Message `json:"answers,omitempty"`
 	Result          *schema.Message            `json:"result,omitempty"`
 	Failure         string                     `json:"failure,omitempty"`
+	Progress        *Progress                  `json:"progress,omitempty"`
 	CancelRequested bool                       `json:"cancel_requested,omitempty"`
 	Notified        bool                       `json:"notified,omitempty"`
 	Digest          string                     `json:"digest"`

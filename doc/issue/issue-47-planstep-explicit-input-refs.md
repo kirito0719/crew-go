@@ -191,7 +191,7 @@ func defaultExecInput(original string, executed []ExecutedStep, current PlanStep
 3. **example/orchestration/plan_chat**
    - 各 scenario 的 Planner prompt 补 `depends_on` 判断规则
    - arbiter 可选保留 `ExecInputOverride` 或改用 `InputRefs: [0,1,2,...]`
-4. **doc/description/patterns.md**
+4. **doc/v2/orchestration-patterns.md**
    - PlanAgent 章节重写"每步输入构成"部分
    - 写清 `InputRefs` 与 `ExecInputBuilder` 的互斥覆盖关系
    - 强调"框架不提纯"设计原则——需要精简时插 summarizer step
@@ -256,7 +256,7 @@ sub-agent prompt 不再膨胀。
 - 6 个 scenario 全部迁移到 refs 声明（`default` / `code_review` / `feasibility` /
   `fault` / `budget` / `drill`），fan-in / 多版本场景给出 int 显式提示
 - `scenario_arbiter` 删除 `ExecInputOverride`，全量迁到 `refs:["searcher_a","searcher_b","searcher_c"]`
-- `doc/description/patterns.md`：PlanAgent 章节重写"每步输入构成"+ summarizer
+- `doc/v2/orchestration-patterns.md`：PlanAgent 章节重写"每步输入构成"+ summarizer
   step 编排建议 + ExecInputBuilder 互斥覆盖
 - `CLAUDE.md`：`PlanStep` 条目加 `InputRefs` 与 `ExecutedStep.Agent` 说明
 
@@ -287,7 +287,9 @@ sub-agent prompt 不再膨胀。
 - **Planner 侧上下文累积**：长任务下 Planner 单次 input token 膨胀——本 issue
   不解决，正解是分层规划（PlanAgent 嵌套），独立 issue 范围
 
-## 副收益：为动态并行铺路（future work）
+## 同批依赖的设计记录
+
+当前固定分支优先用图表达。Plan 在每个产出后继续重规划，`InputRefs` 仍指向已执行步骤。本地同任务对照及取舍见[待办核验台账](../code/backlog-audit.md#2026-11-24-本地待办续做)。
 
 显式 `InputRefs` 天然支持"静态可达性分析"：
 
@@ -296,7 +298,7 @@ sub-agent prompt 不再膨胀。
 - 若 Planner 返回 `[A, B]` 且 `B.InputRefs` 指向 `A`（同批 sibling）→ 必须串行
 
 但**这需要扩展 `InputRefs` 的语义**（让 index 能同时指 executed 和 remaining sibling），
-当前 issue 保持 InputRefs 只指 executed。动态并行是独立 issue，不在本 issue 范围。
+该扩展需要独立的工作负载验证同批依赖和失败语义。
 
 ## 参考
 

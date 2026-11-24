@@ -218,7 +218,7 @@ type Config struct {
 	// 否则 Handoff 共享视图下它恰好排在末尾、业务拿到的是框架记账而不是对话内容；框架以 user
 	// 角色追加的提示（后台任务通知、重复调用提醒、inline skill 正文，见 IsFrameworkNote）同样跳过；
 	// 每轮都跑（含 Resume 后的轮）。用于"分类后裁工具"等场景（RoutingAgent classifier 分类 →
-	// filter 返子集是典型用法）。与 ToolSearch（LLM 主动搜解锁）正交可叠加。
+	// filter 返子集是典型用法）。启用 ToolSearch 时，本轮名单同时限制可检索的延迟工具。
 	// **执行侧同样拦**：模型照样发了调被裁掉的业务工具的 tool_call（凭上文记得的名字）时，工具不执行，模型收到
 	// [ToolNotAvailableErrCode] 失败结果；判的是产出这一批 tool_call 的那一轮交给模型的工具（随存档走，续跑时不重算回调）。
 	// 软降落轮摘掉的工具（含框架工具）同理。
@@ -461,6 +461,7 @@ func WithToolMiddleware(mws ...ToolMiddleware) Option {
 // WithToolFilter 设每轮业务工具裁剪回调——每次 model 调用前框架调 fn 拿本轮允许的业务
 // 工具名白名单，在 bind 前过滤（fn 返 nil = 不裁、返子集 = 只 bind 这些业务工具）。框架
 // 工具（ask_user/activate_skill/tool_search/...）恒保留、不受影响。fn 为 nil 不挂。
+// 启用 [WithToolSearch] 时，名单中的延迟工具也可以参与本轮检索。
 //
 // ⚠️ **轮次预算的最后一轮**（软降落，见 [withFinalRound]）fn 照常被调用，但那一轮模型不调工具：
 // 没配 WithOutputSchema 时照常按 fn 的白名单 bind，只是 tool_choice=none 关掉了工具调用；配了时工具

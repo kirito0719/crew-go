@@ -486,8 +486,9 @@ func TestRouteDecider_UndecidedWithoutErrorsRetriesFromScratch(t *testing.T) {
 // TestRouteDecider_UndecidedRouterAsToolLeavesParentRunning：RoutingAgent 被包成工具时，
 // 决策方都拿不准只是这个工具失败了，模型拿到失败后自己换条路，父 Run 不受影响。
 func TestRouteDecider_UndecidedRouterAsToolLeavesParentRunning(t *testing.T) {
+	const detail = "private routing backend failure"
 	abstain := func(_ context.Context, _ agent_v2.RouteRequest) (agent_v2.RouteDecision, error) {
-		return agent_v2.RouteDecision{}, nil
+		return agent_v2.RouteDecision{}, errors.New(detail)
 	}
 	router := agent_v2.NewRoutingAgent(
 		agent_v2.WithRoutingName("router"),
@@ -523,7 +524,7 @@ func TestRouteDecider_UndecidedRouterAsToolLeavesParentRunning(t *testing.T) {
 			toolResult = m.Content
 		}
 	}
-	if !strings.Contains(toolResult, "no decider produced an acceptable decision") {
+	if !strings.Contains(toolResult, "no decider produced an acceptable decision") || strings.Contains(toolResult, detail) {
 		t.Fatalf("the model should see why routing failed, got tool result %q", toolResult)
 	}
 }

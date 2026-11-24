@@ -9,6 +9,8 @@ depends: ISSUE-65
 
 # ISSUE-68 · ReactiveCompact 被动压缩
 
+现行实现沿用本轮已生成的 AutoCompact 摘要，再按组裁剪当前模型视图。下文保留立项时的候选方案。以[上下文压缩](../v2/context-compaction.md)和[本次核验](../code/backlog-audit.md#2026-11-24-本地待办续做)为准。
+
 ## 背景
 
 第 3 层压缩——AutoCompact 没拦住的最后兜底。当 LLM 调用返回 prompt-too-long 错误

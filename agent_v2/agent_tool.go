@@ -3,6 +3,7 @@ package agent_v2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 
 	"crew-go/compose_v2"
@@ -18,6 +19,7 @@ type agentToolConfig struct {
 	customInputSchema map[string]any
 	fullHistoryInput  bool
 	callKey           func(args map[string]any) string
+	errorMapper       func(context.Context, error) *tool.Error
 }
 
 type agentToolAdapter interface {
@@ -94,6 +96,12 @@ func WithAgentToolFullHistoryInput() AgentAsToolOption {
 // 全历史输入（[WithAgentToolFullHistoryInput]）本来就只按位置定身份，给了 key 时位置之外再带上它。
 func WithAgentToolCallKey(fn func(args map[string]any) string) AgentAsToolOption {
 	return func(c *agentToolConfig) { c.callKey = fn }
+}
+
+// WithAgentToolErrorMapper 显式提供可呈现给模型的业务错误。返回 nil 时使用通用文案。
+// 映射器只处理普通错误，挂起、取消和存档控制流沿用原错误链。
+func WithAgentToolErrorMapper(mapper func(ctx context.Context, err error) *tool.Error) AgentAsToolOption {
+	return func(c *agentToolConfig) { c.errorMapper = mapper }
 }
 
 // AgentAsTool 把 Agent 包装为 tool.Tool——可注册到 toolkit 让另一 agent 的
@@ -189,6 +197,7 @@ func AgentAsTool(a Agent, opts ...AgentAsToolOption) tool.Tool {
 		customInputSchema: cfg.customInputSchema,
 		fullHistoryInput:  cfg.fullHistoryInput,
 		callKey:           cfg.callKey,
+		errorMapper:       cfg.errorMapper,
 		adapter:           adapter,
 	}
 }
@@ -199,6 +208,7 @@ type agentTool struct {
 	customInputSchema map[string]any
 	fullHistoryInput  bool
 	callKey           func(args map[string]any) string
+	errorMapper       func(context.Context, error) *tool.Error
 	adapter           agentToolAdapter
 }
 
@@ -243,7 +253,7 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 	case t.customInputSchema != nil:
 		raw, err := json.Marshal(args)
 		if err != nil {
-			return tool.Failure(tool.ErrCodeInternal, "AgentAsTool: marshal custom args: "+err.Error()), nil
+			return t.handleError(ctx, err, tool.ErrCodeInvalidArguments, "无法编码子 Agent 的工具参数")
 		}
 		subInput = schema.UserMessage(string(raw))
 	case t.usesHistory():
@@ -290,7 +300,7 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 		var err error
 		subInput, err = t.adapter.AgentToolInput(args)
 		if err != nil {
-			return tool.Failure(tool.ErrCodeInvalidArguments, err.Error()), nil
+			return t.handleError(ctx, err, tool.ErrCodeInvalidArguments, "子 Agent 的工具参数无效")
 		}
 		if subInput == nil {
 			return tool.Failure(tool.ErrCodeInvalidArguments, "agent tool returned no input message"), nil
@@ -351,19 +361,7 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 		nestedMode{positional: t.usesHistory(), remember: true, finalOnly: true, settle: !outputRecordedAsToolResult(ctx)},
 		opts...)
 	if err != nil {
-		// **audit Phase 5.2 Bug #1 修复**：InterruptError 必须 propagate as error
-		// 让上层框架 SaveNS cp——之前转 tool.Failure 静默吞会让 HITL 中断丢失。
-		// 业务错（非 Interrupt）仍按 tool.Failure 让 LLM 看到错误信息继续 ReAct。
-		// **控制流信号必 propagate，不转 tool.Failure**（判据走 `MustPropagate`，
-		// **别直接调 `IsControlFlowSignal`**——理由见 errors.go 那条 godoc，agent_v2 有机械
-		// 对账 `TestSwallowDecision_NoDirectControlFlowSignal` 挡着）：
-		// InterruptError（框架要 SaveNS cp、父要挂起）/ ctx 取消（父也超时了，转错误让父
-		// LLM 继续 ReAct 纯浪费）/ **陈旧写回**（另一个执行者已推进会话——转成 tool 错误
-		// 会让父 LLM 当普通失败重试，而子 agent 的副作用已经落地了，重试即翻倍）。
-		if compose_v2.MustPropagate(ctx, err) {
-			return nil, err
-		}
-		return tool.Failure(tool.ErrCodeInternal, err.Error()), nil
+		return t.handleError(ctx, err, tool.ErrCodeInternal, "子 Agent 未能完成调用")
 	}
 	out := FinalMessage(events)
 	if out == nil {
@@ -373,6 +371,27 @@ func (t *agentTool) Call(ctx context.Context, args map[string]any) (*tool.Result
 		return tool.Success(t.adapter.AgentToolOutput(out)), nil
 	}
 	return tool.Success(out.Content), nil
+}
+
+func (t *agentTool) handleError(ctx context.Context, err error, code, message string) (*tool.Result, error) {
+	if compose_v2.MustPropagate(ctx, err) {
+		return nil, err
+	}
+	var undecided *RouteUndecidedError
+	if errors.As(err, &undecided) {
+		message = "no decider produced an acceptable decision"
+	}
+	if t.errorMapper != nil {
+		if public := t.errorMapper(ctx, err); public != nil {
+			if public.Code != "" {
+				code = public.Code
+			}
+			if public.Message != "" {
+				message = public.Message
+			}
+		}
+	}
+	return tool.Failure(code, message), nil
 }
 
 var _ tool.Tool = (*agentTool)(nil)

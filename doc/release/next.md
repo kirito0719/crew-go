@@ -2,6 +2,9 @@
 
 ## 部署前
 
+- `AgentAsTool` 的模型侧失败使用框架通用文案和明确的路由未决提示。业务可通过 `WithAgentToolErrorMapper` 提供可公开的错误信息。[用法](../v2/usage-guide.md#子-agent-的工具错误)
+- `WithToolFilter` 同时约束业务工具绑定和渐进检索。BasicAgent 的软降落轮中，超出预算的工具调用跳过工具钩子，历史仍记录结果。[工具检索](../v2/toolsearch.md) · [钩子协议](../v2/hooks.md)
+
 - 自行构建工具图时，用 `BasicAgentBuilder.WithToolCategoryLookup` 绑定该图的分类查询。原先从 ctx 设置和读取查询的调用方改在构建时提供函数。使用 BasicAgent 注册工具时由框架绑定。[工具观测](../v2/observability.md)
 - Schema 25 保存子调用的独立完成结果。旧版挂起的嵌套 agent 通过父图补答。尤其是跨分区的旧静态成员，其存档可能缺少可识别父调用的字段。回退前处理新版已完成、仍等待父图领取的子槽。[子调用存档](../v2/checkpoint.md#独立完成的子调用)
 - 自定义模型和模型钩子应返回有效 UTF-8 工具调用 ID。旧挂起档若已将非法字节替换为 `�`，受影响的调用可能再次提问，可按新问题的 ID 作答。[HITL 协议](../v2/hitl-resume.md)

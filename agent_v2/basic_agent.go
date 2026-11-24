@@ -389,18 +389,9 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 				"（答复在 events 里，用 FinalMessage 取）: %w",
 				a.config.Name, &compose_v2.MaxIterationsError{Iterations: int(lastRound)})
 		case errors.As(err, &mie) && !isInterruptErr(err):
-			// ⚠️ **`errors.As` 问的是「链上任何位置有没有 MaxIterationsError」，它不足以断言「是我自己的软降落轮
-			// 模型硬调了工具」**。可达的反例（审计实测）：软降落轮的 tools 节点里业务 OnToolStart / OnToolEnd 钩子
-			// 对被拦下的那一批照样 fire，钩子返错会让节点失败（见 basic_builder.go 的 `OnToolStart: %w`），而那个错
-			// 里可以包着钩子自己调起的子 agent 的 MaxIterationsError——此刻 round 恰好是 mr+1，判据成立。
-			// 实测报出 `Iterations=99`（钩子里别人的数字）挂在一句讲本 agent 预算的话下面。
+			// 收尾模型或允许执行的结构化收尾工具也可能返回包含 MaxIterationsError 的业务错误。
+			// 正文只报告本次预算状态，保留实际原因和可续的中断。
 			//
-			// 所以正文**只陈述能确定的事**（预算跑满了几轮、这次 Run 以错误收尾、没交付答复），把「provider 不守
-			// none」写成**常见原因之一**而不是结论，真正的错误紧跟在后面。曾经直接断言「模型仍硬调了工具」，那在
-			// 上面那条路上是一句假陈述。
-			//
-			// **链上有中断的不碰**：a2a/server 与 agui 会走中断分支把问题呈现给用户请他作答，而同一个错误的头条
-			// 说「预算耗尽、FinalMessage 可能为 nil」是自相矛盾的（审计实测业务钩子 errors.Join 两者的形态）。
 			// **重铸一个自己的 MaxIterationsError 挂在外层**：errors.As 取链上第一个，于是调用方读到的
 			// Iterations 是**本 agent 跑满的轮数**（= maxRounds+1），跟上面正文里那句「跑满 %d 轮」一致。
 			// 不重铸的话取到的是引擎 maxVisit 填的 visits[id]（= maxRounds+2，被拒的那次访问），同一个
@@ -1128,10 +1119,26 @@ func truncatePriorPreservingMarkers(prior []*schema.Message, limit int) []*schem
 		}
 	}
 
-	out := make([]*schema.Message, 0, len(queue)+len(rest)-start)
+	needsInput := make(map[historyInvocation]bool)
+	for _, key := range retainedInvocations(rest[start:]) {
+		needsInput[key] = true
+	}
+	// 窗内已有同一次调用的输入时沿用，不为已裁掉的其他调用扩大窗口。
+	for _, m := range rest[start:] {
+		if invocationInput(m) {
+			delete(needsInput, historyInvocationOf(m))
+		}
+	}
+	out := make([]*schema.Message, 0, len(queue)+len(rest)-start+len(needsInput))
 	for i, m := range prior {
 		if protected[i] || restPos[i] >= start {
 			out = append(out, m)
+		} else if invocationInput(m) {
+			key := historyInvocationOf(m)
+			if needsInput[key] {
+				out = append(out, m)
+				delete(needsInput, key)
+			}
 		}
 	}
 	return out
@@ -2367,6 +2374,7 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	}
 	// 这一批处理完之后把结果定进工具账（见 finalizeToolMemo）——跟配没配转存无关。
 	bld.useToolMemo = true
+	bld.finalRoundTool = func(name string) bool { return isFrameworkFinalOutput(dispatchToolkit, name) }
 	if len(a.config.TurnGates) > 0 {
 		bld = bld.WithTurnGates(a.config.TurnGates, a.config.TurnGateMaxVetoes)
 	}
@@ -2960,11 +2968,7 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 			tools := toolkit.ToolInfos()
 			// 这一轮有没有裁剪（ToolFilter 返回了名单、或软降落）：有的话交给模型的那些就是 tools 节点只执行的那些（见 toolBinding）
 			restricted := false
-			if tsDeferredNames != nil {
-				tools = filterVisibleTools(tools, tsDeferredNames, tsRevealed)
-			}
-			// 业务工具裁剪：ToolFilter 返本轮允许的工具名（nil = 不裁）。与 tool_search
-			// 的 filterVisibleTools 正交、同位置叠加——这里在 bind 前再裁一层。
+			// 本轮允许名单同时约束绑定与检索。延迟工具仍可进入检索名单。
 			if cfg.ToolFilter != nil {
 				// 倒着找最后一条**真实**消息——跳过框架合成的记账文本。
 				// 它在 Handoff 共享视图（Raw/Rewrite）下会恰好排在末尾：那条路径不 append
@@ -2984,7 +2988,17 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 				if allowed := cfg.ToolFilter(ctx, lastInput); allowed != nil {
 					tools = filterToolsByName(tools, allowed, toolkit)
 					restricted = true
+					if sink := toolBindingSink(ctx); sink != nil && tsDeferredNames != nil {
+						names := make([]string, 0, len(tools))
+						for _, info := range tools {
+							names = append(names, info.Name)
+						}
+						sink.searchNames = &names
+					}
 				}
+			}
+			if tsDeferredNames != nil {
+				tools = filterVisibleTools(tools, tsDeferredNames, tsRevealed)
 			}
 			// **软降落**（轮次预算的最后一轮，见 [withFinalRound]）分两档：
 			//
@@ -3027,10 +3041,10 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 				tools = keepOnlyTools(tools, FinalOutputToolName)
 			}
 			if sink := toolBindingSink(ctx); sink != nil && (restricted || isFinalRound(ctx)) {
-				sink.Restricted = true
-				sink.Names = make([]string, 0, len(tools))
+				sink.binding.Restricted = true
+				sink.binding.Names = make([]string, 0, len(tools))
 				for _, ti := range tools {
-					sink.Names = append(sink.Names, ti.Name)
+					sink.binding.Names = append(sink.binding.Names, ti.Name)
 				}
 			}
 			if len(tools) > 0 {
@@ -3376,10 +3390,12 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 					msg = cloneCalleeInput(msg)
 					var names []string
 					if search, ok := dispatchToolkit.Get(tc.Function.Name).(*toolSearchTool); ok && turn != nil {
-						names, _ = splitCandidates(hit.Search.Names, search.deferred)
+						names, _ = splitCandidates(hit.Search.Names, search.candidates(callCtx))
 						turn.add(idx, names...)
 					}
-					if len(names) != len(hit.Search.Names) && !isFailedToolResult(msg) {
+					selection := toolBindingFrom(callCtx)
+					legacyScope := selection.restricted() && selection.searchNames == nil
+					if legacyScope || len(names) != len(hit.Search.Names) && !isFailedToolResult(msg) {
 						// 固定提示不重建钩子已处理的正文，也不交出目录里已撤下的候选。
 						setSearchReceipt(msg, "部分工具已从检索候选中撤下。请按当前工具列表选择，或重新检索。")
 					}
@@ -3405,8 +3421,7 @@ func (a *BasicAgent) makeToolsFn(cfg Config, grants memberGrants, dispatchToolki
 			// 在轮次预算之外多跑一批副作用，而结果再没有一轮可以消化。以失败结果交回（同下面的 tool_not_revealed：调了这一轮
 			// 不让调的工具是失败的 tool call）；回到 model 节点时以 MaxIterationsError 结束，不再调模型（顶层 Run 上是引擎的
 			// maxVisit 先拦下，续跑时是 model 节点开头「每个任务至多一个软降落轮」那道闸）。
-			// 放在审批之前：框架的审批不会去问一个注定不执行的调用。业务的 OnToolStart / OnToolEnd 照常触发（钩子在工具函数
-			// 之外、每个调用都触发）——在 OnToolStart 里做 HITL 确认的业务会被问到这次调用。
+			// 普通调用在软降落轮跳过工具钩子。本闸还校验允许的收尾工具是否被开始钩子改写。
 			//
 			// 放行的只有框架那件 final_output：配了结构化输出时那一轮只给它留了它，它是答复的唯一投递通道。按实例认、不按
 			// 名字——没配 WithOutputSchema 时 final_output 这个名字是业务工具，跟别的业务工具一样不执行。

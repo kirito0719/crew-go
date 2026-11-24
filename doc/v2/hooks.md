@@ -104,6 +104,7 @@ type Hooks interface {
 | **OnAgentEnd** | agent 最外层、图执行**后**（defer）· 每 Run/Resume 1 次 | `AgentOutput.Messages` = 本 Run 累积消息快照 | `ctx`（**无 error**）；不中断 | 一次调用的收尾：trace span 结束 / 在途计数 -- / 审计 |
 | **OnError** | 任一阶段出错时（中断信号 & ctx 取消除外）| `CommError.Code` / `Message` | `ctx`（**无 error**）；不中断 | 错误观测 / 统计 |
 
+BasicAgent 的软降落轮只派发框架结构化收尾工具。超出轮次预算的其他模型调用不进入工具开始或结束钩子，历史保留配对的失败结果。AG-UI 按存档中的展示记录，给升级前已展示的调用补发提交后的拒绝结果。
 
 ## 3. 编排级 OrchestrationHooks（5 方法）
 

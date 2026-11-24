@@ -403,3 +403,8 @@ OpenAI Agents SDK 本地 `6c4e4a29` 的 `src/agents/models/_response_terminal.py
 | 文档与注释 | 实际 diff（含新文件）经过 commentaudit，未发现 ERROR；公开 API 用 go doc 核对 |
 
 失败用量、恢复所有权、评测与文档分别经过独立复审；发现使用生产组件或真实 wire-format stub 复现后修复。当时另行登记的 AutoCompact 并发快照问题已由后续修复关闭。 [并发边界决策与回归](../../issue/issue-100-history-compaction-concurrent.md)
+
+
+### 2026-11-24 转存记录的保留期限
+
+MicroCompact 给应用一个显式期限，默认由应用决定何时回收。工具原文和存档各有生命周期，应用选择可覆盖挂起窗口的期限。SQLite 磁盘验证同时保留永久与限时引用，关闭重开后按原 key 读取，限时条目到期后原有永久记录仍能读到。ReactiveCompact 继续裁剪已经送模的当轮视图，已有摘要随同视图受保护。[保留与恢复](../../v2/context-compaction.md#第-1-层microcompact-微压缩) · [SQLite 对照](../../../sql/microcompact_retention_test.go)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"crew-go/agent_v2"
@@ -87,5 +88,49 @@ func TestAgentAsTool_PropagatesInterruptError(t *testing.T) {
 	}
 }
 
-// 防 unused
-var _ = errors.New
+func TestAgentAsToolKeepsRuntimeErrorsOutOfModelInput(t *testing.T) {
+	private := errors.New("dependency error with private connection details")
+	for _, mapped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mapped=%t", mapped), func(t *testing.T) {
+			const name = "inspect"
+			child := mkEchoGraph(t, name, func(_ context.Context, in *schema.Message) (*schema.Message, error) {
+				if in.Content != "run inspection" {
+					t.Fatalf("子任务收到 %q", in.Content)
+				}
+				return nil, private
+			})
+			opts := []agent_v2.AgentAsToolOption{agent_v2.WithAgentToolDescription("核验检查项")}
+			want := "子 Agent 未能完成调用"
+			mappedCalls := 0
+			if mapped {
+				want = "暂时无法核验，请选择其他记录"
+				opts = append(opts, agent_v2.WithAgentToolErrorMapper(func(_ context.Context, err error) *tool.Error {
+					if !errors.Is(err, private) {
+						t.Fatalf("业务映射器未收到原错误，实际 %v", err)
+					}
+					mappedCalls++
+					return &tool.Error{Code: "inspection_unavailable", Message: want}
+				}))
+			}
+			kit := tool.NewToolkit()
+			kit.Register(agent_v2.AgentAsTool(child, opts...))
+			m := &promptRecorder{resp: []*schema.Message{schema.AssistantToolCallMessage([]schema.ToolCall{
+				{ID: "inspection", Function: schema.FunctionCall{Name: name, Arguments: `{"input":"run inspection"}`}},
+			}), schema.AssistantMessage("已收到工具失败")}}
+			parent := agent_v2.NewBasicAgent(agent_v2.WithName("parent"), agent_v2.WithModel(m), agent_v2.WithToolkit(kit))
+			events, err := parent.Run(t.Context(), agent_v2.NewRunSession(), schema.UserMessage("核验"))
+			if err != nil || agent_v2.FinalMessage(events) == nil {
+				t.Fatalf("父 agent 应收到工具失败后继续，错误 %v", err)
+			}
+			for _, msg := range m.call(1) {
+				if schema.GetToolResultID(msg) == "inspection" {
+					if !strings.Contains(msg.Content, want) || strings.Contains(msg.Content, private.Error()) || mapped && mappedCalls != 1 {
+						t.Fatalf("模型收到 %q，映射器调用 %d 次", msg.Content, mappedCalls)
+					}
+					return
+				}
+			}
+			t.Fatal("父模型没有拿到工具结果")
+		})
+	}
+}

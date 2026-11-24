@@ -540,6 +540,10 @@ func testLongKeys(t *testing.T, factory HistoryStoreFactory) {
 					return agent_v2.HistoryKey{Owner: "o", ConvID: p + l1},
 						agent_v2.HistoryKey{Owner: "o", ConvID: p + l2}
 				}},
+				{"Owner 和 ConvID 同时到上限", func(p, l1, l2 string) (agent_v2.HistoryKey, agent_v2.HistoryKey) {
+					return agent_v2.HistoryKey{Owner: p + l1, ConvID: p + l1},
+						agent_v2.HistoryKey{Owner: p + l1, ConvID: p + l2}
+				}},
 			} {
 				t.Run(dim.name, func(t *testing.T) {
 					hs := factory()

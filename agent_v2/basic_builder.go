@@ -230,6 +230,8 @@ type BasicAgentBuilder struct {
 	finishToolResult func(ctx context.Context, toolName string, msg *schema.Message, failed bool, code string)
 	// useToolMemo 由 BasicAgent 启用。低阶 builder 的自定义 toolsFn 自行管理进度。
 	useToolMemo bool
+	// finalRoundTool 判断软降落轮允许交给业务钩子的框架收尾工具。
+	finalRoundTool func(string) bool
 	// limitedToolSearch 在并行检索汇合后按工具调用顺序分配本任务的解锁额度。
 	limitedToolSearch *toolSearchTool
 	// turnGates / turnGateMaxVetoes 见 WithTurnGates：回合结束闸门（空 = 不建闸门节点）。
@@ -1085,6 +1087,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		memo := &compactionMemoCtx{in: memoIn}
 		var out, boundary *schema.Message
 		var binding *toolBinding // 这一轮交给模型的工具，没有裁剪时为 nil（见 toolBinding）
+		var searchNames *[]string
 		// 处理这次模型调用时做出的上行信号收在一起（钩子与模型里做出的，多数为空）：定下时连同产出记下，续跑重放定下的
 		// 那一轮时交出当时那份（那时钩子不再触发）。
 		sigs, err := compose_v2.CaptureSignals(ctx, func(segCtx context.Context) error {
@@ -1137,11 +1140,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if hasRec {
 				// 上一次模型调用成功之后、OnModelEnd 处理完之前停下了（中断、取消）：沿用那次的答复，不再调模型——钩子
 				// 问过人的话，用户答的就是这一份（见 modelCallRecord）
-				out, memo.out, boundary, binding = rec.Out, rec.Compaction, rec.Boundary, rec.Binding
+				out, memo.out, boundary, binding, searchNames = rec.Out, rec.Compaction, rec.Boundary, rec.Binding, rec.SearchNames
 			} else {
 				var err error
 				// modelFn 绑工具时把这一轮交给模型的那些填进来（见 toolBinding）
-				sink := &toolBinding{}
+				sink := &toolSelection{binding: &toolBinding{}}
 				out, err = model(withToolBindingSink(callCtx, sink), modelIn.Preamble, msgs)
 				if err == nil && out != nil {
 					err = validateToolCallIDs(out)
@@ -1153,8 +1156,9 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 					}
 				}
 				err = providerModel.ReportFailedUsage(callCtx, err)
-				if sink.Restricted {
-					binding = sink
+				if sink.restricted() {
+					binding = sink.binding
+					searchNames = sink.searchNames
 				}
 				if err != nil {
 					// audit Round 7 Bug 3 修复：compose_v2.InterruptError 是控制流不是错误, 不上报 OnError
@@ -1174,7 +1178,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				}
 				// 模型调用成功那一刻记下原样：OnModelEnd 因为要等人或被叫停停下时，续跑沿用这一份（见 modelCallRecord）。
 				// 记在交给 OnModelEnd 之前——存下的字节是钩子改写之前当场序列化的。
-				saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Out: out, Compaction: memo.out, Boundary: boundary, Binding: binding, FinalRound: finalRound})
+				saveModelCall(ctx, &modelCallRecord{Notes: notes, Inter: inter, Out: out, Compaction: memo.out, Boundary: boundary, Binding: binding, SearchNames: searchNames, FinalRound: finalRound})
 				keepRecord = false
 			}
 
@@ -1285,9 +1289,10 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		if len(schema.GetToolCalls(out)) != 0 {
 			// 这批的身份随模型答复保存。已挂起的旧批次没有这个标注，沿用原调用 ID。
 			stamped := *out
-			stamped.Annotations = make(map[string]any, len(out.Annotations)+1)
+			stamped.Annotations = make(map[string]any, len(out.Annotations)+2)
 			maps.Copy(stamped.Annotations, out.Annotations)
 			stamped.Annotations[toolCallBatchIDAnnotation] = newUUID()
+			stampToolSearchScope(&stamped, searchNames)
 			out = &stamped
 		} else if !finalRound {
 			all, err := takeInterjections(ctx)
@@ -1334,7 +1339,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 这一批 tool_call 出自哪一轮的绑定（见 toolBinding）：执行闸只放行那一轮交给模型的业务工具。从 channel 读，
 		// 续跑直接进本节点时也是当初那份。没有也推（nil），盖掉从调用方继承来的那份。
 		binding, _ := compose_v2.Get(chs, basicToolBindingCh)
-		ctx = withToolBinding(ctx, binding)
 		// 这一批里检索解锁的名字记在这次执行上（工具体拿不到 channel 写入口），节点成功后写进 basicRevealedCh；
 		// 节点失败或中断时，已完成检索的候选从逐调用工具账恢复。每次执行一份新的，盖掉从调用方继承的批次。
 		turn := &revealTurn{}
@@ -1351,6 +1355,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			return nil, fmt.Errorf("tools: no messages in history")
 		}
 		last := msgs[len(msgs)-1]
+		ctx = withToolBinding(ctx, toolSelection{binding: binding, searchNames: readToolSearchScope(last)})
 		toolCalls := schema.GetToolCalls(last)
 		if len(toolCalls) == 0 {
 			return nil, fmt.Errorf("tools: last message has no tool_calls")
@@ -1385,11 +1390,12 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			result := batch.memo[i].Result
 			return result != nil && result.ToolMsg != nil && result.Final
 		}
-		// unfixed 去掉定下了的那几个：它们的 OnToolStart 没触发，失败路径上也不补 OnToolEnd（见 endSettledToolCalls）
-		unfixed := func(ends []toolCallEnd) []toolCallEnd {
+		skipped := make([]bool, len(toolCalls))
+		// 未触发 OnToolStart 的调用在失败路径上也跳过 OnToolEnd。
+		started := func(ends []toolCallEnd) []toolCallEnd {
 			out := make([]toolCallEnd, len(ends))
 			for j := range ends {
-				if !isFixed(j) {
+				if !isFixed(j) && !skipped[j] {
 					out[j] = ends[j]
 				}
 			}
@@ -1402,6 +1408,15 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		for i := range toolCalls {
 			if isFixed(i) {
 				toolCalls[i] = fixedContent[i]
+				callCtxs[i] = ctx
+				continue
+			}
+			callName := toolCalls[i].Function.Name
+			if redispatched {
+				callName = fixedContent[i].Function.Name
+			}
+			if finalRound && b.finalRoundTool != nil && !b.finalRoundTool(callName) {
+				skipped[i] = true
 				callCtxs[i] = ctx
 				continue
 			}
@@ -1472,7 +1487,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		results, err := tools(withToolBatch(withToolResultRecorder(ctx), batch), toolCalls, execCtxs)
 		if err != nil {
 			// 这一批没整体成功：已经有结局的调用先各自收尾（OnToolEnd），挂起的、被停下的不收（见 endSettledToolCalls）
-			endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, batch, unfixed(batch.ends), 0)
+			endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, batch, started(batch.ends), 0)
 			// audit Round 7 Bug 3: compose_v2.InterruptError 是控制流, 不上报 OnError (HITL ask_user)
 			if _, isInt := compose_v2.IsInterrupt(err); !isInt {
 				// 业务自写的 toolsFn 交不出各调用的结局，OnError 是钩子给 OnToolStart 里开的东西（span 等）收尾的唯一机会。
@@ -1528,6 +1543,11 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			if !before.Success {
 				preHookFailure[i] = before.Output // 失败时 Output 就是渲染好的 `[code] msg`
 			}
+			if skipped[i] {
+				hookSignals = append(hookSignals, compose_v2.Signals{})
+				failedAfterHook[i], codeAfterHook[i] = !before.Success, before.ErrorCode
+				continue
+			}
 			// 定下了的不再处理（OnToolStart 也没触发，见上）：结论与钩子做出的决定用定下时那份。
 			if isFixed(i) {
 				hookSignals = append(hookSignals, batch.memo[i].Result.HookSignals)
@@ -1573,7 +1593,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				for j := i + 1; j < len(toolCalls) && j < len(results); j++ {
 					rest[j] = toolCallEnd{msg: results[j], replayed: j < len(batch.ends) && batch.ends[j].replayed}
 				}
-				endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, batch, unfixed(rest), i+1)
+				endSettledToolCalls(ctx, hooks, info, toolCalls, callCtxs, batch, started(rest), i+1)
 				if _, isInt := compose_v2.IsInterrupt(hookErr); !isInt && ctx.Err() == nil {
 					hooks.OnError(toolHookCtx(callCtxs[i], "OnError", toolCalls[i].Function.Name, to.CallId, i), info, &schema.CommError{Code: "tool_end_error", Message: hookErr.Error()})
 				}
@@ -1839,15 +1859,24 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 			original := schema.GetToolCalls(last)
 			for i, result := range results[:min(len(results), len(toolCalls))] {
 				delivery := deliveries[i]
-				if result == nil || delivery == nil {
+				deliver := observer.Deliver
+				if skipped[i] {
+					// 旧档可能已经展示这次调用。提交拒绝结果后由宿主核对原展示记录。
+					deliver = observer.DeliverSkipped
+				} else if delivery == nil {
+					continue
+				}
+				if result == nil || deliver == nil {
 					continue
 				}
 				out := toolOutputFor(result, toolCalls[i].ID, i < len(batch.ends) && batch.ends[i].replayed)
 				out.Extra = batch.withIdentity(out.Extra, i)
-				out.Result = delivery.Project(out.Result)
+				if delivery != nil {
+					out.Result = delivery.Project(out.Result)
+				}
 				start := original[i]
 				startCtx := toolHookCtx(ctx, "OnToolStart", start.Function.Name, start.ID, i)
-				compose_v2.AfterNodeCommit(ctx, func() { observer.Deliver(startCtx, out) })
+				compose_v2.AfterNodeCommit(ctx, func() { deliver(startCtx, out) })
 			}
 		}
 		return writes, nil

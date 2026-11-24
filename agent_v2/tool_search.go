@@ -377,6 +377,20 @@ func (t *toolSearchTool) InputSchema() map[string]any {
 	}
 }
 
+func (t *toolSearchTool) candidates(ctx context.Context) []tool.Tool {
+	binding := toolBindingFrom(ctx)
+	if !binding.restricted() {
+		return t.deferred
+	}
+	out := make([]tool.Tool, 0, len(t.deferred))
+	for _, candidate := range t.deferred {
+		if binding.allowsSearch(candidate.Name()) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
 func (t *toolSearchTool) Call(ctx context.Context, args map[string]any) (*tool.Result, error) {
 	query, _ := args["query"].(string)
 	if strings.TrimSpace(query) == "" {
@@ -386,20 +400,24 @@ func (t *toolSearchTool) Call(ctx context.Context, args map[string]any) (*tool.R
 	if turn == nil {
 		return tool.Failure(tool.ErrCodeInternal, "tool_search: 不在 BasicAgent 的 tools 节点里（框架内部错误）"), nil
 	}
+	candidates := t.candidates(ctx)
 	var names []string
 	if t.maxRevealed > 0 {
 		// 额度结算依赖检索结果随这次工具批次一起提交，禁止让它附带可独立重放的信号。
 		signals, _ := compose_v2.CaptureSignals(ctx, func(ctx context.Context) error {
-			names = t.retriever(ctx, query, t.deferred)
+			names = t.retriever(ctx, query, candidates)
 			return nil // 检索接口只有候选列表。
 		})
 		if !signals.IsZero() {
 			return tool.Failure(tool.ErrCodeInternal, "tool_search: 启用累计上限时 Retriever 只能返回候选，不能发出编排控制信号"), nil
 		}
 	} else {
-		names = t.retriever(ctx, query, t.deferred)
+		names = t.retriever(ctx, query, candidates)
 	}
-	matched, others := splitCandidates(names, t.deferred)
+	matched, others := splitCandidates(names, candidates)
+	if binding := toolBindingFrom(ctx); binding.restricted() {
+		others = slices.DeleteFunc(others, func(name string) bool { return !binding.allows(name) })
+	}
 	// 批次成功后由节点提交。批内执行仍只认此前提交的解锁集。
 	turn.add(compose_v2.GetCurrentToolCallIndex(ctx), matched...)
 	if len(matched) == 0 {

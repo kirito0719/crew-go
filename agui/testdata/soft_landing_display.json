@@ -1,0 +1,158 @@
+{
+  "call_id": "d52f891e-dde6-4f36-bb7b-71786a855e90/tool/0",
+  "checkpoint": {
+    "id": "9b6286e7-d431-493a-957e-628a5666202f",
+    "status": 1,
+    "schema_ver": 25,
+    "graph_id": "graph-v1:29417a2c1dda77f62753b2b8f2f8495004baa1c30d0300fb0dc7a2fc8a2727f7",
+    "created_at": 1795503912697722000,
+    "epoch": "9abc7cf04c043d22",
+    "task_id": "559870478f2bc7f9",
+    "channels": {
+      "__basic_agent_final__": {
+        "type": "*schema.Message",
+        "data": {
+          "role": "assistant",
+          "content": "",
+          "content_blocks": [
+            {
+              "type": "tool_call",
+              "toolcall": {
+                "type": "",
+                "id": "provider",
+                "arguments": "{}",
+                "name": "noop"
+              }
+            }
+          ],
+          "annotations": {
+            "run_id": "c01b1050-c131-4dff-a000-a936b79a9a30",
+            "tool_call_batch_id": "d52f891e-dde6-4f36-bb7b-71786a855e90"
+          }
+        }
+      },
+      "__basic_agent_final_round__": {
+        "type": "bool",
+        "data": true
+      },
+      "__basic_agent_messages__": {
+        "type": "[]*schema.Message",
+        "data": [
+          {
+            "id": "58ba48a8cad4310ea83f872b0880ce7b",
+            "role": "user",
+            "content": "go"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "content_blocks": [
+              {
+                "type": "tool_call",
+                "toolcall": {
+                  "type": "",
+                  "id": "provider",
+                  "arguments": "{}",
+                  "name": "noop"
+                }
+              }
+            ],
+            "annotations": {
+              "run_id": "cfd557a5-a22d-46ca-8b00-8e4962e5b13d",
+              "tool_call_batch_id": "5cb96753-7c88-42ba-92fb-7943b855dcb8"
+            }
+          },
+          {
+            "role": "tool",
+            "content": "done",
+            "content_blocks": [
+              {
+                "type": "tool_result",
+                "toolresult": {
+                  "type": "",
+                  "toolCallId": "provider",
+                  "content": "done"
+                }
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "content_blocks": [
+              {
+                "type": "tool_call",
+                "toolcall": {
+                  "type": "",
+                  "id": "provider",
+                  "arguments": "{}",
+                  "name": "noop"
+                }
+              }
+            ],
+            "annotations": {
+              "run_id": "c01b1050-c131-4dff-a000-a936b79a9a30",
+              "tool_call_batch_id": "d52f891e-dde6-4f36-bb7b-71786a855e90"
+            }
+          }
+        ]
+      },
+      "__basic_agent_preamble_input__": {
+        "type": "*BasicAgentPreambleInput",
+        "data": {
+          "UserInput": {
+            "id": "58ba48a8cad4310ea83f872b0880ce7b",
+            "role": "user",
+            "content": "go"
+          }
+        }
+      },
+      "__basic_agent_round__": {
+        "type": "int",
+        "data": 2
+      },
+      "__basic_agent_tool_binding__": {
+        "type": "*agent_v2.toolBinding",
+        "data": {
+          "restricted": true,
+          "names": [
+            "noop"
+          ]
+        }
+      },
+      "__basic_agent_tools_used__": {
+        "type": "bool",
+        "data": true
+      }
+    },
+    "pending_interrupts": [
+      {
+        "question": "approve old soft landing call?",
+        "interrupt_id": "f12692f6c8d03159"
+      }
+    ],
+    "current_frontier": [
+      {
+        "node_id": "tools"
+      }
+    ],
+    "frontier_started": true,
+    "node_visits": {
+      "model": 2,
+      "preamble": 1,
+      "tools": 1
+    },
+    "completed_write_owners": null,
+    "recipient_key": "571R/a/DypxbPBlqDgSwatcIHkwTSaJVSr/kVtL9NyI=",
+    "node_states": {
+      "2803bd19dff0b817:scope:9e1ce2fb6ca13f87176d2a343d2d4c67:step:7c489978e189c0d4405d5da9fdd03421": {
+        "type": "string",
+        "data": "d52f891e-dde6-4f36-bb7b-71786a855e90/tool/0"
+      },
+      "2803bd19dff0b817:scope:9e1ce2fb6ca13f87176d2a343d2d4c67:step:7c489978e189c0d4405d5da9fdd03421:streams": {
+        "type": "compose_v2.nodeStreams",
+        "data": null
+      }
+    }
+  }
+}
