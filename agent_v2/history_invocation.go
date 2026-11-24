@@ -93,3 +93,54 @@ func (s historySource) locateInvocationInputs(ctx context.Context, prior []*sche
 	}
 	return found, nil
 }
+
+const historyRecoveredInputAnnotation = "crew_history_recovered_input"
+
+// placeRecoveredInputs 把晚补的输入放到同一次调用的首条可见历史之前。
+// 存储层保留实际追加顺序，送模视图保持调用因果顺序。
+func placeRecoveredInputs(prior []*schema.Message) []*schema.Message {
+	var inputs map[historyInvocation][]*schema.Message
+	for _, msg := range prior {
+		if !isRecoveredHistoryInput(msg) {
+			continue
+		}
+		if key := historyInvocationOf(msg); key != (historyInvocation{}) {
+			if inputs == nil {
+				inputs = make(map[historyInvocation][]*schema.Message)
+			}
+			inputs[key] = append(inputs[key], msg)
+		}
+	}
+	if len(inputs) == 0 {
+		return prior
+	}
+	out := make([]*schema.Message, 0, len(prior))
+	for _, msg := range prior {
+		key := historyInvocationOf(msg)
+		if restored := inputs[key]; len(restored) != 0 {
+			out = append(out, restored...)
+			delete(inputs, key)
+		}
+		if key == (historyInvocation{}) || !isRecoveredHistoryInput(msg) {
+			out = append(out, msg)
+		}
+	}
+	return out
+}
+
+func isRecoveredHistoryInput(msg *schema.Message) bool {
+	return msg != nil && msg.Role == schema.RoleUser && !isCallerHistory(msg) &&
+		msg.Annotations[historyRecoveredInputAnnotation] == true
+}
+
+// hasEarlierInvocation 查询尾页之前是否仍有同一次调用的原始记录。
+// 正式翻页继续核对压缩边界，范围查找的结果仅用于决定是否早停。
+func (s historySource) hasEarlierInvocation(ctx context.Context, key historyInvocation, before HistoryCursor) (bool, error) {
+	found := false
+	err := s.scanBackward(ctx, HistoryQuery{Task: key.task, Agent: key.agent, Before: before}, historyPageMin, true, func(msg *schema.Message, _ HistoryCursor) bool {
+		found = historyInvocationOf(msg) == key && !isCallerHistory(msg) &&
+			!isCompactionBoundary(msg) && !isRecoveredHistoryInput(msg)
+		return found
+	}, nil)
+	return found, err
+}

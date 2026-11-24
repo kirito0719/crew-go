@@ -350,6 +350,8 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 	counted := 0
 	satisfied := false // 读够了：普通历史只需这一段。
 	var inputAnchors map[historyInvocation]string
+	var recoveredScopes map[historyInvocation]struct{}
+	readFullTail := false
 	first := historyPageMin
 	if need > 0 && 2*need > first {
 		first = 2 * need
@@ -383,6 +385,14 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			return false
 		}
 		rev = append(rev, v)
+		if need > 0 && isRecoveredHistoryInput(v) {
+			if key := historyInvocationOf(v); key != (historyInvocation{}) {
+				if recoveredScopes == nil {
+					recoveredScopes = make(map[historyInvocation]struct{})
+				}
+				recoveredScopes[key] = struct{}{}
+			}
+		}
 		if len(inputAnchors) != 0 && invocationInput(v) && v.ID != "" {
 			key := historyInvocationOf(v)
 			if inputAnchors[key] == v.ID {
@@ -394,16 +404,29 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 		}
 		return false
 	}, func(_ *HistoryQuery, pageStart HistoryCursor) bool {
-		if inputAnchors != nil {
-			satisfied = len(inputAnchors) == 0
-			return satisfied
-		}
-		if need <= 0 || counted <= need {
+		if readFullTail || need <= 0 || counted <= need || len(inputAnchors) != 0 {
 			return false
 		}
-		prior := reversed(rev)
+		prior := placeRecoveredInputs(reversed(rev))
 		if !priorWindowSatisfied(prior, need) {
 			return false
+		}
+		for key := range recoveredScopes {
+			older, err := src.hasEarlierInvocation(ctx, key, pageStart)
+			if err != nil {
+				slog.WarnContext(ctx, "agent_v2: 定位迟补输入的原调用失败，继续顺序读取历史尾段",
+					"key", src.key.String(), "err", err)
+				readFullTail = true
+				return false
+			}
+			if older {
+				return false
+			}
+			delete(recoveredScopes, key)
+		}
+		if inputAnchors != nil {
+			satisfied = true
+			return true
 		}
 		anchors, err := src.locateInvocationInputs(ctx, prior, ownerAgentName, need, pageStart)
 		if err != nil {
@@ -422,9 +445,11 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			"key", src.key.String(), "err", err)
 		return nil, false
 	}
+	// 只恢复真实尾段中的调用顺序，保留已确认的摘要边界。
+	tail := placeRecoveredInputs(reversed(rev))
 	if satisfied {
 		// 前文是这场对话最早的记录，排在视图最前：这一段已经读够、截断会把它们连同更早的一起截掉
-		return reversed(rev), true
+		return tail, true
 	}
 	if mode == HandoffHistorySelfOnly {
 		// 调用方前文有独立归属。只取边界后追加的前文；没有边界时查整场。
@@ -453,9 +478,9 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 				base = callerFirst(append(base, fresh...), func(m *schema.Message) *schema.Message { return m })
 			}
 		}
-		return append(base, reversed(rev)...), true
+		return append(base, tail...), true
 	}
-	return append(dedupCallers(reversed(callers)), reversed(rev)...), true
+	return append(dedupCallers(reversed(callers)), tail...), true
 }
 
 // callersAfterBoundary 排除已进入摘要的前文副本。调用方的前文按 ID 去重，其他历史记录允许重复。
@@ -631,7 +656,16 @@ func projectHistoryForView(m *schema.Message, ownerAgentName string, mode Handof
 		return markFromAgent(m, historyDisplayName(m))
 	case HandoffHistoryRewrite:
 		// 改写文案用**显示名**（agent 自己的 Name），不用位置——`[br1] said:` 模型看不懂
-		return rewriteCrossAgentMessage(m, historyDisplayName(m))
+		rewritten := rewriteCrossAgentMessage(m, historyDisplayName(m))
+		if rewritten != nil && rewritten != m {
+			// 保留调用身份供尾段排序。改写出的正文及应用标注仍按共享视图规则生成。
+			if key := historyInvocationOf(m); key != (historyInvocation{}) {
+				rewritten.Annotations = map[string]any{
+					HistoryTaskAnnotation: key.task, HistoryAgentAnnotation: key.agent, historyScopeAnnotation: key.trail,
+				}
+			}
+		}
+		return rewritten
 	default: // HandoffHistorySelfOnly——别人的一概不看
 		return nil
 	}

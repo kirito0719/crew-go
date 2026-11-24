@@ -222,6 +222,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 的序号）、不算调起它的那次 tool_call 本身；它的主图（落在子 ns 上）的输入算调用方产的，入口
 	// 条件边否决时作废的是调用方按 Rerunnable 记下的产出。子 ns 已在 enterNestedCall 里推好。
 	subCtx = compose_v2.HandOver(subCtx, call.identity)
+	settledInput := mode.settle && restoreNestedHistoryInput(ctx, subCtx, call)
 	// 已完成的调用重放结果，集成可从同一交接相位恢复结果引用的会话状态。
 	if mode.remember {
 		if events, ok := recallNestedCall(ctx, call); ok {
@@ -239,11 +240,6 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 只取位置的调用不交——它的输入由框架现拼、续跑时可以合法地不同。
 	if call.digest != "" {
 		opts = append(opts[:len(opts):len(opts)], withNestedCallDigest(call.digest, !call.keyed))
-	}
-	// 这次调用的输入在之前一次暂停时已经落过历史的话，结算时只记产出（见 settledInput）
-	settleInput := input
-	if mode.settle && inputSettledBefore(ctx, call) {
-		settleInput = nil
 	}
 	// 5. 这次调用做出的上行信号（转交 / 路由决定，见 side_signal.go）：成功时连同结果一起记下、再交给
 	// 调用方所在的那段执行；失败 / 中断时随它作废——被调方停下时它图里已提交的那些留在它的存档里，
@@ -263,10 +259,14 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	compose_v2.RecordStreams(ctx, streamIDs...)
 	if err != nil {
 		// 可 Resume 的退出先落输入（见 settleHistoryOnPause）。开关同下面的成功补记。
-		if mode.settle && compose_v2.LeavesResumableCheckpoint(err) {
-			settleHistoryOnPause(subCtx, sub.Name(), settleInput, err)
-			if historyWriterFrom(subCtx) != nil {
-				markInputSettled(ctx, call)
+		if mode.settle && !settledInput && compose_v2.LeavesResumableCheckpoint(err) {
+			if writer := historyWriterFrom(subCtx); writer != nil {
+				stamped := settleHistoryOnPause(subCtx, sub.Name(), input, err)
+				if receipt := historyReceiptFrom(subCtx); stamped == nil && receipt != nil {
+					// 采用成员在前言盖章的输入，保留钩子改写后的版本。
+					stamped = receipt.input.Load()
+				}
+				saveNestedHistoryInput(ctx, call, writer.key, stamped)
 			}
 		}
 		return events, err
@@ -282,41 +282,9 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 那样它什么也不留。只补它自己没记的，见 settleHistorySlot。拿回记下的结果那条路不补
 	// ——首次完成时已经补过。
 	if mode.settle {
-		settleHistoryAt(subCtx, HistorySlot(subCtx), sub.Name(), gateExtentProduced, input, FinalMessage(events), settleInput != nil)
+		settleHistoryAt(subCtx, HistorySlot(subCtx), sub.Name(), gateExtentProduced, input, FinalMessage(events), !settledInput)
 	}
 	return events, nil
-}
-
-// settledInputStepKey 是「这次调用的输入已经在一次暂停时落过历史」那条步骤记录的键。
-func settledInputStepKey(call nestedCall) string {
-	return "agent_v2.nested_call_input:" + identityHash(call.identity)
-}
-
-// nestedInputSettled 是那条步骤记录的值类型（私有具名类型：不跟业务注册的 `bool` 撞名）。
-type nestedInputSettled bool
-
-func init() {
-	compose_v2.RegisterValueType[nestedInputSettled]("agent_v2.nestedInputSettled")
-}
-
-// inputSettledBefore 报这次调用的输入是不是已经在之前一次暂停时落过历史（markInputSettled）。
-//
-// 跨暂停认「同一条输入」只能按调用的身份认，不能按消息认：调用方常常每次执行都现拼一条输入
-// （`schema.UserMessage(...)`，AgentAsTool 从参数现拼的也是），消息 ID 每次都不同，历史层按消息
-// 认同一条的守卫认不出来——被调方中断一次、续跑完成后输入就记两份，每多一次中断多一份（实测）。
-// 调用的身份跨重跑稳定（同一次调用续跑时算出同一个），记在调用方节点这次执行名下，随存档走。
-func inputSettledBefore(ctx context.Context, call nestedCall) bool {
-	done, _ := compose_v2.GetStepResult[nestedInputSettled](ctx, settledInputStepKey(call))
-	return bool(done)
-}
-
-// markInputSettled 记下「这次调用的输入已经落过历史」（暂停时结算之后）。记不住（不在节点执行里）
-// 时是 no-op：那里没有续跑这回事。
-func markInputSettled(ctx context.Context, call nestedCall) {
-	if err := compose_v2.SaveStepResult(ctx, settledInputStepKey(call), nestedInputSettled(true), compose_v2.WithStreams(nil)); err != nil {
-		slog.WarnContext(ctx, "agent_v2: 记不住这次嵌套调用的输入已落过历史，续跑完成时它会再记一份",
-			"ns", call.ns, "err", err)
-	}
 }
 
 // nestedCall 是一次嵌套调用的身份与去向。

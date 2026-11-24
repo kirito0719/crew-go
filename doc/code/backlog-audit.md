@@ -6,6 +6,14 @@
 
 **证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，剩余目标 CI、真实 provider 和业务数据验收见 A02、A03、A05–A07。
 
+## 2026-11-24 嵌套挂起输入恢复
+
+Q13 子项以 `7fc5abf` 为基线。用实际父子 GraphAgent 模拟历史写入失败，首次挂起时历史缺少原输入。父图两次补答后，子图产出仍使用存档中的首次输入，历史却只有答复。历史中每次重造的消息 ID 与子调用的稳定身份彼此独立。
+
+边界保存首次实际入队并盖章的输入。BasicAgent 在前言记录过输入时，使用钩子改写后落历史的版本。续跑时按原历史分区、任务、成员和调用轨迹回查。查明记录缺失后使用原始快照补写。已提交但确认丢失的记录保持一份，回查失败时等后续恢复再次核对。冷恢复覆盖 BasicAgent 脱敏、工具实执行一次和原文不进入历史。分区切换的独立对照确认旧输入不跨分区补记。存储仍按实际追加顺序保留审计记录，后续模型请求在已确认压缩边界后的历史中，将补写输入放回同一次调用的工具声明之前。真实模型替身回归覆盖成员和共享改写视图。定向核对更早页是否含同调用记录，分页截窗与全读后截窗对照一致。L579 的多轮补答重复写入在旧版已修，本次补上写入失败路径。[故障与冷恢复回归](../../agent_v2/nested_input_recovery_test.go) · [边界契约](../description/three-way-comparison/conversation-history.md)
+
+工作树通过禁用测试缓存的四模块全量测试、五包竞态、覆盖率门禁及 `make vet`。嵌套冒烟通过 12/12，Plan Web 验证 SSE 挂起和补答及 HTTP 终态，A2A HITL mock 通过。教学集成 9 项 mock 通过，12 项真模型按范围跳过。编排断路器的半开时序断言在并行竞态套件中失败，单独复跑整个编排竞态套件通过。
+
 ## 2026-11-24 钩子链上下文隔离
 
 Q22 以 `5fe969b` 为基线。BasicAgent 处理第二个请求时，前置钩子返回第一个请求的 ctx，后续嵌套钩子实际读到第一个 Owner。低阶图也复现后续钩子读到外来 Owner 和任务 ID，同时丢失 deadline。两个回归在基线上失败。
@@ -775,7 +783,7 @@ OpenAI 真实服务端冒烟四项通过，A04 已完成。GitLab PostgreSQL/MyS
 | L576 | 🔴 编排随机挑租户的历史配置——跨租户落盘 已解决（2026-07-28，fc02cbc + cd603e1）：startHistoryForOrchestration 原来取… | 已解决（回归 history_tenant_conflict_test.go 3 条 + 2 处 sanity-revert 实跑） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/history_slot.go](../../agent_v2/history_slot.go) · 基线缺旧引用 fc02cbc、cd603e1 · 原文溯源 877aea13（仅文档溯源） |
 | L577 | 🔴 7 个编排的 Resume 入口不建历史写入器 已解决（2026-07-28，cd603e1）：7 个生产调用点原来全落在 Run 的行号区间内，BasicAgent 却 … | 已解决（回归 history_resume_symmetry_test.go，sanity-revert 实跑 3 条→1 条） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 基线缺旧引用 cd603e1 · 原文溯源 877aea13（仅文档溯源） |
 | L578 | HITL 会话跨多次调用，而 ownsHistory / 范围回执 / 全局登记表都只作用于一次调用 已解决（2026-07-30）。⚠️ 我先前给的「不修」理由是断言不是实测… | 已解决（回归 history_graphagent_scope_test.go 3 条含对照面。3 轮 sanity-revert 各 1 红，… | 完成（当前回归） | — | 原行已关闭，当前树仍有对应回归入口。 · 现存回归 [TestHistory_ExecutorReusesMessageObject_AllRoundsRecorded](../../agent_v2/history_fanout_input_test.go#L183) · 定义 877aea13 · 现存入口 [agent_v2/graph_agent.go](../../agent_v2/graph_agent.go) · 原文溯源 877aea13（仅文档溯源） |
-| L579 | NodeFunc 里现构造子任务消息的业务，历史会随 Resume 次数增长（2026-07-30 审计附带实测）。去重按消息身份（Message.ID 构造期铸），而 Res… | OPEN（待补。措辞见左） | 文档 | Q13 | NodeFunc 随机重建派生 Message 的 Resume 增长需清楚记录。同任务稳定逻辑消息身份，跨任务仍隔离。 · 现存入口 [doc/v2/usage-guide.md](../../doc/v2/usage-guide.md) · 原文溯源 877aea13（仅文档溯源） |
+| L579 | NodeFunc 里现构造子任务消息的业务，历史会随 Resume 次数增长（2026-07-30 审计附带实测）。去重按消息身份（Message.ID 构造期铸），而 Res… | OPEN（待补。措辞见左） | 已关闭 | Q13 | 调用身份上已处理反复挂起和现拼输入。本轮补上首次历史写入失败后按原快照恢复的回归。 · 现存入口 [doc/v2/usage-guide.md](../../doc/v2/usage-guide.md) · 原文溯源 877aea13（仅文档溯源） |
 | L580 | GraphAgent 没接历史层的任何钩子 已解决（2026-07-29 首版 8aa695c+e3a3837。2026-07-30 审计后改法 aa9226b）：Run/Re… | 已解决 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/graph_agent.go](../../agent_v2/graph_agent.go) · 基线缺旧引用 8aa695c、e3a3837 · 原文溯源 877aea13（仅文档溯源） |
 | L581 | tools 节点 fanout + AgentAsTool Resume 整段重记 已修（95fae06，条目写完 2 天后）：「补节点私有中断态原语——已跑成功的 tool_… | ✅ 已修（95fae06。2026-09-18 探针：Resume 后子 agent 的问与答各恰好一份） | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/basic_builder.go](../../agent_v2/basic_builder.go) · 基线缺旧引用 95fae06、e649c9c · 原文溯源 877aea13（仅文档溯源） |
 | L582 | 业务外壳 agent 改写输入后委派给框架 agent 时，用户原话在整条历史里零落点（本轮判据的已知取舍，不是 bug）。producedHistoryHere 是范围判据：… | 取舍，不改。后果已写进 producedHistoryHere godoc（2026-10-23） | 既定边界/非目标 | — | 外壳 agent 自行改写输入再委派时，只有业务层掌握原始 user 意图。文档已经记载，不将框架盲目回填算当前缺陷。 · 现存入口 [agent_v2/history_slot.go](../../agent_v2/history_slot.go)、[doc/issue/issue-99-state-architecture.md](../../doc/issue/issue-99-state-architecture.md) · 原文溯源 c194ade2（仅文档溯源） |

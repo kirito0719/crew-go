@@ -1038,7 +1038,10 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 	if input.Role == schema.RoleUser && !isDerivedInput(input) && !(fromHistory && priorHasRootInputID(priorForDedup, id)) {
 		shared := mode != HandoffHistorySelfOnly
 		if !shared || !fromHistory || claimSharedRootInput(ctx, priorForDedup, input) {
-			recordHistoryBatch(ctx, historyOwner(ctx, a.config.Name), a.config.Name, []*schema.Message{input}, historyRecordOptions{coverage: coverage})
+			records := recordHistoryBatch(ctx, historyOwner(ctx, a.config.Name), a.config.Name, []*schema.Message{input}, historyRecordOptions{coverage: coverage})
+			if receipt := historyReceiptFrom(ctx); receipt != nil && len(records) != 0 {
+				receipt.input.CompareAndSwap(nil, records[0])
+			}
 		}
 	}
 

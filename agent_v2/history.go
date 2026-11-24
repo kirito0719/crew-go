@@ -1214,10 +1214,10 @@ type historyRecordOptions struct {
 }
 
 // recordHistoryBatch 可在写入工具结果时保留调用实例，结果正文和原始调用 ID 按原消息存放。
-func recordHistoryBatch(ctx context.Context, owner, display string, msgs []*schema.Message, opts historyRecordOptions) {
+func recordHistoryBatch(ctx context.Context, owner, display string, msgs []*schema.Message, opts historyRecordOptions) []*schema.Message {
 	w := historyWriterFrom(ctx)
 	if w == nil || len(msgs) == 0 {
-		return
+		return nil
 	}
 	coverage := opts.coverage
 	if coverage != nil && (coverage.writer != w || coverage.owner != owner || coverage.mode != GetHandoffHistoryMode(ctx)) {
@@ -1261,9 +1261,10 @@ func recordHistoryBatch(ctx context.Context, owner, display string, msgs []*sche
 		stamped = append(stamped, record)
 	}
 	if len(stamped) == 0 {
-		return
+		return nil
 	}
 	w.submitBatch(historyWrite{msgs: stamped, coverage: coverage, boundary: boundaryIndex})
+	return stamped
 }
 
 // stamp 给一条要写进历史的消息盖归属、任务章与来源（见 stampHistoryAgent），返回拷贝。
@@ -1365,6 +1366,7 @@ func stampHistoryAgent(m *schema.Message, owner, display, task string) *schema.M
 		delete(anns, HistoryTaskAnnotation)
 	}
 	delete(anns, historyScopeAnnotation)
+	delete(anns, historyRecoveredInputAnnotation)
 	delete(anns, historyOriginAnnotation) // 同理：来源章只由写入器盖（recordHistory）
 	// 位置跟名字不同才存显示名——顶层回落时两者相同，没必要多存一份。
 	if display != "" && display != owner {

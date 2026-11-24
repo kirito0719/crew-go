@@ -141,7 +141,8 @@ func pushHistorySegment(ctx context.Context, segment historySegment) context.Con
 type historyReceipt struct {
 	parent   *historyReceipt
 	n        atomic.Int64
-	outputs  sync.Map // historyOutputKey → struct{}
+	outputs  sync.Map                       // historyOutputKey → struct{}
+	input    atomic.Pointer[schema.Message] // 本调用前言实际入队的输入，子调用各用自己的回执。
 	trail    string
 	restored sync.Map // 本次成员调用实际恢复过的 *compose_v2.Checkpoint。
 	replayed sync.Map // 已实际重放的子调用回复。
@@ -162,7 +163,7 @@ func historyOutputOf(m *schema.Message) historyOutputKey {
 	// 历史层盖章前后的消息具有同样的业务内容，业务自己修改的标注仍属于产出。
 	body.Annotations = maps.Clone(m.Annotations)
 	for _, k := range []string{HistoryAgentAnnotation, HistoryAgentDisplayAnnotation, HistoryTaskAnnotation,
-		historyOriginAnnotation, historyScopeAnnotation, hostedHistoryTaskAnnotation, CallerHistoryAnnotation} {
+		historyOriginAnnotation, historyScopeAnnotation, historyRecoveredInputAnnotation, hostedHistoryTaskAnnotation, CallerHistoryAnnotation} {
 		delete(body.Annotations, k)
 	}
 	key := historyOutputKey{id: m.ID, payload: inputDigest(&body)}
@@ -345,11 +346,11 @@ func historyOwner(ctx context.Context, agentName string) string {
 // 判据是 `LeavesResumableCheckpoint`——框架对这个错的**处置意图**，不是错的类型（枚举
 // IsInterrupt 会漏软取消 / CondFailRerunFrom 两档，GraphAgent 那轮踩过）。纯业务硬错
 // 不落：cp 标 Failed、这一层不可 Resume，「报错的外部执行体不记」是既有语义。
-func settleHistoryOnPause(ctx context.Context, agentName string, input *schema.Message, err error) {
+func settleHistoryOnPause(ctx context.Context, agentName string, input *schema.Message, err error) *schema.Message {
 	if err == nil || !compose_v2.LeavesResumableCheckpoint(err) {
-		return
+		return nil
 	}
-	settleHistorySlot(ctx, agentName, input, nil)
+	return settleHistoryAt(ctx, HistorySlot(ctx), agentName, gateExtentProduced, input, nil, true)
 }
 
 // settleHistorySlot 在编排调完 sub-agent 之后补记这一步——**只补执行体自己没记的**。
@@ -487,11 +488,11 @@ const (
 	gateInputRecorded
 )
 
-// settleHistoryAt 是上面两者的共同实现——slot 与输入闸门显式传入。
-func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate, input, final *schema.Message, recordInput bool) {
+// settleHistoryAt 补写边界历史，返回本次实际入队的输入快照。
+func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate, input, final *schema.Message, recordInput bool) *schema.Message {
 	w := historyWriterFrom(ctx)
 	if w == nil || historySuppressed(ctx) || slot == "" {
-		return
+		return nil
 	}
 
 	inputTakenCareOf := func() bool {
@@ -511,9 +512,9 @@ func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate
 
 	// 认领放在**最后一个条件**：抢到就一定会记，不会登记了却没写。
 	var msgs []*schema.Message
-	if recordInput && input != nil && input.Role == schema.RoleUser && !isDerivedInput(input) &&
-		!inputTakenCareOf() && !recordedBefore() &&
-		w.claimRecordHere(slot, input) {
+	queuedInput := recordInput && input != nil && input.Role == schema.RoleUser && !isDerivedInput(input) &&
+		!inputTakenCareOf() && !recordedBefore() && w.claimRecordHere(slot, input)
+	if queuedInput {
 		msgs = append(msgs, input)
 	}
 	// 兄弟可能独立返回同一个对象，仅本次调用的回执、实际输入或真实子调用能证明透传。
@@ -525,9 +526,13 @@ func settleHistoryAt(ctx context.Context, slot, agentName string, gate inputGate
 		}
 	}
 	if len(msgs) == 0 {
-		return
+		return nil
 	}
-	recordHistory(ctx, historyOwner(ctx, agentName), agentName, msgs)
+	records := recordHistoryBatch(ctx, historyOwner(ctx, agentName), agentName, msgs, historyRecordOptions{})
+	if queuedInput && len(records) != 0 {
+		return records[0]
+	}
+	return nil
 }
 
 // inputAlreadyInAnyStream 报这条输入是不是已经在历史里了——**不限归属**。

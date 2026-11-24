@@ -52,3 +52,22 @@ func TestHistoryWindowRecoversInputAcrossInterleavedPages(t *testing.T) {
 		t.Fatalf("只应补回同一成员调用的旧输入和配对结果，实际 %v", content)
 	}
 }
+
+func TestPlaceRecoveredInputPreservesOtherInvocation(t *testing.T) {
+	stamp := func(msg *schema.Message, trail string) *schema.Message {
+		stamped := stampHistoryAgent(msg, "worker", "worker", "task")
+		stamped.Annotations[historyScopeAnnotation] = trail
+		return stamped
+	}
+	other := stamp(schema.AssistantMessage("同一成员的另一次调用"), "other")
+	declaration := stamp(schema.AssistantMessage("本次调用的已有产出"), "current")
+	recovered := stamp(schema.UserMessage("本次调用迟补的输入"), "current")
+	recovered.Annotations[historyRecoveredInputAnnotation] = true
+	last := stamp(schema.AssistantMessage("另一调用继续写入"), "other")
+	prior := []*schema.Message{other, declaration, recovered, last}
+	got := placeRecoveredInputs(prior)
+	want := []*schema.Message{other, recovered, declaration, last}
+	if !slices.Equal(got, want) || prior[1] != declaration {
+		t.Fatalf("迟补输入只能移动到同一次调用之前，实际 %v", got)
+	}
+}

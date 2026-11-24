@@ -2,6 +2,8 @@
 
 ## 部署前
 
+- 嵌套调用挂起时可保存已入队的历史输入快照，BasicAgent 使用前言实际写入的版本。续跑在原历史分区回查并补写缺失记录，已有记录保持一份。旧档仍沿用原有的输入结算标记。[历史契约](../description/three-way-comparison/conversation-history.md)
+
 - 内置 Agent 和编排钩子链按回调采纳上下文。后续钩子沿用当前执行范围，仍可接收由前一跳合法派生的应用值和环境。自定义组合钩子可调用 `compose_v2.CallHook` 应用同一规则。[钩子契约](../v2/hooks.md)
 
 - `AgentAsTool` 的模型侧失败使用框架通用文案和明确的路由未决提示。业务可通过 `WithAgentToolErrorMapper` 提供可公开的错误信息。[用法](../v2/usage-guide.md#子-agent-的工具错误)
