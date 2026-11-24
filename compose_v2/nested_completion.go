@@ -141,7 +141,14 @@ func (m *nestedTransfer) transfer(outer, selected context.Context, partition Che
 	if current != nil {
 		start := time.Now()
 		n, err := deleteTransferredResult(selected, partition, sid, ns, source)
-		EmitCpCleanupHelper(selected, sid, ns, "success", n, time.Since(start).Milliseconds(), err)
+		if isEmitCpEventCtx(selected) {
+			// 父节点可在进入子图之前领走回执。清理事件属于实际子槽，沿用本次执行的编排钩子。
+			eventCtx := WithGraphNS(selected, ns)
+			if hooks := eventSinksFrom(selected).graphHooks; hooks != nil {
+				eventCtx = withEventSink(eventCtx, graphEventSink(eventCtx, hooks, ns))
+			}
+			EmitCpCleanupHelper(eventCtx, sid, ns, "success", n, time.Since(start).Milliseconds(), err)
+		}
 		if err != nil {
 			return fmt.Errorf("clear transferred nested result %q: %w", ns, err)
 		}

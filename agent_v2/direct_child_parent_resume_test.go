@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -648,11 +649,44 @@ func TestDirectChildCompletionLateSelectedPartition(t *testing.T) {
 	}
 }
 
+type receiptEventSite struct {
+	operation compose_v2.CpOperationType
+	ctxNS     string
+	eventNS   string
+	nodeID    string
+}
+
+type receiptEventLog struct {
+	agent_v2.NoOpOrchestrationHooks
+	sid, ns string
+	mu      sync.Mutex
+	events  []receiptEventSite
+}
+
+func (h *receiptEventLog) OnNodeEvent(ctx context.Context, nodeID string, event agent_v2.Event) context.Context {
+	action, _ := event.Metadata["action"].(*compose_v2.CpAction)
+	if action == nil {
+		return ctx
+	}
+	save, cleanup := action.Save, action.Cleanup
+	saved := save != nil && save.SessionID == h.sid && save.NS == h.ns && save.Ok && save.ChannelsCount == 0 && save.PendingInterruptsCount == 0
+	cleared := cleanup != nil && cleanup.SessionID == h.sid && cleanup.NS == h.ns && cleanup.Ok && cleanup.Reason == "success" && cleanup.DeletedCount == 1
+	if !saved && !cleared {
+		return ctx
+	}
+	eventNS, _ := event.Metadata["graph_ns"].(string)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.events = append(h.events, receiptEventSite{action.Type, compose_v2.GetGraphNS(ctx), eventNS, nodeID})
+	panic("模拟存档事件订阅方出错")
+}
+
 func TestDirectChildCompletionCheckpointEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	cp := compose_v2.NewInMemoryCheckpointer()
-	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+	const rootNS = "tenant-root"
+	ctx = compose_v2.WithGraphNS(compose_v2.WithCheckpointerCtx(ctx, cp), rootNS)
 	child := mkEchoGraph(t, "receiptEvents", func(ctx context.Context, _ *schema.Message) (*schema.Message, error) {
 		return compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "确认提交？"})
 	})
@@ -663,32 +697,27 @@ func TestDirectChildCompletionCheckpointEvents(t *testing.T) {
 	sess := agent_v2.NewRunSession()
 	_, err := parent.Run(ctx, sess, schema.UserMessage("工单"))
 	qid := partitionQuestionID(t, err)
-	ns := directPendingNS(t, ctx, cp, sess.RunID, "child#")
-	log := &eventLog{}
+	ns := directPendingNS(t, ctx, cp, sess.RunID, rootNS+"/child#")
+	log := &receiptEventLog{sid: sess.RunID, ns: ns}
 	ctx = agent_v2.WithCtxOrchHooks(compose_v2.WithEmitCpEventCtx(ctx, true), log)
 	answer := agent_v2.WithResumeUserInputs(map[string]*schema.Message{qid: schema.UserMessage("同意")})
 	if _, err := child.Resume(compose_v2.WithGraphNS(ctx, ns), sess.RunID, answer); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parent.Resume(ctx, sess.RunID); err != nil {
-		t.Fatal(err)
+	events, err := parent.Resume(ctx, sess.RunID)
+	if final := agent_v2.FinalMessage(events); err != nil || final == nil || final.Content != "同意" {
+		t.Fatalf("存档钩子 panic 后父图应该完成，实际回复 %v，错误 %v", final, err)
 	}
-	var got []compose_v2.CpOperationType
+	if rows, err := cp.LoadAllInSession(ctx, sess.RunID); err != nil || len(rows) != 0 {
+		t.Fatalf("存档钩子 panic 后应清空父子槽，剩余 %d，错误 %v", len(rows), err)
+	}
+	want := []receiptEventSite{
+		{operation: compose_v2.CpOperationSave, ctxNS: ns, eventNS: ns},
+		{operation: compose_v2.CpOperationCleanup, ctxNS: ns, eventNS: ns},
+	}
 	log.mu.Lock()
 	defer log.mu.Unlock()
-	for _, event := range log.events {
-		action, _ := event.Metadata["action"].(*compose_v2.CpAction)
-		if action == nil {
-			continue
-		}
-		if a := action.Save; a != nil && a.SessionID == sess.RunID && a.NS == ns && a.Ok && a.ChannelsCount == 0 && a.PendingInterruptsCount == 0 {
-			got = append(got, action.Type)
-		}
-		if a := action.Cleanup; a != nil && a.SessionID == sess.RunID && a.NS == ns && a.Ok && a.Reason == "success" && a.DeletedCount == 1 {
-			got = append(got, action.Type)
-		}
-	}
-	if !slices.Equal(got, []compose_v2.CpOperationType{compose_v2.CpOperationSave, compose_v2.CpOperationCleanup}) {
-		t.Fatalf("子图完成回执应先报告落盘、后报告父图接管时的清理，实际 %v", got)
+	if !slices.Equal(log.events, want) {
+		t.Fatalf("回执存档和清理应按子图 namespace 报告，实际 %+v，期望 %+v", log.events, want)
 	}
 }

@@ -12,7 +12,7 @@
 | --- | --- |
 | A08 | 慢存储下三个隔离的历史流各保留一份原问题，共享视图只写一份。Plan 拒绝不可派发的决定后，新决定需要重新确认。Reflect 保留已提交轮次。Toolkit 覆盖原生流、同步回退和空结果，实际 fallback 切换及扇出实例已核对到 span 和指标。[历史](../../agent_v2/history_slow_fanout_test.go) · [决策](../../agent_v2/decision_retry_identity_test.go) · [工具流](../../tool/stream_call_test.go) · [观测](../../observability/fallback_fanout_e2e_test.go) |
 | A10 | MySQL 8.0.35 在预处理与客户端插值两种模式下准确区分最大 uint64 和相邻值。长小数和下溢按实际存储值筛选，写入 `1e400` 返回 3140 / 22032 并保留旧行及时间戳。PostgreSQL 16.9 的三个 pgx 协议均按 numeric 精度比较相邻整数和长小数。[MySQL 回归](../../sql/store_mysql_numeric_integration_test.go) · [PostgreSQL 回归](../../sql/store_postgres_numeric_integration_test.go) · [存储契约](../v2/store.md) |
-| A11 | 从子 namespace 补答后冷恢复父图，可领取完整业务事件、原属历史和提交信号。父图重新递交答案只执行一次工具写入。订阅存档事件时，先看到子槽保存，再看到父图接管时的清理。覆盖兄弟、不同物理分区、条件否决、写回失败及旧档。区分独立非空根与真实嵌套调用。[父子续跑](../../agent_v2/direct_child_parent_resume_test.go) · [升级](../release/next.md) |
+| A11 | 从子 namespace 补答后冷恢复父图，可领取完整业务事件、原属历史和提交信号。父图重新递交答案只执行一次工具写入。按子图 namespace 订阅时，先看到子槽保存，再看到父图接管时的清理。两个事件钩子均抛出 panic 时，父图仍能交出结果并清空存档。覆盖兄弟、不同物理分区、条件否决、写回失败及旧档。区分独立非空根与真实嵌套调用。[父子续跑](../../agent_v2/direct_child_parent_resume_test.go) · [升级](../release/next.md) |
 | A13 | 不可重做的生产步骤经子图或 Sequential 成员入口被否决、重试和续跑后仍只执行一次。调用方取消和软取消保留现场，后端自身超时按原策略处理。[引擎](../../compose_v2/entry_nonrerunnable_retry_test.go) · [编排成员](../../agent_v2/member_nonrerunnable_retry_test.go) |
 | A14 | 父 BasicAgent 和低阶子图派发同名工具时，每张图记录自身工具的分类。未配置分类查询的子图使用默认类别。[工具分类](../../agent_v2/framework_tool_identity_gates_test.go) |
 | A17 | 非法 UTF-8 工具调用 ID 在整批派发前失败，已有流只撤回出错轮次。SQLite 关闭重开后，合法替换字符、中文及空 ID 仍可补答。[工具 ID](../../agent_v2/tool_call_id_encoding_test.go) |

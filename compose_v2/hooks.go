@@ -228,8 +228,9 @@ type EventSink interface {
 type eventSinkKey struct{}
 
 type eventSinks struct {
-	send    EventSink
-	observe EventSink // 观测钩子走框架的转发出口，保留流记录。
+	send       EventSink
+	observe    EventSink          // 观测钩子走框架的转发出口，保留流记录。
+	graphHooks OrchestrationHooks // 框架图级事件使用实际执行的钩子，独立于流记录和业务转发。
 }
 
 func eventSinksFrom(ctx context.Context) eventSinks {
@@ -239,11 +240,11 @@ func eventSinksFrom(ctx context.Context) eventSinks {
 
 // withEventSink 是 framework 内部 ctx 注入 helper, runNodeWithHooks 在节点入口
 // 调本函数挂 nodeEventSink. 业务侧用 WithEventSink (公开版本).
-func withEventSink(ctx context.Context, sink EventSink) context.Context {
+func withEventSink(ctx context.Context, sink *nodeEventSink) context.Context {
 	if sink == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, eventSinkKey{}, eventSinks{send: sink, observe: sink})
+	return context.WithValue(ctx, eventSinkKey{}, eventSinks{send: sink, observe: sink, graphHooks: sink.hooks})
 }
 
 // WithEventSink 把 sink 挂到 ctx 上，跟 GetEventSink 对称。
@@ -281,8 +282,9 @@ func eventHookCtx(ctx context.Context) context.Context {
 	// 钩子只观察事件。事件的进度已按发送它的尝试登记。
 	if p := nodeProgressFrom(ctx); p != nil && p.tracksIdle {
 		ctx = withNodeProgress(ctx, nil)
-		observer := eventSinksFrom(ctx).observe
-		ctx = context.WithValue(ctx, eventSinkKey{}, eventSinks{send: observer, observe: observer})
+		sinks := eventSinksFrom(ctx)
+		sinks.send = sinks.observe
+		ctx = context.WithValue(ctx, eventSinkKey{}, sinks)
 	}
 	return ctx
 }
