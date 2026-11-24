@@ -6,6 +6,14 @@
 
 **证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，剩余目标 CI、真实 provider 和业务数据验收见 A02、A03、A05–A07。
 
+## 2026-11-24 钩子链上下文隔离
+
+Q22 以 `5fe969b` 为基线。BasicAgent 处理第二个请求时，前置钩子返回第一个请求的 ctx，后续嵌套钩子实际读到第一个 Owner。低阶图也复现后续钩子读到外来 Owner 和任务 ID，同时丢失 deadline。两个回归在基线上失败。
+
+复用同一采纳机制，按回调恢复当前执行范围。合法派生的应用值及环境仍能传给下一跳。修复后，BasicAgent 的两个请求各自获得正确的派生 Owner，低阶图节点在当前任务中收到后续钩子设置的环境。[BasicAgent](../../agent_v2/hook_chain_context_test.go) · [低阶图](../../compose_v2/hook_chain_context_test.go) · [公开契约](../v2/hooks.md)
+
+工作树四模块全量测试、七包竞态、覆盖率门禁、嵌套 12/12、Plan Web SSE 与 A2A HITL mock 冒烟均通过。教学集成 9 项 mock 通过，12 项真模型按范围跳过。
+
 ## 2026-11-24 本地待办续做
 
 以 `05f5bb9` 为基线。真模型、业务标注数据及发布环境验收继续由各自待办追踪。
@@ -708,9 +716,9 @@ OpenAI 真实服务端冒烟四项通过，A04 已完成。GitLab PostgreSQL/MyS
 | L517 | 🟡 HandoffAgent 的持久 active 在 step 节点提交之前就写进 store（2026-10-09 整条分支轮次审计顺带发现，改动前就有）：转到哪个 age… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/handoff_agent.go](../../agent_v2/handoff_agent.go) · 原文溯源 c35ef98b（仅文档溯源） |
 | L518 | 🟢 HandoffAgent「忘配 transfer 工具」的运行期软提示没有实现（2026-10-09 文档审计发现：doc/v2/handoff.md §6.2 / §13… | 已实现 | 历史已归档 | C10 关闭 | 通过 `WithExpectedHandoffTransfer` 声明装配意图，`BasicAgent` 在工具开关处按候选报告一次漏配。 · [诊断回归](../../agent_v2/handoff_diagnostic_test.go) · [现行契约](../v2/handoff.md#工具漏配诊断) · 原文溯源 877aea13（仅文档溯源） |
 | L519 | 🟡 OnNodeStart 返回不从入参派生的 ctx（如 context.Background()）时，节点体丢掉的不止答案（2026-09-28 第三轮审计顺带观察、第四轮… | ✅ 已修 | 完成（当前回归） | — | 原行已关闭，当前树仍有对应回归入口。 · 现存回归 [TestHookCtx_NonDerivedCtx_NSAndAnswersKept](../../compose_v2/hook_ctx_survival_test.go#L112) · 定义 877aea13 · 现存入口 [compose_v2/phase.go](../../compose_v2/phase.go)、[compose_v2/detach.go](../../compose_v2/detach.go) · 基线缺旧引用 b6d33bab · 原文溯源 877aea13（仅文档溯源） |
-| L520 | 🟢 钩子链内部不按来源采纳 ctx（2026-10-12 审计实测，改动前就有）：hook.ChainHooks / compose_v2.ChainOrchHooks 把前一… | 🟢 OPEN（文档已写明排序要求） | 契约 | Q22 | hook/hooks.go 内层直接转交 ctx。顶层采纳不同。改变会影响合法组合钩子，先证真实路径。 · 现存入口 [hook/hooks.go](../../hook/hooks.go) · 原文溯源 877aea13（仅文档溯源） |
+| L520 | 🟢 钩子链内部不按来源采纳 ctx（2026-10-12 审计实测，改动前就有）：hook.ChainHooks / compose_v2.ChainOrchHooks 把前一… | 🟢 OPEN（文档已写明排序要求） | 已关闭 | Q22 | 已修复。内置钩子链按回调采纳 ctx，恢复本次执行环境并保留合法派生值。 · 现存入口 [hook/hooks.go](../../hook/hooks.go) · 原文溯源 877aea13（仅文档溯源） |
 | L521 | ✅ 采纳钩子 ctx 的三步协议（放标记 → 调钩子 → 采纳）靠机械哨兵按源码位置查，几种形状查不出（2026-10-12 审计实测）：agent_v2/hook_ctx_a… | ✅ 已修 | 完成（当前回归） | — | 原行已关闭，当前树仍有对应回归入口。 · 现存回归 [TestHookCtx_AdoptedHooksOnlyThroughCallHook](../../agent_v2/hook_ctx_adoption_internal_test.go#L217) · 定义 877aea13、[TestHookCtx_LowLevelAdoptionOnlyInPhase](../../agent_v2/hook_ctx_adoption_internal_test.go#L285) · 定义 877aea13 · 现存入口 [compose_v2/phase.go](../../compose_v2/phase.go)、[agent_v2/hook_ctx_adoption_internal_test.go](../../agent_v2/hook_ctx_adoption_internal_test.go) · 原文溯源 877aea13（仅文档溯源） |
-| L522 | 🟢 业务组合钩子在内部自己采纳内层钩子的 ctx，外层采纳会把它当成外来的（2026-10-12 审计实测，改动前就有）：组合钩子在内部也经 compose_v2.CallHo… | 🟢 OPEN | 外层承接已关闭 | Q22 | compose_v2/phase.go 以 token 父链认可嵌套的合法 ctx。组合链内逐跳转交作为单独契约。 |
+| L522 | 🟢 业务组合钩子在内部自己采纳内层钩子的 ctx，外层采纳会把它当成外来的（2026-10-12 审计实测，改动前就有）：组合钩子在内部也经 compose_v2.CallHo… | 🟢 OPEN | 已关闭 | Q22 | compose_v2/phase.go 以 token 父链认可嵌套的合法 ctx。内置钩子链逐跳使用同一采纳规则。 |
 | L523 | 🟢 业务强制 tool_choice=required 时，软降落轮发出「有 tool_choice、没有 tools」的请求（2026-10-12 审计读码，改动前就有）：软… | ✅ 已修 | 完成（当前回归） | — | 原行已关闭，当前树仍有对应回归入口。 · 现存回归 [TestForcedRequired_DroppedWhenNoToolsBound](../../agent_v2/forced_tool_choice_test.go#L115) · 定义 78576919、[TestToolChoice_DroppedWhenNoTools](../../model/openai/tool_choice_test.go#L35) · 定义 877aea13 · 现存入口 [model/openai](../../model/openai)、[agent_v2/basic_agent.go](../../agent_v2/basic_agent.go) · 基线缺旧引用 9c9c4649、e093bbbe · 原文溯源 78576919（仅文档溯源） |
 | L524 | 🟡 业务经 WithRunModelOptions 强制的 tool_choice=required 每一轮都生效（2026-10-12 调研）：模型每轮都被逼着调工具、永远不… | ✅ 已修 | 历史已归档 | — | 保留原处置。后附当前可定位入口。 · 现存入口 [agent_v2/basic_agent.go](../../agent_v2/basic_agent.go) · 原文溯源 877aea13（仅文档溯源） |
 | L525 | 🟢 软降落轮摘掉工具会让最后一轮的 prompt cache 整段失效（2026-10-12 调研）：工具段排在消息之前，摘掉工具前缀就变了，而最后一轮通常上下文最长。MAF … | 🟢 OPEN（只剩结构化输出档。成本优化，非正确性） | 量测 | Q08 | 结构化尾轮 final_output 改工具集影响 prompt cache。按成本对照，无正确性 P1。 · 现存回归 [TestSoftLanding_AtMostOnePerTaskAcrossResume](../../agent_v2/soft_landing_test.go#L212) · 定义 78576919、[TestSoftLanding_ShrunkBudgetOnResumeStillLands](../../agent_v2/soft_landing_test.go#L283) · 定义 78576919 · 现存入口 [agent_v2/basic_agent.go](../../agent_v2/basic_agent.go) · 原文溯源 78576919（仅文档溯源） |

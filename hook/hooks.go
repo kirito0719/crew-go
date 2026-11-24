@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
+	"crew-go/compose_v2"
 	"crew-go/internal/panicerr"
 	specModel "crew-go/modules/model"
-
 	"crew-go/schema"
 )
 
@@ -64,7 +64,7 @@ type AgentOutput struct {
 // Hooks 定义代理执行的生命周期回调.
 //
 // ─── ctx-based 协议 (audit² 改: 每个 hook 方法签名 OnStart(ctx)→ctx) ───
-// 每个 hook 方法返 context.Context：链里交给下一个 hook，整条链返回之后框架接着用（哪几个方法的、
+// 每个 hook 方法返 context.Context：链内按来源采纳后交给下一个 hook，整条链返回之后框架接着用（哪几个方法的、
 // 怎么用见下文「ctx 返回值」）。业务 hook 内可 `ctx = context.WithValue(ctx, spanKey{}, span)`
 // 让后续 hook 拿到 (典型 OTel trace 模式: OnStart 内 `ctx, span := tracer.Start(ctx)`,
 // OnEnd 内 ctx 取 span + span.End()). 返回的 ctx 要**从入参派生**。
@@ -137,7 +137,7 @@ type AgentOutput struct {
 //	OnAgentEnd  output.Messages —— Run/Resume 已返回 events，此 hook 是事后通知（defer）
 //	OnError     err.Code / err.Message —— 框架返回原始 error，CommError 仅快照
 //
-// ctx 返回值：链里每个 hook 返回的 ctx 交给下一个 hook（ChainHooks）；整条链返回之后，框架用开始一侧的返回值，
+// ctx 返回值：ChainHooks 逐跳采纳 ctx。整条链返回之后，框架用开始一侧的返回值，
 // **只用于它包住的那次调用**：
 //
 //	OnAgentStart     这次 Run / Resume（OnAgentEnd 收的也是它）
@@ -160,8 +160,7 @@ type AgentOutput struct {
 // 业务值框架分不出哪些是 span、哪些是凭证，照用钩子返回的那份：**别跨请求存 ctx**——存下的 ctx 会把
 // 那个请求的凭证带进这一次。
 //
-// ⚠️ 链内部不做这层处理：链里前一个 hook 返回存下来的 ctx 时，后一个 hook 收到的就是它。
-// observability 的钩子手动装进链时要排第一（`obs.Install` 已经这么装）。
+// 前一个钩子返回 nil 时，后一个沿用本次上下文。整条链失败时按对应方法处理错误和收尾。
 //
 // 触发点 / 频次：
 //
@@ -256,12 +255,11 @@ func (NoOpHooks) OnError(ctx context.Context, _ *AgentInfo, _ *schema.CommError)
 // ChainHooks 串联 N 个 Hooks — 业务一次想挂多个独立 hook (typical: SSE adapter +
 // audit logger + observability + billing).
 //
-// **ctx propagation**: hook 链式串 — 每个 hook 返的 ctx 给下一个 hook 用. 业务在
-// hook A 内 push 的 span 让 hook B 拿到.
+// 每个钩子的 ctx 按 [compose_v2.CallHook] 的来源规则采纳，后一个钩子能读到前一个钩子合法派生的 span。
 //
 // **panic 语义**: 一个 hook panic = 业务 bug, 中断剩余 hook; 处置见包文档「panic 语义」.
 //
-// **错误路径的 ctx 语义**（8 个方法一致）: 链上任一 hook 返 err 时,
+// **错误路径的 ctx 语义**：流式包装失败时关闭已包装的流。其他返回 error 的方法在链上任一 hook 返 err 时，
 // ChainHooks 回**入参** ctx 而不是那个 hook 返的 newCtx. 理由: hook 返 err 即
 // 声明本次失败, 把"自认失败但改了一半"的 ctx 传给 caller 会让 caller 的错误路径
 // 拿到一个半成品——而 caller 的常规写法正是"错误路径用入参 ctx". 于是框架 caller
@@ -288,7 +286,9 @@ func NewChainHooks(hooks ...Hooks) *ChainHooks {
 func (c *ChainHooks) OnAgentStart(ctx context.Context, info *AgentInfo, input *AgentInput) (context.Context, error) {
 	inCtx := ctx
 	for _, h := range c.hooks {
-		newCtx, err := h.OnAgentStart(ctx, info, input)
+		newCtx, err := compose_v2.CallHook(ctx, func(in context.Context) (context.Context, error) {
+			return h.OnAgentStart(in, info, input)
+		})
 		if err != nil {
 			return inCtx, err
 		}
@@ -302,7 +302,8 @@ func (c *ChainHooks) OnAgentStart(ctx context.Context, info *AgentInfo, input *A
 // 收尾）静默跳过。
 func (c *ChainHooks) OnAgentEnd(ctx context.Context, info *AgentInfo, output *AgentOutput) context.Context {
 	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
-		ctx = c.hooks[i].OnAgentEnd(ctx, info, output)
+		in, adopt := compose_v2.EnterHook(ctx)
+		ctx = adopt(c.hooks[i].OnAgentEnd(in, info, output))
 	})
 	return ctx
 }
@@ -310,7 +311,9 @@ func (c *ChainHooks) OnAgentEnd(ctx context.Context, info *AgentInfo, output *Ag
 func (c *ChainHooks) OnModelStart(ctx context.Context, info *AgentInfo, input *schema.ModelInput) (context.Context, error) {
 	inCtx := ctx
 	for _, h := range c.hooks {
-		newCtx, err := h.OnModelStart(ctx, info, input)
+		newCtx, err := compose_v2.CallHook(ctx, func(in context.Context) (context.Context, error) {
+			return h.OnModelStart(in, info, input)
+		})
 		if err != nil {
 			return inCtx, err
 		}
@@ -322,7 +325,9 @@ func (c *ChainHooks) OnModelStart(ctx context.Context, info *AgentInfo, input *s
 func (c *ChainHooks) OnModelEnd(ctx context.Context, info *AgentInfo, output *schema.ModelOutput) (context.Context, error) {
 	inCtx := ctx
 	for _, h := range c.hooks {
-		newCtx, err := h.OnModelEnd(ctx, info, output)
+		newCtx, err := compose_v2.CallHook(ctx, func(in context.Context) (context.Context, error) {
+			return h.OnModelEnd(in, info, output)
+		})
 		if err != nil {
 			return inCtx, err
 		}
@@ -356,7 +361,8 @@ func (c *ChainHooks) OnModelEndStream(ctx context.Context, info *AgentInfo, sr s
 		}
 	}()
 	for _, h := range c.hooks {
-		newCtx, wrapped, err := h.OnModelEndStream(ctx, info, sr)
+		in, adopt := compose_v2.EnterHook(ctx)
+		newCtx, wrapped, err := h.OnModelEndStream(in, info, sr)
 		if err != nil {
 			cleanup()
 			return ctx, nil, err
@@ -368,7 +374,7 @@ func (c *ChainHooks) OnModelEndStream(ctx context.Context, info *AgentInfo, sr s
 		}
 		wrappedStack = append(wrappedStack, wrapped)
 		sr = wrapped
-		ctx = newCtx
+		ctx = adopt(newCtx)
 	}
 	return ctx, sr, nil
 }
@@ -376,7 +382,9 @@ func (c *ChainHooks) OnModelEndStream(ctx context.Context, info *AgentInfo, sr s
 func (c *ChainHooks) OnToolStart(ctx context.Context, info *AgentInfo, input *schema.ToolInput) (context.Context, error) {
 	inCtx := ctx
 	for _, h := range c.hooks {
-		newCtx, err := h.OnToolStart(ctx, info, input)
+		newCtx, err := compose_v2.CallHook(ctx, func(in context.Context) (context.Context, error) {
+			return h.OnToolStart(in, info, input)
+		})
 		if err != nil {
 			return inCtx, err
 		}
@@ -388,7 +396,9 @@ func (c *ChainHooks) OnToolStart(ctx context.Context, info *AgentInfo, input *sc
 func (c *ChainHooks) OnToolEnd(ctx context.Context, info *AgentInfo, output *schema.ToolOutput) (context.Context, error) {
 	inCtx := ctx
 	for _, h := range c.hooks {
-		newCtx, err := h.OnToolEnd(ctx, info, output)
+		newCtx, err := compose_v2.CallHook(ctx, func(in context.Context) (context.Context, error) {
+			return h.OnToolEnd(in, info, output)
+		})
 		if err != nil {
 			return inCtx, err
 		}
@@ -400,7 +410,8 @@ func (c *ChainHooks) OnToolEnd(ctx context.Context, info *AgentInfo, output *sch
 // OnError 每个钩子都调到，同 OnAgentEnd：一个钩子 panic，排在后面的（错误计数、告警）照样收到这个错误。
 func (c *ChainHooks) OnError(ctx context.Context, info *AgentInfo, err *schema.CommError) context.Context {
 	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
-		ctx = c.hooks[i].OnError(ctx, info, err)
+		in, adopt := compose_v2.EnterHook(ctx)
+		ctx = adopt(c.hooks[i].OnError(in, info, err))
 	})
 	return ctx
 }

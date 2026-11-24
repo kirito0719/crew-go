@@ -210,6 +210,9 @@ func callHookOnto(ctx context.Context, call func(ctx context.Context) (context.C
 // enterHookCall 放这次钩子调用独有的标记：采纳时凭它分辨钩子返回的 ctx 是派生的还是外来的。只经 CallHook /
 // EnterHook / callHookOnto 调。
 func enterHookCall(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil // 直接调用钩子链时允许无上下文，原样交给首个钩子。
+	}
 	outer, _ := ctx.Value(hookCallKey{}).(*hookCall)
 	return markedCtx{Context: ctx, tok: &hookCall{outer: outer}}
 }
@@ -264,6 +267,9 @@ func execSource(from context.Context) context.Context {
 func adoptHookCtx(hookCtx, from context.Context) context.Context {
 	if hookCtx == nil {
 		return from
+	}
+	if from == nil {
+		return hookCtx
 	}
 	if tok, _ := from.Value(hookCallKey{}).(*hookCall); tok != nil && derivedFrom(hookCtx, tok) {
 		if tok.pushedIdentity.Load() {

@@ -115,7 +115,7 @@ func (NoOpOrchestrationHooks) OnNodeEvent(ctx context.Context, _ NodeID, _ Event
 }
 
 // ChainOrchHooks 把多个 OrchestrationHooks 串成一个——业务想同时挂 SSE 适配 +
-// audit 日志 + metrics 等多 hook 时用。对齐 hook.ChainHooks 设计.
+// audit 日志 + metrics 等多 hook 时用。每个钩子的 ctx 按 [CallHook] 规则采纳。
 //
 // **panic 语义**：不逐个隔离。OnGraphStart / OnNodeStart 一个钩子 panic 时排在它后面的不再调（返回的 ctx 往后流，panic 的
 // 那个交不出 ctx）；OnNodeEnd / OnGraphEnd / OnNodeEvent 每个钩子都调到、调完再抛出第一个 panic（带它当初的栈）。panic 交给
@@ -146,8 +146,7 @@ func NewChainOrchHooks(hooks ...OrchestrationHooks) *ChainOrchHooks {
 	return &ChainOrchHooks{hooks: filtered}
 }
 
-// **ctx propagation 协议**: ChainOrchHooks 内 ctx 链式串 — 每个 hook 返的 ctx
-// 给下一个 hook 用. 业务在 hook A 内 push 的 span 让 hook B 拿到.
+// 逐跳采纳上下文，业务钩子设置的 span 可传给同一链的后续钩子。
 //
 // **panic 语义**: 一个 hook panic 中断剩余链，处置见 [OrchestrationHooks]「panic 语义」.
 func (c *ChainOrchHooks) OnGraphStart(ctx context.Context, chs Channels) (context.Context, error) {
@@ -156,7 +155,9 @@ func (c *ChainOrchHooks) OnGraphStart(ctx context.Context, chs Channels) (contex
 	// — hook B fail 时 caller 拿到含 hook A push span 的 ctx, 跨 ChainHooks 行为不一致.
 	inCtx := ctx
 	for _, h := range c.hooks {
-		newCtx, err := h.OnGraphStart(ctx, chs)
+		newCtx, err := CallHook(ctx, func(in context.Context) (context.Context, error) {
+			return h.OnGraphStart(in, chs)
+		})
 		if err != nil {
 			return inCtx, err // fail-fast: start 错中断剩余 handlers + 回入参 ctx
 		}
@@ -170,7 +171,8 @@ func (c *ChainOrchHooks) OnGraphStart(ctx context.Context, chs Channels) (contex
 // 调用点又按成功收尾（审计实测）。
 func (c *ChainOrchHooks) OnGraphEnd(ctx context.Context, chs Channels, runErr error) context.Context {
 	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
-		ctx = c.hooks[i].OnGraphEnd(ctx, chs, runErr)
+		in, adopt := EnterHook(ctx)
+		ctx = adopt(c.hooks[i].OnGraphEnd(in, chs, runErr))
 	})
 	return ctx
 }
@@ -179,7 +181,9 @@ func (c *ChainOrchHooks) OnNodeStart(ctx context.Context, id NodeID, chs Channel
 	// **audit³ B2 fix**: 错误路径回入参 ctx (跟 OnGraphStart + ChainHooks 6 method 同款)
 	inCtx := ctx
 	for _, h := range c.hooks {
-		newCtx, err := h.OnNodeStart(ctx, id, chs)
+		newCtx, err := CallHook(ctx, func(in context.Context) (context.Context, error) {
+			return h.OnNodeStart(in, id, chs)
+		})
 		if err != nil {
 			return inCtx, err
 		}
@@ -191,19 +195,19 @@ func (c *ChainOrchHooks) OnNodeStart(ctx context.Context, id NodeID, chs Channel
 // OnNodeEnd 每个钩子都调到，同 OnGraphEnd。
 func (c *ChainOrchHooks) OnNodeEnd(ctx context.Context, id NodeID, chs Channels, nodeErr error) context.Context {
 	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
-		ctx = c.hooks[i].OnNodeEnd(ctx, id, chs, nodeErr)
+		in, adopt := EnterHook(ctx)
+		ctx = adopt(c.hooks[i].OnNodeEnd(in, id, chs, nodeErr))
 	})
 	return ctx
 }
 
-// OnNodeEvent 依次交给链里每个钩子，每个拿到的都摘掉了收信号处（OnNodeEvent 只作观测，见接口）。前一个钩子
-// 返回的 ctx 照常交给后一个，但前一个返回的可能是别处存下的 ctx（比如它在 OnNodeStart 存的、带着节点的收信号
-// 处）——曾经原样交下去，后一个钩子在里面做的决定照样交到了调用方（审计实测）。
+// OnNodeEvent 依次调用每个观测钩子，每跳沿用本次事件的执行范围并摘除信号收集处。
 //
 // 每个钩子都调到，同 OnGraphEnd：一个观测钩子在某个片段上 panic，排在它后面的（前端适配层）照样收到这个片段。
 func (c *ChainOrchHooks) OnNodeEvent(ctx context.Context, id NodeID, ev Event) context.Context {
 	panicerr.CallEach(ctx, len(c.hooks), func(i int) {
-		ctx = c.hooks[i].OnNodeEvent(eventHookCtx(ctx), id, ev)
+		in, adopt := EnterHook(eventHookCtx(ctx))
+		ctx = adopt(c.hooks[i].OnNodeEvent(in, id, ev))
 	})
 	return ctx
 }
