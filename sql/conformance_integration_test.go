@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -159,6 +160,23 @@ func TestMySQLIntegration(t *testing.T) {
 	})
 }
 
+func checkStoredNumericKeys(t *testing.T, st *crewsql.Store, group, op string, value any, want []string) {
+	t.Helper()
+	items, err := st.Search(t.Context(), store.NS(group), store.WithFilter(map[string]any{"n": map[string]any{op: value}}))
+	if err != nil {
+		t.Errorf("%s %s %v 查询失败：%v", group, op, value, err)
+		return
+	}
+	keys := make([]string, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, item.Key)
+	}
+	slices.Sort(keys)
+	if !slices.Equal(keys, want) {
+		t.Errorf("%s %s %v 命中 %v，期望 %v", group, op, value, keys, want)
+	}
+}
+
 func newSQLTestTable() string {
 	return "crew_test_" + strings.ToLower(rand.Text())
 }
@@ -249,6 +267,12 @@ func runSQLBackendConformance(t *testing.T, dialect crewsql.Dialect, open func()
 			}
 			assertDecimalFilterPrecision(t, st, true)
 		})
+	}
+	switch dialect.(type) {
+	case crewsql.Postgres:
+		t.Run("StoreNumericDomain", func(t *testing.T) { checkPostgresStoreNumericDomain(t, db) })
+	case crewsql.MySQL:
+		t.Run("StoreNumericDomain", func(t *testing.T) { checkMySQLStoreNumericDomain(t, db) })
 	}
 	t.Run("HistoryStore", func(t *testing.T) {
 		history_conformance.RunHistoryStoreTests(t, func() agent_v2.HistoryStore {

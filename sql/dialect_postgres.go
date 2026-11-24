@@ -77,6 +77,11 @@ func (Postgres) JSONFieldEquals(col, field, valueJSON string, _ JSONKind, b Para
 	return fmt.Sprintf("%s->%s = %s::jsonb", col, pf, pv)
 }
 
+// numericRangeArg 让 PostgreSQL 按 numeric 精度解析范围阈值，大整数和小数都保留有效数字。
+func (Postgres) numericRangeArg(v any) (any, bool) {
+	return jsonNumericArg(v)
+}
+
 // JSONFieldNumericCompare 返
 //
 //	(CASE WHEN jsonb_typeof(col->'field') = 'number' THEN (col->>'field')::numeric END) <op> $n::numeric
@@ -88,12 +93,7 @@ func (Postgres) JSONFieldEquals(col, field, valueJSON string, _ JSONKind, b Para
 // 条件求值是文档保证的, 同一实验下不受影响. 非数值行 CASE 落 NULL ⟹ 比较为 NULL ⟹
 // 不命中、不报错; 数字字符串 `"9"` 不会被静默 cast 参与比较.
 //
-// 参数 `$n::numeric` 显式 cast 让绑定类型不影响结果: 2026-09-04 真库 conformance 跑的是
-// pgx/v5 stdlib (按 int8 / float8 绑定); lib/pq 按 text 绑定同样能落成 numeric (2026-09-07
-// 真库补测: 三种绑定形态结果一致).
-//
-// ⚠️ 另注: lib/pq **不受** bindJSON 那条 exec-mode 坑影响 (它对非 bytea 目标原样送出),
-// 那条精确地是 pgx 两个 OID 不可知模式独有的——见 sql_helpers.go 的 bindJSON.
+// Store 将阈值的 JSON 数字原文绑定为字符串，`$n::numeric` 让阈值和列中的数字按同一精度比较。
 func (Postgres) JSONFieldNumericCompare(col, field, op string, num any, b ParamBinder) string {
 	// PG 的 $n 可复用——字段名只绑一次、在 SQL 里出现两次。
 	pf := b.Bind(field)

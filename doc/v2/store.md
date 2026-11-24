@@ -323,7 +323,7 @@ backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
 | ListNamespaces WithListMaxDepth | ✅ | ✅ | ✅ |
 | Batch (per-Op error 隔离 best-effort) | ✅ | ✅ | ✅ |
 | **TTLAware** (`WithTTL`) | ❌ | ✅（`NewTTLStore`） | ✅（Redis 原生期限） |
-| filter value 含 `json.Number`（业务 `json.Decoder.UseNumber()` 路径） | ✅ | ✅（`numericArg` 先按 int64 绑参保精度、再退 float64；2026-09-04 起） | ✅ |
+| filter value 含 `json.Number`（业务 `json.Decoder.UseNumber()` 路径） | ✅ | ✅（PostgreSQL 和 MySQL 范围条件绑定原始 JSON 数字，SQLite 范围条件先尝试 int64，再使用 float64） | ✅ |
 | 跨进程 wire (`MarshalCheckpoint` round-trip) | ✅ (单进程) | ✅ | ✅ |
 | 持久化 (重启不丢) | ❌ (进程内存) | ✅ (disk fsync) | ⚠️ (业务必配 `appendonly yes`) |
 
@@ -343,6 +343,23 @@ backend opt-in. 业务跨 backend 切换前**必查**此矩阵:
   是否含活条目。同前缀的写入端统一升级后，首次枚举回填既有名称和条目的对应关系。 [Redis Store 索引](../../redis/doc.go)
 - **持久化**: Redis 默认 `appendonly no` 业务 crash 丢 1h cp. 必读 `redis/doc.go`
   "Redis 持久化配置" 章节.
+
+#### PostgreSQL JSONB 数值的写入与过滤
+
+PostgreSQL 按 `numeric` 精度保存 JSONB 数字，范围查询的阈值也从原始数字文本转为 `numeric`。例如，`$gt 18446744073709551615` 能区分该无符号整数上界与更大的两个相邻整数。`0.10000000000000000001` 和 `0.10000000000000000002` 分别保存，前者作 `$gt` 阈值时只命中两者中的后者。`1e-400` 也保留为大于零的数。这些用例在 PostgreSQL 16.9 上覆盖 pgx 的语句缓存、`exec` 和简单查询协议。[PostgreSQL 数值集成测试](../../sql/store_postgres_numeric_integration_test.go)
+
+#### MySQL JSON 数值的写入与过滤
+
+MySQL 的 JSON 列按数值类型保存数据。`Get` 把库中实际保存的数字解成 `json.Number`，等值和范围过滤也按该值比较。下表来自 MySQL 8.0.35，覆盖驱动的预处理和客户端参数插值两种模式。 [MySQL 数值集成测试](../../sql/store_mysql_numeric_integration_test.go)
+
+| 传入 `Put` 的 JSON 数字 | `Get` 回读 | 查询行为 |
+| --- | --- | --- |
+| `18446744073709551614`、`18446744073709551615` | 两个不同的 `UNSIGNED INTEGER`，保留原值 | 以第二个数为阈值，`$lt` 只匹配两者中的第一个 |
+| `18446744073709551616`、`18446744073709551617` | 同一个 `DOUBLE`，文本为 `1.8446744073709552e19` | `$eq` 查询 2⁶⁴ 命中两行，`$gt` 查询 2⁶⁴−1 也命中两行 |
+| `0.1`、`0.10000000000000000001` | 都是 `0.1` | `$eq` 匹配两行，`$gt 0.1` 会跳过两行 |
+| `1e-400` | `0.0` | 与零相等 |
+
+`Put` 写入 `json.Number("1e400")` 时，调用方可用 `errors.As` 取得 `*mysql.MySQLError`，错误号为 3140，SQLSTATE 为 `22032`。失败的插入不会产生新行，覆盖写失败后原值和原时间戳都保留。这个数作为范围查询的阈值时，调用方可用 `errors.Is(err, store.ErrFilterTypeMismatch)` 判断 `Search` 返回的错误，空 namespace 也一样。
 
 ### 3.4.2 SQL Store TTL
 

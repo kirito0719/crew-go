@@ -78,7 +78,7 @@ func TestDialects_JSONFieldNumericCompare_Shapes(t *testing.T) {
 			"(CASE WHEN jsonb_typeof(value->$1) = 'number' THEN (value->>$1)::numeric END) > $2::numeric",
 			[]any{"age", int64(3)}},
 		{"mysql", agentSQL.MySQL{},
-			"(JSON_TYPE(JSON_EXTRACT(value, ?)) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(value, ?) > ?)",
+			"(JSON_TYPE(JSON_EXTRACT(value, ?)) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(value, ?) > CAST(? AS JSON))",
 			[]any{`$."age"`, `$."age"`, int64(3)}},
 		{"sqlite", agentSQL.SQLite{},
 			"(json_type(value, ?) IN ('integer','real') AND json_extract(value, ?) > ?)",

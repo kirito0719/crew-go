@@ -1,10 +1,10 @@
 # 项目待办
 
-2026-11-23 复核待办，行业调研已通过 `5d29a77` 合入 `test`。失败模型调用的用量、评测逐轮记录、Folio 式上下文恢复及 ISSUE-100 并发历史边界均已合入。当日 GitHub 开放 Issue 为 0，以下使用仓内编号。[GitHub Issues](https://github.com/kirito0719/crew-go/issues) · [仓内 Issue 索引](../issue/issues.md)
+2026-11-24 复核待办，行业调研已通过 `5d29a77` 合入 `test`。失败模型调用的用量、评测逐轮记录、Folio 式上下文恢复及 ISSUE-100 并发历史边界均已合入。11 月 23 日核查时 GitHub 开放 Issue 为 0，以下使用仓内编号。[GitHub Issues](https://github.com/kirito0719/crew-go/issues) · [仓内 Issue 索引](../issue/issues.md)
 
 [逐条核验台账](backlog-audit.md)记录关闭、归并、已决和待验收的证据。[历史 TODO 快照](todo-history.md)保留原表、旧优先级快照和审计过程。
 
-共 **39 项**。P1 **0**、P2 **3**、P3 **36**。待决 **25**、验收 **14**。A16、C18 和 Q17 的晚到前文查询已完成。[回归与实测](backlog-audit.md#2026-11-23-历史归属转交策略与晚到前文)
+共 **33 项**。P1 **0**、P2 **3**、P3 **30**。待决 **25**、验收 **8**。本批完成 A08、A10、A11、A13、A14、A17。[回归与实测](backlog-audit.md#2026-11-24-本地验收)
 
 - **缺陷**已有当前复现，或可从实际生产调用路径确认契约不一致。
 - **能力缺口**对应现有实现边界外的功能，完成条件独立列出。
@@ -15,16 +15,7 @@
 
 ## 下一批可开工项
 
-以下工作可用本地模型替身或数据库验证。顺序按复现证据、影响和验收成本排列。
-
-| 顺序 | 事项 | 本批验收 |
-| --- | --- | --- |
-| 1 | A11、A13 · 补嵌套续跑与禁止重做的回归 | 分别复现直接续完子图再续父图、不可重做的上游遇到入口否决和重试。核对实际工具写入次数、完成记录归属，以及取消后还能续哪份档。[直接恢复子图](../../agent_v2/handoff_commit_test.go) · [入口否决](../../compose_v2/entry_reject_paths_test.go) |
-| 2 | A10 · 核准 MySQL 数值写入和筛选边界 | 在目标 MySQL 版本用 `1e400` 和 `0.10000000000000000001` 做写入、回读及范围查询，记录驱动错误、实际保存值和命中行，明确对调用方的约定。[旧版实测](todo-history.md) · [当前方言](../../sql/dialect_mysql.go) |
-
-其余可单独验证的窄路径有 A08 的慢历史写入与共享输入去重、A14 的嵌套同名工具观测分类、A17 的自定义模型工具调用 ID。
-
-### 后续功能实验
+以下功能实验可用本地数据或模型替身验证。
 
 - **Q03/Q17 · 压缩原文保留与恢复成本。** MicroCompact 当前由应用回收转存内容，ContextRecovery 已支持按后端能力设置 TTL。用同一段长任务对照证据取回量、挂起后可读性和存储占用。[转存契约](../v2/context-compaction.md) · [恢复行为](../v2/context-recovery.md)
 - **Q12 · 后台子任务上报阶段进度和证据。** 已有派单、补答、取消和终态通知。可先试父任务按版本读取阶段产物，用进程接手和重复上报检验连续性。[后台任务](../v2/durable-background-agent.md)
@@ -47,14 +38,8 @@
 | --- | --- | --- | --- |
 | A06 | 验收 | Anthropic 真流、错误分类与服务端上下文清理 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。跑 `TestSmoke_ContextEditing` 确认两种清理的实际统计、与 compaction 组合的请求以及严格前缀回放。另核对实际触发压缩后的交互和编辑前后的缓存用量。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [流式冒烟命令](../description/smoke-test-recipes.md) · [清理冒烟](../../example/model/anthropic_smoke/context_editing_test.go) |
 | A07 | 验收 | 跑齐 thinking 多轮回放、关停和 provider 变体 | 使用现有模型集成入口补 3 轮以上及中途关闭的对照。Anthropic 的空闲/计费另见 A06。历史 TODO 570。 |
-| A08 | 验收 | 复核有具体目标的弱测试与历史探针 | 核对 Reflect/Plan 失败重试代数、Toolkit.StreamCall 的流式分派与退化，以及观测扇出实例和真实 fallback 指标。ISSUE-99 的现有嵌套测试已断言各成员输出，补慢历史后端下共享输入只写一次的断言。provider 候选归 A18。历史 TODO 207、291、569、639–640、659 及 ISSUE-16、99。 |
 | A09 | 验收 | Plan Web 生产入口与生命周期 | mock 已覆盖挂起、续跑及完成态。目标环境仍需验鉴权、Cookie、反向代理、状态 TTL 和故障恢复。共享 Redis 迁移、双副本切换和跨副本续跑暂缓。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
-| A10 | 验收 | 明确 MySQL Store 的有限数值写入域与范围过滤 | 现有后端方言和 conformance 已覆盖默认类型；验证边界、越界和下推过滤的真实 MySQL 行为，再固定告警、返回或约束。历史 TODO 502。 [SQL 方言](../../sql/dialect.go) |
-| A11 | 验收 | GraphAgent 多层脱离与嵌套调用的任务边界 | 图身份、显式源档、钩子换分区及条件清档已有回归。余下核对图外钩子、外来 ctx、裸调和闭包逻辑改版，以及直接完成子图后再恢复父图时的完成记录归属。旧档部署验收归 A02。 [脱离入口](../../agent_v2/detach_origin_test.go) · [直接恢复子图](../../agent_v2/handoff_commit_test.go) · [分区回归](../../agent_v2/graph_checkpoint_late_backend_test.go) |
-| A13 | 验收 | 复核禁止重做的入口否决与重试 | 现有回归已覆盖有权重做的上游及若干钩子相位。余下用 AddSubgraphNode、成员主图和 RunWithRetry 对照不可重做的输入，检查上游调用次数、重试之间的代际与取消时的存档。 [条件边](../../compose_v2/out_edges.go) · [入口否决回归](../../compose_v2/entry_reject_paths_test.go) |
-| A14 | 验收 | 低阶 BasicAgentBuilder 的工具 tracing 使用自身类型查表 | 嵌套节点运行同名工具时，验证观测分类来自自身的位置与工具绑定，而不是调用方的表。历史 TODO 532。 [构建器](../../agent_v2/basic_builder.go) |
 | A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `ReasoningContent` 文本已计入，签名块可能仅存在标注。优先用真实回放的服务端 input usage 对照触发点。历史 TODO 329。 [估算](../../compose_v2/token_estimate.go) · [Anthropic](../../model/anthropic/client.go) |
-| A17 | 验收 | 复测自定义模型的非 UTF-8 工具调用 ID | provider JSON 下不会产生这类 ID。通过自定义模型和持久存档复核中断寻址，确认入口应规范化还是拒绝。历史 TODO 341。Redis 旧 GraphID 的迁移修复见 [D07](backlog-audit.md#2026-11-18-剩余缺陷修复)。 |
 | A18 | 验收 | 核对仍有独立使用意义的历史审查条目 | 对只有档案结论的事项按台账定位。先核对现行的长 HistoryKey 可移植边界、旧候选可用性及低阶/自定义入口，再决定是否补测试。 [历史 TODO 逐条表](backlog-audit.md#历史-todo-逐条核验) |
 | Q01 | 待决 | 可插拔 Sandbox 的一致性边界 | 现有 `Sandbox` 和工具适配器只提供约定及单测。确定哪些文件、网络、进程及取消语义由每个应用实现保证，是否要落可共享 conformance。 [现行契约](../v2/sandbox.md) · [接口](../../sandbox/sandbox.go) |
 | Q02 | 待决 | 多分支停机时对外报告与挂起记录的关系 | 终局错误与身份冲突并存时保留两条错误链，受保护的子档保留。余下决定某支存档失败时，哪些兄弟问题需要对外展示及如何继续处理，以及成功清理兄弟挂起档时是否报告数量。 [超步退出](../../compose_v2/graph_loop.go) · [历史记录](todo-history.md) |
@@ -83,6 +68,8 @@
 | Q27 | 待决 | 持久化业务状态演进与按执行 namespace 查历史 | ISSUE-70 Phase 4 的通用状态迁移需要版本化调用方。SelfHistoryByNS 希望按执行 namespace 查写入记录，先核对执行位置能否成为历史身份。 [ISSUE-70](../issue/issue-70-checkpoint-evolution.md) |
 
 ## 已关闭及归并去向
+
+- A08、A10、A11、A13、A14、A17 已完成。覆盖重试与历史、MySQL 与 PostgreSQL 数值过滤、父子续跑与取消、工具分类和工具调用 ID。[实测及回归入口](backlog-audit.md#2026-11-24-本地验收)
 
 - **A16、C18 和 Q17 的查询子项已完成。** 独立成员各自保留回复历史。Handoff 可按来源限制目标并按次暂停新转交。摘要边界后的前文按批量 ID 查重。[回归与数据库实测](backlog-audit.md#2026-11-23-历史归属转交策略与晚到前文)
 

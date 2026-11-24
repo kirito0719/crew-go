@@ -133,9 +133,8 @@ var rangeOpSQL = map[string]string{
 //
 //   - `{"key": v}` / `{"key": {"$eq": v}}` → dialect.JSONFieldEquals, 参数 = v 的 JSON 文本
 //   - `{"key": {"$ne": v}}` → (JSONFieldExists AND NOT (JSONFieldEquals)), 参数同上
-//   - `{"key": {"$gt"|"$gte"|"$lt"|"$lte": n}}` → dialect.JSONFieldNumericCompare, 参数 = Go 数值
-//     (json.Number 转 int64 / float64 再绑, driver 才认)
-//   - key 必过 identifier 校验 (两条路径都拼进 SQL 字面量, 防注入)
+//   - 范围操作经 Dialect.JSONFieldNumericCompare 下推。PostgreSQL 和 MySQL 接收 JSON 数字原文，其他方言默认绑 Go 数值。
+//   - 字段名由方言绑定成参数。
 //   - op map 里出现非 `$` 键 (嵌套 filter) → ErrUnsupportedFilterOp
 //
 // 调用前 store.ValidateFilter 已保证 op 名合法、范围 op 的值是数值; 这里对两者仍
@@ -154,6 +153,10 @@ func (s *Store) buildFilterSQL(filter map[string]any, paramOffset int) (string, 
 	var conds []string
 
 	binder := &paramBinder{dialect: s.dialect, offset: paramOffset}
+	rangeArg := numericArg
+	if d, ok := s.dialect.(interface{ numericRangeArg(any) (any, bool) }); ok {
+		rangeArg = d.numericRangeArg
+	}
 
 	equals := func(key string, want any) error {
 		jsonText, err := json.Marshal(want)
@@ -201,7 +204,7 @@ func (s *Store) buildFilterSQL(filter map[string]any, paramOffset int) (string, 
 					bindJSON(jsonText), jsonKindOf(jsonText), binder)
 				conds = append(conds, fmt.Sprintf("(%s AND NOT (%s))", exists, eq))
 			case "$gt", "$gte", "$lt", "$lte":
-				num, ok := numericArg(opValue)
+				num, ok := rangeArg(opValue)
 				if !ok {
 					return "", nil, fmt.Errorf("%w: %s on field %q requires a numeric filter value, got %T",
 						store.ErrFilterTypeMismatch, opName, key, opValue)

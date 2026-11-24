@@ -156,10 +156,7 @@ func TestStore_Search_Int64_Filter_Goes_To_Numeric_Path(t *testing.T) {
 	}
 }
 
-// TestStore_Search_JSONNumber_Filter_Binds_Numeric 验 json.Number filter 值 (业务
-// `json.Decoder.UseNumber()` 路径) 走数值路径且按 int64 绑定——它是 string 底层类型,
-// 不转的话 driver 会按文本绑, `numeric > text` 在 PG 上直接报错; 之前 sql 后端对它返
-// ErrFilterTypeMismatch 而 in-memory / redis 接受, 跨后端漂.
+// TestStore_Search_JSONNumber_Filter_Binds_Numeric 验 PostgreSQL 将 json.Number 的数字原文绑定到 numeric 阈值。
 func TestStore_Search_JSONNumber_Filter_Binds_Numeric(t *testing.T) {
 	db, mock, _ := sqlmock.New()
 	defer db.Close()
@@ -167,7 +164,7 @@ func TestStore_Search_JSONNumber_Filter_Binds_Numeric(t *testing.T) {
 	st := agentSQL.NewStore(db, agentSQL.Postgres{})
 
 	mock.ExpectQuery(regexp.QuoteMeta(`> $4::numeric`)).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "id", int64(9007199254740993)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "id", "9007199254740993").
 		WillReturnRows(sqlmock.NewRows([]string{"ns", "data_key", "value", "created_at", "updated_at"}))
 
 	_, err := st.Search(context.Background(), store.NS("test"),
@@ -324,7 +321,7 @@ func TestStore_Search_Filter_SQL_Is_Deterministic(t *testing.T) {
 		// 全仓 + 三个真库 conformance 跑 5 遍全绿，而 sqlmock 截下的 SQL 实测有 4 种形状。
 		// 排序后 op 名的序是 `$gt` < `$lte`。
 		mock.ExpectQuery(regexp.QuoteMeta(`value->$3 = $4::jsonb AND (CASE WHEN jsonb_typeof(value->$5) = 'number' THEN (value->>$5)::numeric END) > $6::numeric AND (CASE WHEN jsonb_typeof(value->$7) = 'number' THEN (value->>$7)::numeric END) <= $8::numeric AND value->$9 = $10::jsonb`)).
-			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "a", `"x"`, "b", 1, "b", 9, "c", `true`).
+			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "a", `"x"`, "b", "1", "b", "9", "c", `true`).
 			WillReturnRows(sqlmock.NewRows([]string{"ns", "data_key", "value", "created_at", "updated_at"}))
 		_, err := st.Search(context.Background(), store.NS("test"),
 			store.WithFilter(map[string]any{

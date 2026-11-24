@@ -94,7 +94,7 @@ type Dialect interface {
 	JSONFieldEquals(col, field, valueJSON string, kind JSONKind, b ParamBinder) string
 
 	// JSONFieldNumericCompare 返「JSON 列 col 的顶级字段 field 是 JSON 数值且与参数
-	// 比较为真」的 WHERE 子句. **参数绑定的是 Go 数值** (int64 / float64 等).
+	// 比较为真」的 WHERE 子句。默认参数为可绑定的 Go 数值。PostgreSQL 和 MySQL 使用 JSON 数字文本保留阈值精度。
 	//
 	// 语义必须与 [store.MatchFilter] 的范围 op 一致 (type bracketing): 字段是字符串 /
 	// bool / null / 数组 / 对象或缺失 ⟹ **不命中、不报错**——不允许把字符串 cast 成数
@@ -102,7 +102,7 @@ type Dialect interface {
 	// 静默 cast), 也不允许按引擎的跨类型全序比 (MySQL / SQLite 会把字符串行判成
 	// 「大于任何数」). 引擎不保证 AND 短路时用 CASE 强制求值顺序.
 	//   Postgres: "(CASE WHEN jsonb_typeof(col->$1) = 'number' THEN (col->>$1)::numeric END) > $2::numeric"
-	//   MySQL:    "(JSON_TYPE(JSON_EXTRACT(col, ?)) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(col, ?) > ?)"
+	//   MySQL:    "(JSON_TYPE(JSON_EXTRACT(col, ?)) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(col, ?) > CAST(? AS JSON))"
 	//
 	// op 是 SQL 比较符 (`>` / `>=` / `<` / `<=`).
 	JSONFieldNumericCompare(col, field, op string, num any, b ParamBinder) string

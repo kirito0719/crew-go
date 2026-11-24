@@ -384,8 +384,9 @@ type searchConfig struct {
 //     `user-id` / `a.b` / `用户` 这类完全合法的 JSON 字段名换后端就从「有结果」变成
 //     「报错」。现在字段名一律**绑参**，注入面从结构上消失、字符集限制随之取消；
 //     conformance 的 `Search_WithFilter_NonIdentifierFieldNames` 六后端逐格钉
-//   - **小数精度**：**整数已统一按精确整数比**（客户端走 big.Int，三个引擎本来就精确，
-//     conformance 用贴着 2^53 的阈值钉住）；**小数没有统一**，因为三个引擎自己就不一致——
+//   - **数值精度**：客户端使用 big.Int 比较整数，SQL 范围比较同时受后端存储精度和阈值绑定类型影响。
+//     MySQL 范围阈值与存储都使用 JSON 数字，可精确保留到最大 uint64，再大的整数可能舍入为 DOUBLE。
+//     PostgreSQL 范围阈值按 numeric 解析，能保留大整数和高精度小数。小数也因后端而异，
 //     PG 的 jsonb 是任意精度 numeric、MySQL JSON 是 DOUBLE、SQLite `json_extract` 出
 //     REAL，客户端过滤走 float64。于是 `$eq 0.1` 这种在 PG 上只命中真正的 0.1，在其余
 //     后端上会把 0.1 与 0.1000…001 当成同一个值。**别用 filter 做高精度小数的相等判定**。

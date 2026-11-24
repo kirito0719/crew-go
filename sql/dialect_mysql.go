@@ -83,11 +83,16 @@ func (MySQL) JSONFieldEquals(col, field, valueJSON string, _ JSONKind, b ParamBi
 	return fmt.Sprintf("JSON_EXTRACT(%s, %s) = CAST(%s AS JSON)", col, pf, pv)
 }
 
+// numericRangeArg 保留阈值的 JSON 数字文本，使 MySQL 能精确解析 uint64 范围内的无符号整数。
+func (MySQL) numericRangeArg(v any) (any, bool) {
+	return jsonNumericArg(v)
+}
+
 // JSONFieldNumericCompare 返
 //
-//	(JSON_TYPE(JSON_EXTRACT(col, '$.field')) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(col, '$.field') <op> ?)
+//	(JSON_TYPE(JSON_EXTRACT(col, '$.field')) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(col, '$.field') <op> CAST(? AS JSON))
 //
-// MySQL 的 JSON 比较永不报错——跨类型按优先级排序 (STRING > INTEGER, NULL 最低),
+// MySQL 对合法 JSON 值按类型优先级排序 (STRING > INTEGER, NULL 最低),
 // 所以裸 `JSON_EXTRACT(...) > 10` 会把**每个字符串 / bool / 对象 / 数组行都判成大于
 // 10**、把 JSON null 行判成小于 10 (真库实测). `JSON_TYPE` 守卫把非数值行排掉;
 // 两个合取项都没有副作用, AND 的求值顺序无关 (与 PG 不同, 不需要 CASE).
@@ -95,15 +100,14 @@ func (MySQL) JSONFieldEquals(col, field, valueJSON string, _ JSONKind, b ParamBi
 // **列表必须含 `UNSIGNED INTEGER`**: 手册的 JSON_TYPE 返回值表没列它, 但 MySQL 会把
 // 大正整数 (实测 9007199254740993) 标成它, 漏了 Snowflake ID / 纳秒时间戳会被守卫误排.
 //
-// 参数按 Go 数值绑定 (int64 → 整数, float64 → 浮点); 按字符串绑定会退化成 JSON
-// STRING 的字典序比较, 共享层保证不会.
+// MySQL 把参数按 JSON 数字解析，沿用写入和等值过滤的整数或 DOUBLE 精度。
 func (MySQL) JSONFieldNumericCompare(col, field, op string, num any, b ParamBinder) string {
 	// `?` 是位置绑定——同一条 path 出现两次就得绑两次，顺序即出现顺序。
 	path := jsonFieldPath(field)
 	p1 := b.Bind(path)
 	p2 := b.Bind(path)
 	pv := b.Bind(num)
-	return fmt.Sprintf("(JSON_TYPE(JSON_EXTRACT(%s, %s)) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(%s, %s) %s %s)",
+	return fmt.Sprintf("(JSON_TYPE(JSON_EXTRACT(%s, %s)) IN ('INTEGER','UNSIGNED INTEGER','DOUBLE','DECIMAL') AND JSON_EXTRACT(%s, %s) %s CAST(%s AS JSON))",
 		col, p1, col, p2, op, pv)
 }
 

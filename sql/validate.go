@@ -23,11 +23,20 @@ func validateTableName(name string) error {
 	return nil
 }
 
+// jsonNumericArg 保留 JSON 数字字面值，让数据库按自身数值类型解析范围阈值。
+func jsonNumericArg(v any) (any, bool) {
+	raw, err := json.Marshal(v)
+	if err != nil || jsonKindOf(raw) != JSONKindNumber {
+		return nil, false
+	}
+	return bindJSON(raw), true
+}
+
 // numericArg 把范围 op 的 filter 值转成 driver 能绑定的 Go 数值.
 //
 // 覆盖全 Go numeric kind + json.Number (业务 `json.Decoder.UseNumber()` 路径; 先试
 // Int64 保精度, 再退 Float64). uint64 高位置位时 database/sql 拒绝绑定, 退成 float64
-// (精度丢失, 但 > 2^63 的过滤值本就没有精确比较的路). 非数值返 false——正常情况下
+// （可能舍入）。PostgreSQL 和 MySQL 另行绑定 JSON 数字原文。非数值返 false——正常情况下
 // store.ValidateFilter 已在扫描前拦住 (返 ErrFilterTypeMismatch), 这里是兜底.
 func numericArg(v any) (any, bool) {
 	switch n := v.(type) {
