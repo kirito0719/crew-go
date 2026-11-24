@@ -178,8 +178,7 @@ Routing 的分类器与采样路由用 `crew.model.purpose=routing`，Reflect �
 解析和 schema 校验的结果独立于这个属性。
 [OTel 输出类型定义](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/registry/attributes/gen-ai.md#gen-ai-output-type)
 
-工具类别：业务工具实现 `tool.Categorizer` 返回 `tool.CategoryRetrieval` 等，框架查到后放进
-`ToolInput.Extra["category"]`，观测层据此记 `crew.tool.category`，span 名不变。GraphAgent 里直接调组件的
+业务工具通过 `tool.Categorizer` 声明分类。BasicAgent 在本图的工具表中查询，将结果写入 `ToolInput.Extra["category"]`，观测层将 `retrieval`、`embedding` 和 `guardrail` 记入 `crew.tool.category`，普通工具只记录 `execute_tool` span。低阶构建器用 `WithToolCategoryLookup` 绑定自己的查询函数，省略时使用默认工具类别。同名的父子工具各用自身的分类。GraphAgent 里直接调组件的
 节点用 `compose_v2.WithNodeComponent` 声明，节点 span 按 GenAI 操作名命名。
 
 ### 2.4 结局：`crew.outcome` 与 span status

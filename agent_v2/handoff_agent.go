@@ -317,6 +317,9 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 		return nil, err
 	}
 	defer func() { activity.finish(ctx, session) }()
+	if activity.replay != nil {
+		return *activity.replay, nil
+	}
 	ctx = WithSession(ctx, session)
 	// 历史写入器由**编排这一层**拥有：子里可能有不是 BasicAgent 的执行体（远程 / 自研 /
 	// 别的框架的壳），它们不会建也不会写。见 startHistoryForOrchestration。
@@ -370,6 +373,9 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	}
 
 	final, hops, err := h.runGraph(ctx, &cfg, session, input, hooks)
+	if err == nil && activity.replay != nil {
+		return *activity.replay, nil
+	}
 	info.Round = hops // Sub-5 audit Round 2 视角 G fix
 	if err != nil {
 		if final != nil {
@@ -404,7 +410,7 @@ func (h *HandoffAgent) Resume(ctx context.Context, sessionID string, opts ...Res
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer func() { prep.finish(ctx) }()
+	defer prep.finish(&ctx, &retEvents, &retErr)
 	if err := h.validateTransferOptions(); err != nil {
 		return nil, err
 	}

@@ -198,6 +198,9 @@ func (s *SequentialAgent) Run(ctx context.Context, session *RunSession, input *s
 		return nil, err
 	}
 	defer func() { activity.finish(ctx, session) }()
+	if activity.replay != nil {
+		return *activity.replay, nil
+	}
 	ctx = WithSession(ctx, session)
 	// 历史写入器由**编排这一层**拥有：步骤里可能有不是 BasicAgent 的执行体（远程 /
 	// 自研 / 别的框架的壳），它们不会建也不会写，边界补记需要写入器已经在 ctx 里。
@@ -254,6 +257,9 @@ func (s *SequentialAgent) Run(ctx context.Context, session *RunSession, input *s
 
 	// 编译 graph + 跑
 	finalMsg, allMsgs, lastStep, err := s.runGraph(ctx, &cfg, session, input, hooks)
+	if err == nil && activity.replay != nil {
+		return *activity.replay, nil
+	}
 	// Sub-5 audit Round 2 视角 G fix: update info.Round 让 OnAgentEnd 拿真 step 数.
 	info.Round = lastStep
 	if err != nil {
@@ -295,7 +301,7 @@ func (s *SequentialAgent) Resume(ctx context.Context, sessionID string, opts ...
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer func() { prep.finish(ctx) }()
+	defer prep.finish(&ctx, &retEvents, &retErr)
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {

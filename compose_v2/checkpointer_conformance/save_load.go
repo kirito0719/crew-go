@@ -16,6 +16,30 @@ type confChannelVal struct{ V string }
 
 // testSaveLoad 验证 SaveNS / LoadNS round-trip + 自动填 ID/NS.
 func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
+	t.Run("SaveNS_CompletedNestedResult", func(t *testing.T) {
+		ctx := t.Context()
+		cper := factory()
+		cp := &compose_v2.Checkpoint{TaskID: "task", GraphID: "graph", Status: compose_v2.CPStatusCompleted,
+			Caller: &compose_v2.NestedCaller{Address: "caller", Kind: "graph", Result: json.RawMessage(`[{"answer":1}]`)}}
+		if err := cper.SaveNS(ctx, "completed-result", "child", cp); err != nil {
+			t.Fatal(err)
+		}
+		got, err := cper.LoadNS(ctx, "completed-result", "child")
+		if err != nil || got == nil || got.Caller == nil || got.Status != compose_v2.CPStatusCompleted || got.HasResumableWork() {
+			t.Fatalf("未保存完成的子调用，存档 %+v，错误 %v", got, err)
+		}
+		var results []struct {
+			Answer int `json:"answer"`
+		}
+		if err := json.Unmarshal(got.Caller.Result, &results); err != nil || len(results) != 1 || results[0].Answer != 1 {
+			t.Fatalf("子调用结果往返失真 %s", got.Caller.Result)
+		}
+		pending, err := cper.ListPending(ctx, "completed-result")
+		if err != nil || len(pending) != 0 {
+			t.Fatalf("已完成子调用仍在待答列表中 %+v，错误 %v", pending, err)
+		}
+	})
+
 	t.Run("SaveNS_Preserves_Known_Empty_Write_Owners", func(t *testing.T) {
 		cper := factory()
 		cp := &compose_v2.Checkpoint{
@@ -192,6 +216,7 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		ctx := context.Background()
 
 		original := &compose_v2.Checkpoint{
+			Caller:    &compose_v2.NestedCaller{Address: "caller", Kind: "graph", HistorySlot: "outer/child", HistoryTrail: "scope/", RootNS: "outer", RootGraph: "parent", Thread: "thread", Owner: "tenant"},
 			GraphID:   "graph_full",
 			Status:    compose_v2.CPStatusPending,
 			ParentNS:  "parent_ns_path",
@@ -297,6 +322,11 @@ func testSaveLoad(t *testing.T, factory CheckpointerFactory) {
 		//
 		// 这个陷阱曾被 fixture 掩盖（下面几个字段都预填了非空值，auto-fill 分支
 		// 不触发）；谁把 fixture "简化"掉一个预填就会炸，而且炸的是无辜的 backend。
+
+		caller := loaded.Caller
+		if caller == nil || caller.Address != "caller" || caller.Kind != "graph" || caller.HistorySlot != "outer/child" || caller.HistoryTrail != "scope/" || caller.RootNS != "outer" || caller.RootGraph != "parent" || caller.Thread != "thread" || caller.Owner != "tenant" || len(caller.Result) != 0 {
+			t.Errorf("嵌套调用归属或结果往返失真，得到 %+v", caller)
+		}
 		if loaded.GraphID != "graph_full" {
 			t.Errorf("GraphID: expected %q, got %q", "graph_full", loaded.GraphID)
 		}

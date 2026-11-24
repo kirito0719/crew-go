@@ -611,6 +611,9 @@ func guardedSaveNS(ctx context.Context, cfg *runOptions, cm *ChannelManager, cp 
 // 开始的时刻（发事件算耗时用）。cp.Epoch 在调用 SaveNS 之前就铸好了：写档结果不明时，槽里是不是这一代说明它
 // 写没写进去（见 judgeStale 的 ownEpoch）。
 func writeCp(ctx context.Context, cfg *runOptions, cm *ChannelManager, cp *Checkpoint) (time.Time, error) {
+	if cp.Caller == nil {
+		cp.Caller = cfg.nestedCaller
+	}
 	cp.Epoch = newEpoch()
 	// **任务代号原样带过去，不重铸**——它标的是「哪一次任务」，而 Epoch 标的是
 	// 「第几次写」。混淆两者会让中断 ID 在同一次 Run 内跨超步漂（sync 档每超步写一次）。

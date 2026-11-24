@@ -2005,8 +2005,8 @@ func TestInterrupt_CheckpointNotPersisted_IsErrorNotBlocked(t *testing.T) {
 //
 // ⚠️ 下面「span 个数 == 2」那条断言因此**在这个 fixture 下不承重**（变异时属性那条先红）。保留它是因为
 // 它防的是「装两层 + 扇出」的组合——那个组合下 instance 维一旦塌掉，第二个实例的 span 才会被判成已开过
-// 而整个不建，而 harness 的 assertAllEnded 只比 started/ended 的数量、抓不到。要钉死那个组合得再搭一层
-// Observability（形状见 TestTwoInstancesStacked_EachComplete），本轮没做。
+// 而整个不建，而 harness 的 assertAllEnded 只比 started/ended 的数量、抓不到。堆叠场景由
+// TestFanoutInstanceIDsMatchBothStackedProviders 对比两个 provider 的 span 与引擎实际执行的实例 ID。
 func TestNodeInstance_FanoutSpansAreDistinct(t *testing.T) {
 	h := newHarness(t)
 	in := compose_v2.LastValue[*schema.Message]("in")

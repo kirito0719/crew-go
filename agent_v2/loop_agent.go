@@ -171,6 +171,9 @@ func (l *LoopAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		return nil, err
 	}
 	defer func() { activity.finish(ctx, session) }()
+	if activity.replay != nil {
+		return *activity.replay, nil
+	}
 	ctx = WithSession(ctx, session)
 	// 历史写入器由**编排这一层**拥有：子里可能有不是 BasicAgent 的执行体（远程 / 自研 /
 	// 别的框架的壳），它们不会建也不会写。见 startHistoryForOrchestration。
@@ -224,6 +227,9 @@ func (l *LoopAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	}
 
 	final, lastRound, err := l.runGraph(ctx, &cfg, session, input, hooks)
+	if err == nil && activity.replay != nil {
+		return *activity.replay, nil
+	}
 	info.Round = lastRound // Sub-5 audit Round 2 视角 G fix
 	if err != nil {
 		if final != nil {
@@ -258,7 +264,7 @@ func (l *LoopAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer func() { prep.finish(ctx) }()
+	defer prep.finish(&ctx, &retEvents, &retErr)
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {

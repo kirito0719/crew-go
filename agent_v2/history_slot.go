@@ -579,7 +579,8 @@ func historyOutputRecorded(ctx context.Context, slot string, input *schema.Messa
 		other := owner != slot || producer != task
 		descendant := false
 		if trail != "" && r != nil {
-			descendant = strings.HasPrefix(trail, r.trail) && (other || trail != r.trail)
+			_, replayed := r.replayed.Load(key)
+			descendant = strings.HasPrefix(trail, r.trail) && (other || trail != r.trail || replayed)
 			if ns := compose_v2.GetGraphNS(ctx); !descendant && HistorySlot(ctx) == "" && ns != "" {
 				descendant = strings.Contains(trail, historyExecutionToken(task, ns)) && other
 			}
@@ -902,6 +903,22 @@ func beginRunActivity(ctx context.Context, cfg runConfig, session *RunSession, a
 		return ctx, nil, fmt.Errorf("agent %q: %w", agentName, err)
 	}
 	activity := &runActivity{TaskActivity: task}
+	if !freshRoot {
+		receive := func(result json.RawMessage) error {
+			var events []*AgentEvent
+			if err := json.Unmarshal(result, &events); err != nil {
+				return err
+			}
+			noteReplayedHistoryOutput(ctx, FinalMessageByAgent(events, agentName))
+			activity.replay = &events
+			return nil
+		}
+		ctx, err = compose_v2.EnterNestedAgent(ctx, session.RunID, reflect.TypeOf(ag).String(), HistorySlot(ctx), historyScopeTrail(ctx), receive)
+		if err != nil {
+			task.Release()
+			return ctx, nil, err
+		}
+	}
 	if freshRoot {
 		activity.runID = session.RunID
 		activity.initial = compose_v2.GetCheckpointer(ctx)

@@ -37,6 +37,9 @@ func PrepareResumeCheckpoint(sid, ns string, current, expected, source *Checkpoi
 	if current != nil && current.Status == CPStatusResuming || source != nil && source.Status == CPStatusResuming {
 		return nil, ErrCheckpointResumeUnconfirmed
 	}
+	if current.hasNestedResult() || source.hasNestedResult() {
+		return nil, ErrNoPendingCheckpoint
+	}
 	if !sameStoredCheckpoint(current, expected) {
 		return nil, ErrCheckpointStale
 	}

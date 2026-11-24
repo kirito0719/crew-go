@@ -284,21 +284,71 @@ func TestToolCategory_FollowsDispatchedInstance(t *testing.T) {
 	}
 }
 
-// TestToolCategory_NotInheritedFromCaller：嵌套时 ctx 从调用方继承——本 agent 的工具不该按名字查到调用方的类型表
-// （这里直接往 ctx 推一张「什么都标 retrieval」的表模拟）。曾经本 agent 没有 Categorizer 工具时不推自己的表，
-// 继承了调用方的。
+// 父工具在自己的调用上下文里运行子图。两图都派发 lookup，分类由各自的派发表决定。
 func TestToolCategory_NotInheritedFromCaller(t *testing.T) {
-	var n atomic.Int32
-	h := &categoryHooks{}
-	ag := agent_v2.NewBasicAgent(agent_v2.WithName("child"),
-		agent_v2.WithModel(&gateModel{script: []*schema.Message{callMsg(tcall("c1", "lookup", "{}"))}}),
-		agent_v2.WithToolkit(kitOf(namedBizTool("lookup", &n, "ok"))), agent_v2.WithHooks(h))
-	ctx := compose_v2.WithToolCategoryLookup(context.Background(), func(string) string { return "retrieval" })
-	if _, err := ag.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("hi")); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got := h.seen(); len(got) != 1 || got[0] != nil {
-		t.Errorf("本 agent 的 lookup 没实现 Categorizer，不该继承调用方的类型，实际 %v", got)
+	for _, kind := range []string{"basic", "builder", "classified builder"} {
+		t.Run(kind, func(t *testing.T) {
+			var calls atomic.Int32
+			innerHooks, outerHooks := &categoryHooks{}, &categoryHooks{}
+			childModel := &gateModel{script: []*schema.Message{callMsg(tcall("child", "lookup", "{}"))}}
+			var runChild func(context.Context) error
+			if kind == "basic" {
+				child := agent_v2.NewBasicAgent(agent_v2.WithName("child"), agent_v2.WithModel(childModel),
+					agent_v2.WithToolkit(kitOf(namedBizTool("lookup", &calls, "ok"))), agent_v2.WithHooks(innerHooks))
+				runChild = func(ctx context.Context) error {
+					_, err := agent_v2.RunSubAgent(ctx, "delegate", child, schema.UserMessage("子任务"))
+					return err
+				}
+			} else {
+				modelFn := func(ctx context.Context, _, msgs []*schema.Message) (*schema.Message, error) {
+					return childModel.Generate(ctx, msgs)
+				}
+				toolsFn := func(_ context.Context, tcs []schema.ToolCall, _ []context.Context) ([]*schema.Message, error) {
+					calls.Add(1)
+					return []*schema.Message{schema.ToolResultMessage(tcs[0].ID, "ok")}, nil
+				}
+				builder := agent_v2.NewBasicAgentBuilder(modelFn, toolsFn).WithAgentHooks(innerHooks)
+				if kind == "classified builder" {
+					builder.WithToolCategoryLookup(func(name string) string {
+						if name == "lookup" {
+							return tool.CategoryEmbedding
+						}
+						return ""
+					})
+				}
+				g, err := builder.Compile()
+				if err != nil {
+					t.Fatal(err)
+				}
+				runChild = func(ctx context.Context) error {
+					return compose_v2.Run(ctx, g, compose_v2.NewChannelManager(),
+						compose_v2.WithInitialWrites(agent_v2.BasicAgentInputWrites(schema.UserMessage("子任务"))...))
+				}
+			}
+			outerTool := tool.NewFuncTool("lookup", "运行子任务", map[string]any{"type": "object"},
+				func(ctx context.Context, _ map[string]any) (*tool.Result, error) {
+					if err := runChild(ctx); err != nil {
+						return nil, err
+					}
+					return tool.Success("ok"), nil
+				})
+			parent := agent_v2.NewBasicAgent(agent_v2.WithName("parent"), agent_v2.WithHooks(outerHooks),
+				agent_v2.WithModel(&gateModel{script: []*schema.Message{callMsg(tcall("parent", "lookup", "{}"))}}),
+				agent_v2.WithToolkit(kitOf(catTool{outerTool})))
+			if _, err := parent.Run(t.Context(), agent_v2.NewRunSession(), schema.UserMessage("开始")); err != nil {
+				t.Fatal(err)
+			}
+			if got := outerHooks.seen(); len(got) != 1 || got[0] != tool.CategoryRetrieval {
+				t.Errorf("父工具分类 = %v", got)
+			}
+			var want any
+			if kind == "classified builder" {
+				want = tool.CategoryEmbedding
+			}
+			if got := innerHooks.seen(); len(got) != 1 || got[0] != want || calls.Load() != 1 {
+				t.Errorf("子工具分类 = %v, 实际执行 %d 次", got, calls.Load())
+			}
+		})
 	}
 }
 

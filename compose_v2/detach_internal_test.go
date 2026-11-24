@@ -25,7 +25,7 @@ var executionCtxKeys = []any{
 	taskCommitBarrierKey{}, taskCommitContextKey{}, replayedResumeAnswersKey{},
 	toolCallIdxKey{}, currentToolCallIDKey{}, toolCallInstanceKey{}, inToolCallKey{}, withinNodeScopeKey{},
 	nodeStateAccessorKey{}, subCallCounterKey{}, subCallScopeKey{}, abnormalNodeExitKey{}, nodeProgressKey{},
-	componentKindKey{}, eventSinkKey{}, sendSinkKey{}, toolCategoryLookupKey{}, outerRerunGensKey{}, outerRegensKey{},
+	componentKindKey{}, eventSinkKey{}, sendSinkKey{}, nestedCallKey{}, outerRerunGensKey{}, outerRegensKey{},
 	threadIDKey{}, softCancelCtxKey{}, detachedKey{}, detachedFromKey{}, runAliveKey{}, signalScopeKey{}, taskRecipientKeyCtxKey{}, hookCallKey{}, exitGraceKey{}, streamRecordKey{}, runningSlotKey{}, checkpointTaskLeaseKey{}, taskActivityKey{}, checkpointRevisionCtxKey{}, resumeCheckpointTargetKey{}, resumeAdmissionKey{},
 }
 

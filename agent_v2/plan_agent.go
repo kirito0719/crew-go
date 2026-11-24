@@ -2,6 +2,7 @@ package agent_v2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -81,6 +82,12 @@ type ExecutedStep struct {
 //   - remaining：剩余步骤；空 = 终止
 //   - finalAnswer：终止时的最终答复（可空）
 //   - err：规划失败
+//
+// 规划器返回无法派发的步骤，或模型回复未通过内置规划器的格式校验时，
+// 续跑重新规划并为这次决策中的提问分配新身份。
+// 规划调用因 [compose_v2.Ask] 挂起时，续跑会再次执行 Planner，并沿用原提问位置。
+// 若重算可能产生不同候选，先保存待审批对象供续跑复用，或在 Ask 前用
+// [compose_v2.WithResumeAnswerScope] 将答复绑定到候选的稳定身份。
 type Planner func(ctx context.Context, sess *RunSession, input string, executed []ExecutedStep) (remaining []PlanStep, finalAnswer string, err error)
 
 // ExecInputBuilder 自定义 sub-agent 的 input 构造（按 step + 已解析的 refs）。
@@ -406,6 +413,9 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 		return nil, err
 	}
 	defer func() { activity.finish(ctx, session) }()
+	if activity.replay != nil {
+		return *activity.replay, nil
+	}
 	ctx = WithSession(ctx, session)
 	// 历史写入器由**编排这一层**拥有：子里可能有不是 BasicAgent 的执行体（远程 / 自研 /
 	// 别的框架的壳），它们不会建也不会写。见 startHistoryForOrchestration。
@@ -483,6 +493,9 @@ func (p *PlanAgent) Run(ctx context.Context, session *RunSession, input *schema.
 	finalMessagesRef = []*schema.Message{effectiveMsg} // hook 退化看到 input 即可（plan 中断时 graph 还没产 final）
 
 	finalAnswer, err := p.runPlanGraph(ctx, &cfg, session, effectiveContent)
+	if err == nil && activity.replay != nil {
+		return *activity.replay, nil
+	}
 	if err != nil {
 		// review-v6 H-05 fix: 业务错 fire OnError (非 InterruptError / ctx.Err 控制流)
 		if _, isInt := compose_v2.IsInterrupt(err); !isInt && ctx.Err() == nil {
@@ -517,7 +530,7 @@ func (p *PlanAgent) Resume(ctx context.Context, sessionID string, opts ...Resume
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer func() { prep.finish(ctx) }()
+	defer prep.finish(&ctx, &retEvents, &retErr)
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	// MED-1 fail-fast：composite Resume 同样不透传 per-call 覆盖给 inner step。
 	if err := rejectCompositeOverride(rcfg.overrides()); err != nil {
@@ -738,9 +751,17 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 	// 写 planCurrentCh（done 时写 planDoneCh + planAnswerCh）。
 	// 之前这层逻辑分散在 compose_v2.PlanBuilder.Compile 的 planNode + agent_v2 的
 	// plannerFn adapter 两处，消除低层后合并 inline。
-	planNode := func(nodeCtx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+	planNode := func(nodeCtx context.Context, chs compose_v2.Channels) (_ []compose_v2.ChannelWrite, retErr error) {
 		original, _ := compose_v2.Get(chs, planOriginalCh)
 		executed, _ := compose_v2.Get(chs, planExecutedCh)
+		// 已生成的决定若不能派发，或模型答复被规划器拒收，恢复时需要重新决策。
+		// 为新决定分配新的提问身份；中断、取消和未完成的规划调用保留当前代际。
+		var proposed bool
+		defer func() {
+			if retErr != nil && (proposed || rejectedPlannerResponse(retErr)) && !compose_v2.MustPropagate(nodeCtx, retErr) {
+				compose_v2.AdvanceRerunGeneration(nodeCtx)
+			}
+		}()
 
 		// P1 observability: fire plan_replan event 让 observability fire
 		// crew.plan.replans 计数 — Phase initial (executed 空) vs replan (executed 非空).
@@ -761,6 +782,7 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 		if err != nil {
 			return nil, fmt.Errorf("plan: planner: %w", err)
 		}
+		proposed = true
 
 		if len(remaining) == 0 {
 			// 终止信号
@@ -961,6 +983,12 @@ func (p *PlanAgent) buildPlanGraph(ctx context.Context, session *RunSession, gra
 		graphName = p.Name()
 	}
 	return compilePlanGraph(planNode, buildInputNode, workers, p.maxSteps, graphName)
+}
+
+// rejectedPlannerResponse 判断规划器是否已拿到模型回复并因其内容无法形成规划而拒收。
+func rejectedPlannerResponse(err error) bool {
+	return errors.Is(err, ErrPlannerNoToolCall) || errors.Is(err, ErrPlannerEmptySteps) ||
+		errors.Is(err, ErrPlannerBadToolCall) || errors.Is(err, ErrPlannerParseArgs)
 }
 
 // makeTmpSubAgent 按 cfg 当场构造一次性 BasicAgent。

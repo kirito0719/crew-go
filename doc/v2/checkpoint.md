@@ -47,7 +47,7 @@ type Checkpoint struct {
     NS        string           // 本 cp 的 ns 路径（嵌套寻址用）
     ParentNS  string           // 父 ns（O(1) 反查祖先）
     Status    CheckpointStatus // Unset / Pending / Failed / Aborted / Resuming，见 §3.1
-    SchemaVer int              // 当前 CheckpointSchemaVer = 24
+    SchemaVer int              // 当前 CheckpointSchemaVer = 25
     GraphID   string           // 防 cp 串台（§4.3）
     CreatedAt int64            // UnixNano，Cleanup 按它排序；框架只在 caller 没给时盖
     Epoch     string           // 写代：每次 SaveNS 换一枚（§2.2）
@@ -89,6 +89,10 @@ type Checkpoint struct {
 Schema 24 的汇合进度和收尾队列随超步提交。两种调度声明都参与图存档身份校验，
 普通图沿用原身份。屏障进度与编译定义冲突或缺少活动帧时，恢复拒绝并保留原档。
 [配置和执行语义](channel-engine.md#46-固定前驱汇合与收尾节点)
+
+### 独立完成的子调用
+
+Schema 25 为经框架交接的嵌套 agent 保存原调用身份。直接从子 namespace 续跑成功后，子槽以 `CPStatusCompleted` 保存完整事件、已兑付的答案和待提交信号。父图再次到达同一调用时领取结果。待答查询跳过已完成的子槽。父节点把回执记入自身的执行进度，再按世代清理子树。这也支持子图在图开始钩子中选定其他存储分区。若 agent 已获准执行、结果写回失败，返回 `ErrCheckpointResumeUnconfirmed`，调用方可核对外部副作用后显式放弃。旧版挂起子档缺少调用归属时，从父图续跑。[父子图回归](../../agent_v2/direct_child_parent_resume_test.go)
 
 ### 2.2 三个"身份"字段别混
 
@@ -214,6 +218,7 @@ func TestMyPGCheckpointer(t *testing.T) {
 | `CPStatusFailed` | 保存了失败现场。续跑从剩余分支开始。 |
 | `CPStatusAborted` | 终局失败与存档身份冲突并存时封存根档。身份冲突的子档保留。 |
 | `CPStatusResuming` | 该世代已获准续跑，后续结果尚未持久确认。保留快照和旧问题供诊断。 |
+| `CPStatusCompleted` | 子调用已独立完成，事件和待提交信号等待原父调用领取。 |
 
 恢复会检查 `Checkpoint.HasResumableWork()`、图与任务身份、目标分区和存档世代。普通的 Pending、Failed 和旧 Unset 快照按活动帧、待答项与屏障进度识别候选。只有屏障进度却缺少活动帧的档会被拒绝并保留排查。已封存或未结算的续跑会被入口拒绝。 [持久续跑准入](#持久续跑准入)
 
@@ -233,7 +238,7 @@ func TestMyPGCheckpointer(t *testing.T) {
 
 成功与通常的终局失败经 `purgeExitSlot` 清理。出口档没写成且仍拥有存档槽时也用它清旧档。
 
-- **成功**：Run 出口 defer `DeleteSubtree(sid, graphNS)`。避免 Run 1 留下的 cp 污染 Run 2。
+- 图成功时清理本次执行的存档子树。直接恢复嵌套 agent 时，子槽保留回执，供原父调用取回。[独立完成的子调用](#独立完成的子调用)
 - **`ErrRunAborted`**（终局失败）：Run 出口主动删子树。同一超步同时有子档身份冲突和终局失败时，出口保留两条错误链，只在本图的槽写入终局档，并保留冲突子档。终局档没有待执行节点或待答问题，目标槽拒绝续跑。写入失败时，错误链还包含 `ErrCheckpointNotPersisted`，此前的存档可能仍在。
 
 ⚠️ **必须主动删而不是"跳过写"**：cp 是 `(sid, ns)` **单槽覆盖式**，跳过写只是不覆盖，先前那份

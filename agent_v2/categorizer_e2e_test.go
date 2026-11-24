@@ -10,22 +10,7 @@ import (
 	"crew-go/tool"
 )
 
-// ────────────────────────────────────────────────────────────────────────
-// audit fix eaa3fdf HIGH-1 (假绿炸弹) — 端到端 Categorizer 真路径测试.
-//
-// 之前 observability/tool_category_test.go 9 测试都手动填 ti.Extra["category"],
-// 绕开 framework toolsNode 内的 categoryLookup 路径. sanity-revert
-// `agent_v2/basic_builder.go::toolsNode` 内 categoryLookup 整段删 → 9 测试仍 PASS.
-//
-// 本测试走真路径: 业务 retrieval tool 实现 tool.Categorizer → BasicAgent.Run 入口
-// 自动 pushToolCategorizerCtx → compose_v2.Run → toolsNode 内 fire OnToolStart 之前
-// 查 ctx lookup 填 ti.Extra → 业务 hook 拦截看到 framework 填的 category.
-//
-// **sanity-revert 保证**:
-//  1. 删 `agent_v2/basic_agent.go:197 pushToolCategorizerCtx` → 测试 FAIL (Extra nil)
-//  2. 删 `agent_v2/basic_builder.go::toolsNode` 内 categoryLookup 填 Extra → FAIL
-//  3. 业务 tool 不实现 Categorizer → Extra 不含 category (向后兼容验证)
-// ────────────────────────────────────────────────────────────────────────
+// 观测层的分类白名单另有直接钩子测试。这里通过真实工具派发验证生产者写入的类别。
 
 // retrievalTool 模拟业务自定义 RAG 检索 tool, 实现 tool.Categorizer.
 type retrievalTool struct{}

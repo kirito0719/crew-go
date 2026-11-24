@@ -8,6 +8,7 @@ import (
 	"maps"
 	"reflect"
 	"strconv"
+	"unicode/utf8"
 
 	"crew-go/compose_v2"
 	"crew-go/hook"
@@ -211,6 +212,7 @@ type BasicAgentBuilder struct {
 	historyCoverage *historyCoverage
 	name            string
 	model           BasicAgentModelFn
+	toolCategory    func(string) string
 	tools           BasicAgentToolFn
 	preamble        BasicAgentPreambleFn  // ISSUE-74 修：可选 preamble 节点（graph 首段 setup）
 	postamble       BasicAgentPostambleFn // ISSUE-75 修：可选 postamble 节点（graph 末段收尾，如 store.Put）
@@ -875,6 +877,13 @@ func (b *BasicAgentBuilder) WithAgentHooks(h hook.Hooks) *BasicAgentBuilder {
 	return b
 }
 
+// WithToolCategoryLookup 为本图的工具派发函数提供分类查询。开始钩子收到改名前工具的分类。
+// 未设置查询或查询返回空串时，工具使用默认观测分类。
+func (b *BasicAgentBuilder) WithToolCategoryLookup(lookup func(name string) string) *BasicAgentBuilder {
+	b.toolCategory = lookup
+	return b
+}
+
 // WithModelConfig 设算请求配置的函数：每次模型调用前调它，结果放进交给 OnModelStart 的 ModelInput.Config（本次
 // 请求的模型名、温度等，观测层据此记 gen_ai.request.model 与请求参数）。它是 [只读] 视图：框架发请求不读它，钩子
 // 改了不影响调用。BasicAgent 用 model.RequestConfig 按「按次的 model.WithModel 覆盖 > 客户端的 model.ModelNamer」算。
@@ -890,6 +899,16 @@ func (b *BasicAgentBuilder) WithTurnGates(gates []TurnGateFunc, maxVetoes int) *
 	b.turnGates = append([]TurnGateFunc(nil), gates...)
 	b.turnGateMaxVetoes = maxVetoes
 	return b
+}
+
+// JSON 存档会把非法 UTF-8 字节替换为 U+FFFD，使审批和工具结果在冷续跑时换成另一个身份。
+func validateToolCallIDs(msg *schema.Message) error {
+	for i, call := range schema.GetToolCalls(msg) {
+		if !utf8.ValidString(call.ID) {
+			return fmt.Errorf("%w: tool call %d (%q) has a non-UTF-8 ID", compose_v2.ErrRunAborted, i, call.Function.Name)
+		}
+	}
+	return nil
 }
 
 // isPendingUserInput 报 m 是不是一条模型还没回应的、框架接进消息流的用户输入：运行中插话或闸门反馈。
@@ -942,6 +961,7 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 	}
 	backgroundNotes, finishToolResult, useToolMemo := b.backgroundNotes, b.finishToolResult, b.useToolMemo
 	limitedToolSearch := b.limitedToolSearch
+	categoryLookup := b.toolCategory
 
 	modelNode := func(ctx context.Context, chs compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
 		msgs, _ := compose_v2.Get(chs, basicMessagesCh)
@@ -1123,6 +1143,15 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				// modelFn 绑工具时把这一轮交给模型的那些填进来（见 toolBinding）
 				sink := &toolBinding{}
 				out, err = model(withToolBindingSink(callCtx, sink), modelIn.Preamble, msgs)
+				if err == nil && out != nil {
+					err = validateToolCallIDs(out)
+					if err != nil {
+						retractModelAnswer(callCtx, out, name)
+						if out.Metadata != nil {
+							err = providerModel.WithFailureUsage(err, out.Metadata.Usage, out.Metadata.System, out.Metadata.Model)
+						}
+					}
+				}
 				err = providerModel.ReportFailedUsage(callCtx, err)
 				if sink.Restricted {
 					binding = sink
@@ -1205,6 +1234,12 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 				err := fmt.Errorf("OnModelEnd hook set Message to nil")
 				hooks.OnError(callCtx, info, &schema.CommError{Code: "model_end_nil_message", Message: err.Error()})
 				return err
+			}
+			if hasModelHooks {
+				if err := validateToolCallIDs(out); err != nil {
+					hooks.OnError(callCtx, info, &schema.CommError{Code: "model_end_error", Message: err.Error()})
+					return fmt.Errorf("OnModelEnd: %w", err)
+				}
 			}
 			// 输出归属来自原调用。钩子可原地改写标注，也可能返回多个请求共享的固定答复，补章要拷贝。
 			replaced := out != hookMessage || out.Content != originalText
@@ -1334,12 +1369,6 @@ func (b *BasicAgentBuilder) Compile() (*compose_v2.Graph, error) {
 		// 后再调用业务工具（参数注入 / 重定向）。CallId 是 tool_call ↔ tool_result
 		// 配对锚点，hook 改它会破坏配对（OpenAI 422），故传给 hook 观测但不回写消费。
 		//
-		// **Phase 1 fix**: 业务 tool 实现 tool.Categorizer 接口时, agent_v2.BasicAgent
-		// 入口已通过 compose_v2.WithToolCategoryLookup push lookup 函数到 ctx, 这里 fire OnToolStart
-		// 之前查 lookup 填 ti.Extra["category"] 让 observability 创对应 span kind
-		// (retrieval / embedding / guardrail). lookup 返空字符串时业务
-		// 未实现 Categorizer, ti.Extra 不填, observability 走默认 tool kind.
-		categoryLookup := compose_v2.GetToolCategoryLookup(ctx)
 		// 定稿的调用跳过开始与结束钩子，复用原来的结果和信号。
 		fixedContent, redispatched := fixedToolCallContentOf(ctx, toolCalls)
 		if useToolMemo && redispatched {

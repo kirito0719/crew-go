@@ -75,7 +75,7 @@ func restartOwnsCheckpoint(ctx context.Context, cp Checkpointer, sid string, slo
 	if !ok || root.sid != sid || GetOwner(root.base) != GetOwner(ctx) ||
 		!SameCheckpointPartition(cp, root.checkpointer) ||
 		root.ns == slot.NS || !IsNSInSubtree(root.ns, slot.NS) ||
-		slot.Checkpoint.TaskID == "" || slot.Checkpoint.Status == CPStatusAborted || slot.Checkpoint.Status == CPStatusResuming {
+		slot.Checkpoint.TaskID == "" || slot.Checkpoint.hasNestedResult() || slot.Checkpoint.Status == CPStatusAborted || slot.Checkpoint.Status == CPStatusResuming {
 		return false, nil
 	}
 	if !sameStoredCheckpoint(root.slots[slot.NS], slot.Checkpoint) {
@@ -149,7 +149,7 @@ func verifyCheckpointSubtree(ctx context.Context, cp Checkpointer, sid, ns, task
 // checkpointRequiresTaskOwnership 区分仍有任务意义的存档与普通完成快照。
 // 终局标记虽然不可续，仍负责阻止旧快照重放。
 func checkpointRequiresTaskOwnership(cp *Checkpoint) bool {
-	return cp != nil && (cp.Status == CPStatusAborted || cp.Status == CPStatusResuming || cp.HasResumableWork())
+	return cp != nil && (cp.Status == CPStatusAborted || cp.Status == CPStatusResuming || cp.HasResumableWork() || cp.hasNestedResult())
 }
 
 func sameCheckpointPartition(ctx context.Context, cp Checkpointer, sid string) bool {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"crew-go/compose_v2"
@@ -18,6 +19,7 @@ import (
 // abort 路径含删档、cp.cleanup 事件、历史和钩子收尾). caller 不再做
 // 后续 Run / hook fire 等业务逻辑.
 type resumePrep struct {
+	completion *compose_v2.NestedCompletion
 	Checkpoint *compose_v2.Checkpoint
 	Cper       compose_v2.Checkpointer  // 已从 ctx 取出, caller build Run opts 时复用
 	Rcfg       resumeConfig             // 已解析的 ResumeOption
@@ -27,10 +29,17 @@ type resumePrep struct {
 	root       bool
 }
 
-func (p *resumePrep) finish(ctx context.Context) {
+// finish 直接注册为 defer，以便区分正常成功与业务收尾仍在传播的 panic。
+func (p *resumePrep) finish(ctx *context.Context, events *[]*AgentEvent, retErr *error) {
 	defer p.activity.Release()
 	if p.root {
-		finishRootTaskApprovals(ctx, p.Session, p.Session.RunID)
+		defer finishRootTaskApprovals(*ctx, p.Session, p.Session.RunID)
+	}
+	if cause := recover(); cause != nil {
+		panic(cause)
+	}
+	if *retErr == nil && p.completion != nil {
+		*retErr = p.completion.Complete(*events)
 	}
 }
 
@@ -251,6 +260,16 @@ func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessi
 	// 3. ResumeActionAbort: helper 处理整路径
 	if rcfg.action == ResumeActionAbort {
 		ctx = compose_v2.WithSessionIDCtx(ctx, sessionID)
+		// 这个子任务已经完成。其父图仍持有领取结果的权利，父图放弃时才清理整棵子树。
+		if ns != "" {
+			current, err := cper.LoadNS(ctx, sessionID, ns)
+			if err != nil {
+				return nil, ctx, fmt.Errorf("check nested abort target %q: %w", ns, err)
+			}
+			if current != nil && current.Status == compose_v2.CPStatusCompleted {
+				return &resumePrep{Cper: cper, Rcfg: rcfg, AbortDone: true}, ctx, nil
+			}
+		}
 		// review-v6 H-03 fix: forward 父 graphNS 让 Abort 只删本 sub-agent 子树
 		// 不误删父 cp / sibling sub-agent / 其他业务在同 sid 下的 cp.
 		var historyKey *HistoryKey
@@ -371,6 +390,22 @@ func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessi
 			agentTypeName, agentName, sessionID, ns, savedCp.Status, compose_v2.ErrNoPendingCheckpoint)
 	}
 
+	if savedCp.Caller == nil && savedCp.SchemaVer < 25 && ns != "" && savedCp.TaskID != "" {
+		// RunSubAgent 在旧版已为嵌套调用写入输入摘要，父图可能位于另一个实际分区。
+		if savedCp.InputDigest != "" {
+			return nil, ctx, compose_v2.RejectCheckpointIdentity(savedCp, "legacy nested checkpoint must resume through its parent")
+		}
+		// 静态成员没有调用摘要，按同任务的祖先槽区分成员与非空 namespace 的独立根。
+		slots, err := cper.LoadAllInSession(ctx, sessionID)
+		if err != nil {
+			return nil, ctx, fmt.Errorf("check legacy nested checkpoint %q: %w", ns, err)
+		}
+		for _, slot := range slots {
+			if slot.NS != ns && compose_v2.IsNSInSubtree(slot.NS, ns) && slot.Checkpoint.HasResumableWork() && slot.Checkpoint.TaskID == savedCp.TaskID {
+				return nil, ctx, compose_v2.RejectCheckpointIdentity(savedCp, "legacy nested checkpoint must resume through its parent")
+			}
+		}
+	}
 	if unknownRoot {
 		root = resumeApprovalRootWithoutSessionState(ctx, cper, sessionID, ns, savedCp)
 	}
@@ -384,6 +419,14 @@ func commonResumePrep(ctx context.Context, agentTypeName string, ag Agent, sessi
 	// 6. WithSession push
 	newCtx := compose_v2.BindResumeCheckpointTarget(WithSession(ctx, session), cper, sessionID, ns, savedCp)
 
+	newCtx, completion, err := compose_v2.RestoreNestedCaller(newCtx, savedCp, sessionID, ns, reflect.TypeOf(ag).String())
+	if err != nil {
+		return nil, ctx, err
+	}
+	if completion != nil {
+		newCtx = context.WithValue(newCtx, historySlotCtxKey{}, savedCp.Caller.HistorySlot)
+		newCtx = context.WithValue(newCtx, historyReceiptCtxKey{}, &historyReceipt{trail: savedCp.Caller.HistoryTrail})
+	}
 	transferActivity = true
-	return &resumePrep{Checkpoint: savedCp, Cper: configured, Rcfg: rcfg, Session: session, activity: activity, root: root}, newCtx, nil
+	return &resumePrep{completion: completion, Checkpoint: savedCp, Cper: configured, Rcfg: rcfg, Session: session, activity: activity, root: root}, newCtx, nil
 }

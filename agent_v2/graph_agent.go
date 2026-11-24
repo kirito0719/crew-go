@@ -230,6 +230,9 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return nil, err
 	}
 	defer func() { activity.finish(ctx, session) }()
+	if activity.replay != nil {
+		return *activity.replay, nil
+	}
 	ctx = WithSession(ctx, session)
 
 	// 会话历史写入器。**subs 传 nil 是实情不是省事**：GraphAgent 没有静态子列表
@@ -334,7 +337,10 @@ func (g *GraphAgent) Run(ctx context.Context, session *RunSession, input *schema
 	}()
 
 	ctx, commit := compose_v2.WithTaskCommitBarrier(ctx)
-	final, err := g.runGraph(ctx, &cfg, session, input)
+	final, err := g.runGraph(ctx, &cfg, session, input, activity)
+	if err == nil && activity.replay != nil {
+		return *activity.replay, nil
+	}
 	if ownsHistory {
 		endRootInputWindow(ctx)
 	}
@@ -422,7 +428,7 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer func() { prep.finish(ctx) }()
+	defer prep.finish(&ctx, &retEvents, &retErr)
 	if err := g.graph.WithCheckpointContext(newCtx).CheckCheckpointIdentity(prep.Checkpoint); err != nil {
 		return nil, err
 	}
@@ -443,7 +449,9 @@ func (g *GraphAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	defer stopHistory()
 	ownsHistory = ownsHistory && historyWriterFrom(ctx) != nil
 	if ownsHistory {
-		ctx = openHistoryReceipt(ctx) // 与 Run 入口同款，见那处说明
+		if historyReceiptFrom(ctx) == nil {
+			ctx = openHistoryReceipt(ctx)
+		}
 	}
 
 	startOffset := len(session.Events())
@@ -538,6 +546,7 @@ func (g *GraphAgent) runGraph(
 	runCfg *runConfig,
 	session *RunSession,
 	input *schema.Message,
+	activity *runActivity,
 ) (*schema.Message, error) {
 	cm := compose_v2.NewChannelManager()
 	cper := compose_v2.GetCheckpointer(ctx)
@@ -582,6 +591,9 @@ func (g *GraphAgent) runGraph(
 	ctx = withNodeGrants(ctx, runCfg.grantsFor(g))
 	runOpts = withHistoryRestoreSource(ctx, runOpts)
 	runErr := compose_v2.Run(ctx, g.graph, cm, append(runOpts, slotClaimOpt(ctx))...)
+	if activity.replay != nil {
+		return nil, runErr
+	}
 	final := g.outputReader(cm.Channels())
 	return final, runErr
 }

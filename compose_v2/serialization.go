@@ -288,6 +288,8 @@ func UnmarshalTagged(data []byte) (any, error) {
 
 //   - v24：固定前驱的汇合进度与收尾等待队列随超步存档，私有输入沿用实例身份。
 
+//   - v25：嵌套 agent 的原调用身份与独立续跑回执。
+
 // CheckpointSchemaVer 是 Checkpoint 当前存档版本号。恢复时可据此识别旧版运行状态的语义。
 // Marshal 和 Unmarshal 不按版本拒绝存档。
 //
@@ -303,7 +305,7 @@ func UnmarshalTagged(data []byte) (any, error) {
 //   - 业务侧迁移逻辑负责按 cp.SchemaVer 分支决定 unmarshal 字段
 //   - framework 加 `Migrate(v Old, vNew int) (*Checkpoint, error)` 类工具
 //   - 不在 Unmarshal 路径加 fail-fast
-const CheckpointSchemaVer = 24
+const CheckpointSchemaVer = 25
 
 // checkpointSchemaVer (private alias 保 framework 内部 reference 兼容).
 const checkpointSchemaVer = CheckpointSchemaVer

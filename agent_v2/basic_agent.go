@@ -279,6 +279,9 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 		return nil, err
 	}
 	defer func() { activity.finish(ctx, session) }()
+	if activity.replay != nil {
+		return *activity.replay, nil
+	}
 	ctx = WithSession(ctx, session)
 	ctx = pushStoreCtx(ctx, a.config.Store)
 	ctx = withOffloadDedup(ctx) // MicroCompact offload 的 per-Run 跨轮去重集合
@@ -356,6 +359,9 @@ func (a *BasicAgent) Run(ctx context.Context, session *RunSession, input *schema
 	// 避免双重。preamble 抛 InterruptError 时 input 不进 sess.events 也合理
 	// （input 没真消费 LLM）。
 	finalMsgs, lastRound, err := a.runGraph(ctx, &cfg, session, input)
+	if err == nil && activity.replay != nil {
+		return *activity.replay, nil
+	}
 	// Sub-5 audit HIGH-1 fix: update info.Round 让 OnAgentEnd defer 拿到最后一轮真值.
 	// 之前 info.Round 永远是 init 时 0 → 业务钩子在 OnAgentEnd 读到的轮次恒为 0.
 	// info 指针 defer 内闭包捕获 — 这里 mutate 字段, defer 跑时读到新值.
@@ -449,7 +455,7 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	if prep.AbortDone {
 		return nil, nil
 	}
-	defer func() { prep.finish(ctx) }()
+	defer prep.finish(&ctx, &retEvents, &retErr)
 	cper, rcfg, session := prep.Cper, prep.Rcfg, prep.Session
 	ctx = newCtx
 	// ResumeActionReplan：BasicAgent 自身无 plan 节点，但内嵌 sub-agent（如
@@ -509,12 +515,10 @@ func (a *BasicAgent) Resume(ctx context.Context, sessionID string, opts ...Resum
 	// HandoffAgent / RoutingAgent 是同一件事（都没人授予）。嵌在它们底下的续跑不走这条路：
 	// 外层节点在 Resume 时同样重跑，仍以 Run 形态带着授予调下来。
 	ctx = withNodeGrants(ctx, memberGrants{})
-	g, dispatchToolkit, err := a.buildComposeGraph(ctx, memberGrants{})
+	g, err := a.buildComposeGraph(ctx, memberGrants{})
 	if err != nil {
 		return nil, fmt.Errorf("basic agent resume: build graph: %w", err)
 	}
-	// 工具的 trace 类型（tool.Categorizer）按这次实际派发的那份工具表查——见 pushToolCategorizerCtx。
-	ctx = pushToolCategorizerCtx(ctx, dispatchToolkit)
 
 	// Resume 路径：auto-load 从 (sid, ns) 取 saved cp，cm.Restore 恢复 channels
 	//
@@ -633,12 +637,10 @@ func (a *BasicAgent) runGraph(ctx context.Context, runCfg *runConfig, session *R
 	// 本图里的代码（工具函数、钩子）要把能力交给它调起的 agent 时经 RegrantFromNode 显式转授
 	// ——放的是收到的那份，不看 opt-in：opt-in 只管框架给本 agent 注册的那件工具。
 	ctx = withNodeGrants(ctx, grants)
-	g, dispatchToolkit, err := a.buildComposeGraph(ctx, grants)
+	g, err := a.buildComposeGraph(ctx, grants)
 	if err != nil {
 		return nil, 0, fmt.Errorf("agent %q: build graph: %w", a.config.Name, err)
 	}
-	// 工具的 trace 类型（tool.Categorizer）按这次实际派发的那份工具表查——见 pushToolCategorizerCtx。
-	ctx = pushToolCategorizerCtx(ctx, dispatchToolkit)
 
 	cper := compose_v2.GetCheckpointer(ctx)
 
@@ -2289,7 +2291,7 @@ func init() {
 // 授予若是普通的 ctx 值就是环境，孙辈照样读得到，整套授予当场退化（见 handoffGrant godoc）。ctx 上只有
 // runGraph 放的那一份受控形态（nodeGrants）：只给本图里的代码经 [RegrantFromNode] 显式转授，框架调起
 // 别的 agent 时与各编排入口都遮住它。
-func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants) (*compose_v2.Graph, *tool.Toolkit, error) {
+func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants) (*compose_v2.Graph, error) {
 	// **两把闸**：上层授予 + 本 agent 自己 opt-in。缺任一把都不注册对应的工具
 	// （transfer_to_agent / route_to）。授予是「这次调用里谁有资格」，opt-in 是「这个 agent
 	// 愿不愿意」——后者让业务能把某个候选做成终点，也让框架**自己合成**的执行体（TmpSubAgent
@@ -2317,7 +2319,7 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	}
 	conversationTools, conversationRevision, err := bindConversationTools(ctx, cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	checkpointRevision += conversationRevision
 	dispatchToolkit := a.composeDispatchToolkit(cfg, grants, backgroundScopeFrom(ctx) != nil, conversationTools)
@@ -2326,7 +2328,13 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	bld := NewBasicAgentBuilder(modelFn, toolsFn).
 		WithName(a.config.Name).
 		WithMaxRounds(resolveMaxRounds(ctx, a.config.MaxRounds)).
-		WithPostamble(a.postambleFn)
+		WithPostamble(a.postambleFn).
+		WithToolCategoryLookup(func(name string) string {
+			if c, ok := dispatchToolkit.Get(name).(tool.Categorizer); ok {
+				return c.Category()
+			}
+			return ""
+		})
 	bld.WithPreamble(func(ctx context.Context, input *BasicAgentPreambleInput) (*BasicAgentPreambleOutput, error) {
 		// 每次重建图都有独立的来源。直接从 checkpoint 进入模型或工具节点时，没有本次读取的历史前缀。
 		bld.historyCoverage = captureHistoryCoverage(ctx, &cfg)
@@ -2375,9 +2383,9 @@ func (a *BasicAgent) buildComposeGraph(ctx context.Context, grants memberGrants)
 	}
 	g, err := bld.Compile()
 	if err != nil {
-		return nil, dispatchToolkit, err
+		return nil, err
 	}
-	return g.WithCheckpointRevision(checkpointRevision), dispatchToolkit, nil
+	return g.WithCheckpointRevision(checkpointRevision), nil
 }
 
 // postambleFn 是 BasicAgentPostambleFn 实现——graph 末段节点跑业务收尾
@@ -3177,7 +3185,7 @@ func (a *BasicAgent) makeModelFn(cfg Config, grants memberGrants, conversationTo
 
 // composeDispatchToolkit 拼这次 Run 派发用的工具表：业务的工具 + 框架的 opt-in 工具（见 withFrameworkTools）
 // + skill / tool_search 这些框架工具 + 按授予挂的转交 / 路由（没被授予时挂软失败桩）。绑定侧（makeModelFn）
-// 每轮另拼一份，两份注册同一组框架工具。类型标注（pushToolCategorizerCtx）也按这一份查——那是实际会被
+// 每轮另拼一份，两份注册同一组框架工具。工具观测分类也按这一份查——那是实际会被
 // 派发的实例。
 func (a *BasicAgent) composeDispatchToolkit(cfg Config, grants memberGrants, background bool, conversationTools []tool.Tool) *tool.Toolkit {
 	// 只要有用户 toolkit 或 toolCall 模式 skill 集成，就需要 toolsFn。

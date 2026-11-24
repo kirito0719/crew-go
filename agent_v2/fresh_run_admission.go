@@ -18,6 +18,7 @@ type rootRunAdmissionKey struct{}
 func (rootRunAdmissionKey) ExecutionState() {}
 
 type runActivity struct {
+	replay *[]*AgentEvent
 	*compose_v2.TaskActivity
 	runID        string
 	initial      compose_v2.Checkpointer

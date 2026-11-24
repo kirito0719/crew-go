@@ -103,6 +103,8 @@ type NSCheckpoint struct {
 // childNS, cp) 写到独立 ns 路径，**不再嵌入** Checkpoint 自身（旧 SubgraphSnapshots
 // 字段已被否决并删除）。
 type Checkpoint struct {
+	// Caller 绑定嵌套 agent 的原始调用。子槽可以存放已确认完成、等待父图领取的结果。
+	Caller *NestedCaller `json:"caller,omitempty"`
 	// ── ISSUE-70 / ISSUE-50 元数据字段 ──
 	ID        string           `json:"id,omitempty"`         // session ID（SaveNS 自动填）
 	NS        string           `json:"ns,omitempty"`         // 本 cp 的 ns 路径
@@ -396,6 +398,8 @@ const (
 	// CPStatusResuming 保存已获准续跑的现场。进程退出或租约过期后，
 	// 仍须由显式放弃或已提交的后续状态结束此次准入。
 	CPStatusResuming
+	// CPStatusCompleted 表示子调用已结束，原父调用仍可接收其事件。
+	CPStatusCompleted
 )
 
 // Resumable 报告 Pending 和 Failed 两类普通档位。执行前还须校验内容、身份和持久准入。
@@ -445,6 +449,8 @@ func (s CheckpointStatus) String() string {
 		return "aborted"
 	case CPStatusResuming:
 		return "resuming"
+	case CPStatusCompleted:
+		return "completed"
 	default:
 		return "unset"
 	}

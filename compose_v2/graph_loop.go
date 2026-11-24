@@ -21,9 +21,10 @@ type RunOption func(*runOptions)
 
 type runOptions struct {
 	// slotClaim 见 WithSlotClaim——这次 Run 就是占着这个槽的那次 agent 调用自己的。
-	slotClaim   *SlotClaim
-	slotSettled bool
-	slotHasWork atomic.Bool
+	nestedCaller *NestedCaller
+	slotClaim    *SlotClaim
+	slotSettled  bool
+	slotHasWork  atomic.Bool
 	// importOverlay 见 withImportOverlay——**两条路径都摆**成 baseline（子图同步父图 import 值）。
 	importOverlay []ChannelWrite
 	// initialWrites 见 WithInitialWrites——**只在新开路径** apply 的种子写入。
@@ -754,6 +755,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	if boundResumeTarget {
 		ctx = context.WithValue(ctx, resumeCheckpointTargetKey{}, resumeCheckpointTarget{})
 	}
+	nested, _ := ctx.Value(nestedCallKey{}).(*NestedCompletion)
+	mayReplay := nested != nil && nested.sid == cfg.sessionID && nested.ns == cfg.graphNS && nested.replay != nil && cfg.slotClaim != nil && !boundResumeTarget && cfg.resumeFrom == nil
 	var rootCp *Checkpoint
 	var loadErr error
 	var loadDuration time.Duration
@@ -772,6 +775,12 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	checkResumeIdentity := func() error {
 		if loadErr != nil {
 			return fmt.Errorf("check resume target checkpoint: %w", loadErr)
+		}
+		if rootCp.hasNestedResult() {
+			if mayReplay {
+				return g.CheckCheckpointIdentity(rootCp)
+			}
+			return RejectCheckpointIdentity(rootCp, "completed nested result is reserved for its caller")
 		}
 		if rootCp != nil && rootCp.Status == CPStatusResuming || cfg.resumeFrom != nil && cfg.resumeFrom.Status == CPStatusResuming {
 			return ErrCheckpointResumeUnconfirmed
@@ -870,6 +879,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// Rerunnable 记下的产出原样拿回，续跑永不收敛，实测）。
 	producer := hostAcc
 	handoverMain := hostAcc != nil && hostAcc.handover != nil && hostAcc.handover.ns == cfg.graphNS
+	if nested != nil && nested.sid == cfg.sessionID && nested.ns == cfg.graphNS && cfg.slotClaim != nil && (handoverMain || boundResumeTarget) {
+		cfg.nestedCaller = &nested.caller
+	}
 	if handoverMain {
 		producer = hostAcc.handover.from
 	}
@@ -1240,6 +1252,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			}
 			return
 		}
+		// 独立续跑的子图仍属于原父调用。等 agent 构造好返回事件再写回子槽。
+		if boundResumeTarget && cfg.resumeClaimed && cfg.nestedCaller != nil && nested != nil {
+			nested.awaitAgentResult(ctx, cfg, cm, g.CheckpointIdentity())
+			return
+		}
 		// 成功路径：清根 cp 子树
 		// **设计语义**：sid lifetime = 根 graph Run lifetime——graphNS=""（默认根）
 		// 时 DeleteSubtree(sid, "") 清整 sid 命名空间，含本 Run 期间所有子图 cp +
@@ -1501,6 +1518,16 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			return err
 		}
 		restoreRejected = false
+	}
+
+	// 钩子可能在此刻才选定子槽的物理分区。用原父调用接管结果，跳过子图节点与普通出口清档。
+	if mayReplay && readsCheckpoint {
+		replayed, err := nested.replay(ctx, cfg.checkpointer, rootCp, true)
+		if err != nil || replayed {
+			restoreRejected = true
+			bodyReached = replayed
+			return err
+		}
 	}
 
 	// 有冲突时只向祖先交付实际保留的待答项。若本层无法形成合法待答清单，

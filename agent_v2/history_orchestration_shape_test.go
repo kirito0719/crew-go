@@ -36,12 +36,11 @@ import (
 //  3. **不泄漏**：`OnAgentStart` 改写过的输入，改写**之前**那条不得进历史。这是 [消费] 档
 //     hook 的既有语义（脱敏是 CLAUDE.md 自己举的例子），边界补记握着的是闭包里改写前那条。
 //
-// # 输入份数是另一条轴，本表只刻画不断言
+// # 输入份数由读取视图决定
 //
 // 「同一条原始输入记几份」取决于**读回时有几条独立的流**：共享视图（转交）下所有执行体读
 // 同一条流 ⟹ 一份；SelfOnly 扇出下每条分支流各自要完整（有问有答）⟹ 每分支一份。它跟
-// 上面三条契约是正交的两回事，混在一起改就是「修 a 出 b」。本表用 t.Logf 记下实际份数，
-// 已知不一致的形状在各自用例里点名，**不在这里顺手改**。
+// 上面三条产出契约各自独立。B、C 的慢后端回归另核对首次写入和下轮每个模型的实际视图。
 type shapeProbe struct {
 	hs      agent_v2.HistoryStore
 	convID  string
@@ -138,61 +137,59 @@ func TestHistShape_A_HandoffOverParallel(t *testing.T) {
 
 // ── 形状 B：Handoff(Par(Seq(Basic)×3)) ──
 //
-// 中间夹了一层 Sequential ⟹ Parallel 的 subs 是 SequentialAgent，借不到历史配置。
-// 实测重复来自这里：叶子记在 `front/br1/s1`，Sequential 的步骤边界查 `front/br1`，
-// **精确匹配**查不到 → 再记一份 → 同一条产出两个归属 → 第二份走 Rewrite。
+// Handoff 的直接候选是 Parallel。内层 Sequential 的三个叶子默认各读自己的历史。
 func TestHistShape_B_HandoffOverParallelOverSeq(t *testing.T) {
 	p := newShapeProbe(t, "shape-b")
-	mkSeq := func(n int) agent_v2.Agent {
-		return agent_v2.NewSequentialAgent(
-			agent_v2.WithSequentialName(fmt.Sprintf("seq%d", n))).
-			AddStep("s1", p.leaf(fmt.Sprintf("b%d", n), fmt.Sprintf("产出B%d", n)))
-	}
-	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par")).
-		AddBranch("br1", mkSeq(1)).AddBranch("br2", mkSeq(2)).AddBranch("br3", mkSeq(3))
-	ho := agent_v2.NewHandoffAgent(
-		agent_v2.WithHandoffName("front"), agent_v2.WithHandoffInitial("par"),
-	).AddAgent("par", par)
+	ho := shapeHandoffOverParallelSeq(func(n int) agent_v2.Agent {
+		return p.leaf(fmt.Sprintf("b%d", n), fmt.Sprintf("产出B%d", n))
+	})
 
 	if _, err := ho.Run(p.ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	p.load(t)
 	p.assertExactlyOnce(t, "产出B1", "产出B2", "产出B3")
-	t.Logf("输入份数=%d（刻画，不断言）\n%s", p.countOf("原话"), p.dump())
+	if got := countUserWithContent(p.entries, "原话"); got != 3 {
+		t.Errorf("三个独立分支应各有一份输入，实际 %d\n%s", got, p.dump())
+	}
+}
+
+func shapeHandoffOverParallelSeq(leaf func(int) agent_v2.Agent) agent_v2.Agent {
+	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par"))
+	for n := 1; n <= 3; n++ {
+		seq := agent_v2.NewSequentialAgent(agent_v2.WithSequentialName(fmt.Sprintf("seq%d", n))).AddStep("s1", leaf(n))
+		par.AddBranch(fmt.Sprintf("br%d", n), seq)
+	}
+	return agent_v2.NewHandoffAgent(agent_v2.WithHandoffName("front"), agent_v2.WithHandoffInitial("par")).AddAgent("par", par)
 }
 
 // ── 形状 C：Par(Handoff×3) ──
 //
-// Parallel 的 subs 是三个 HandoffAgent ⟹ 借不到配置 ⟹ 现状下 Parallel 层没有写入器、
-// 边界补记整个是 no-op。这是「重复」和「PII 泄漏」两条同时潜伏的地方：一旦编排层有了
-// 写入器，Handoff 的步骤边界就会把叶子已经记过的产出再记一遍。
+// 三个叶子各是本分支 Handoff 的直接候选，读取共享历史。原问题只应落一份。
 func TestHistShape_C_ParallelOverHandoff(t *testing.T) {
 	p := newShapeProbe(t, "shape-c")
-	mkHo := func(n int) agent_v2.Agent {
-		return agent_v2.NewHandoffAgent(
-			agent_v2.WithHandoffName(fmt.Sprintf("ho%d", n)),
-			agent_v2.WithHandoffInitial("w"),
-		).AddAgent("w", p.leaf(fmt.Sprintf("b%d", n), fmt.Sprintf("产出C%d", n)))
-	}
-	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par")).
-		AddBranch("br1", mkHo(1)).AddBranch("br2", mkHo(2)).AddBranch("br3", mkHo(3))
+	par := shapeParallelOverHandoff(func(n int) agent_v2.Agent {
+		return p.leaf(fmt.Sprintf("b%d", n), fmt.Sprintf("产出C%d", n))
+	})
 
 	if _, err := par.Run(p.ctx, agent_v2.NewRunSession(), schema.UserMessage("原话")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	p.load(t)
 	p.assertExactlyOnce(t, "产出C1", "产出C2", "产出C3")
-	// ⚠️ 这里的 3 **不是**「三条分支流各自完整」那种正确的 3。每个 Handoff 都是 Rewrite
-	// 模式，每条分支读得到**所有**分支的消息，所以自己的 prompt 里原始输入就是 3 份——
-	// 实测第二轮各分支 prompt 里「原始问题」×3、「第二问」×2~3。
-	//
-	// 根因是 nonce 的**铸造点**：它在 `HandoffAgent.Run` 里铸，而 Parallel 分发给三个
-	// 分支时那条 input 还没有 nonce ⟹ 三个分支各铸一个、键都不同 ⟹ 任何基于 nonce 的
-	// 去重都失效。写入器合成一个也解决不了，得把铸造点前移到扇出之前。
-	// 见 issue-98 §9 #7（本用例只刻画不断言，等那条修了再收紧）。
-	t.Logf("输入份数=%d（刻画，不断言；⚠️ 这个 3 是 §9 #7 的症状不是正确值）\n%s",
-		p.countOf("原话"), p.dump())
+	if got := countUserWithContent(p.entries, "原话"); got != 1 {
+		t.Errorf("共享视图原问题应恰好落一份，实际 %d\n%s", got, p.dump())
+	}
+}
+
+func shapeParallelOverHandoff(leaf func(int) agent_v2.Agent) agent_v2.Agent {
+	par := agent_v2.NewParallelAgent(agent_v2.WithParallelName("par"))
+	for n := 1; n <= 3; n++ {
+		ho := agent_v2.NewHandoffAgent(agent_v2.WithHandoffName(fmt.Sprintf("ho%d", n)), agent_v2.WithHandoffInitial("w")).
+			AddAgent("w", leaf(n))
+		par.AddBranch(fmt.Sprintf("br%d", n), ho)
+	}
+	return par
 }
 
 // ── 形状 C′：Par(Handoff×3) + 叶子挂改写 hook ──
@@ -233,9 +230,8 @@ func TestHistShape_C_RewriteHook_NoRawLeak(t *testing.T) {
 
 // ── 形状 G：Seq(Basic + 脱敏 hook) ──
 //
-// C′ 那个形状今天恰好安全（Parallel 借不到配置 ⟹ 那层没有写入器 ⟹ 边界补记整个是 no-op），
-// 所以它压不住判据本身。G 把编排层的写入器**确实建起来**（Sequential 的 subs 直接就是
-// BasicAgent，借得到配置），边界真的会跑——这才是「输入按范围判」那一片的哨兵。
+// Sequential 从直接成员 BasicAgent 借到历史配置，步骤边界与叶子共享写入器。
+// 脱敏后的输入应只由叶子记录。
 //
 // 不用范围判会怎样：叶子记的是脱敏版（hook 换了消息，连 nonce 一起换掉了），边界握着的是
 // 闭包里改写**之前**那条；按指针查——不是同一条；按 nonce 查历史——nonce 已经没了。

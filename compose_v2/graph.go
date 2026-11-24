@@ -47,16 +47,11 @@ type NodeFunc func(ctx context.Context, chs Channels) ([]ChannelWrite, error)
 // （要 HITL 请在 node 内抛 InterruptError，后接 cond 读 channel 路由——见 [evalOutEdges]
 // 的 cond 分支）。cond 报错时的 Resume 语义由 CondFailPolicy 决定（业务经 WithCondFailPolicy 声明）。
 //
-// **ctx 只用来透传、不做控制流判断**：cond 收 ctx 是为了签名统一 + 传给 observability，
-// **不该**在里面读 ctx.Err() 并据此返回错误。cond 是纯判断、不做 IO，本就产不出 ctx 错；
-// 取消由引擎在**超步边界统一拦截**（graphLoop 循环顶查 ctx.Err），轮不到 cond 参与。
-//
-// 真这么写的后果自负：它跟任何业务错一样走 CondFailPolicy，默认档 CondFailAbort 判
-// **终局失败**（wrap ErrRunAborted → Run 出口主动清 cp 子树）。想要"报错后能 Resume"
-// 直接声明 CondFailRerunFrom——policy 已覆盖这个需求，框架不为违反本契约的写法另开豁免。
+// 条件边应只根据 channel 判断。调用方取消、软取消和引擎控制错误沿原错误链传播，
+// 留下可续的进度。普通业务错误按声明的 CondFailPolicy 处理。
 type EdgeCondition func(ctx context.Context, chs Channels) (NodeID, error)
 
-// CondFailPolicy 定义 cond fn **报错**（业务错 / ctx.Err / panic-转-error）时的 Resume 语义。
+// CondFailPolicy 定义 cond fn **报错**（业务错误或 panic 转成的错误）时的 Resume 语义。
 //
 // **为什么需要业务来选**：cond 是纯判断，它报错只可能是「判断的前提不成立」——上游 node
 // 产出的数据缺失或非法。该重试还是该放弃，取决于**上游 node 是不是确定性的**，而这只有
@@ -65,7 +60,7 @@ type EdgeCondition func(ctx context.Context, chs Channels) (NodeID, error)
 type CondFailPolicy int
 
 const (
-	// CondFailAbort（**默认**）：cond 报错 = 终局失败。wrap `ErrRunAborted` → Run 出口
+	// CondFailAbort（**默认**）：cond 的业务错误 = 终局失败。wrap `ErrRunAborted` → Run 出口
 	// defer 据此**主动 DeleteSubtree 清 cp 子树** → 业务只能修完问题重新跑。
 	//
 	// **为什么是「主动删」而不是「跳过写」**：cp 是 (sid, ns) **单槽覆盖式**，跳过写只是

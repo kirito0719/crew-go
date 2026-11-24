@@ -640,6 +640,20 @@ InterruptError 死循环**。当时记的长期修法是「Replan 路径主动 c
 **没走那条**——走的是把非寻址型负载拆去独立通道（`WithResumeUserText`，见 §4.4），
 假 key 整个不再需要，冲突的前提消失。
 
+### 5.5 PlanAgent 的规划审批
+
+`Planner` 返回无法派发的步骤（例如成员未注册），或 `NewLLMPlanner` 拒收格式错误的模型答复后，续跑会重新规划。即使调用方再次提交上次的批准，新决策也会获得自己的问题 ID。若决定已经提交，worker 失败后重试会沿用这一步的决定。[重新规划回归](../../agent_v2/decision_retry_identity_test.go)
+
+自定义 `Planner` 在 `Ask` 处挂起时，续跑会从规划函数开头重新执行。`Ask` 按执行位置寻址。如果提问前会重新生成候选，可以先保存候选供续跑复用，或把问题绑定到审批对象。下例只审批成员选择。若审批还取决于金额、版本等参数，稳定标识也应包含这些值。
+
+```go
+member := steps[0].SubAgentName
+askCtx := compose_v2.WithResumeAnswerScope(ctx, member)
+answer, err := compose_v2.Ask(askCtx, &compose_v2.AskQuery{Question: "是否交给 " + member + "？"})
+```
+
+同一成员在同一提问位置可收到原答复。候选成员改变后，调用方会收到新问题，再按其 ID 作答。[成员审批回归](../../agent_v2/planner_answer_scope_test.go)
+
 ---
 
 ## 6. 多 tool_call 部分中断处理
@@ -857,6 +871,10 @@ hack 才能实现的"仅重跑失败/中断分支"，v2 是引擎默认行为。
 - ✨ `cm.PendingInterrupts()` getter 返深拷贝防 caller mutate（R9 C4 修）；**Snapshot 写 cp 是浅拷贝**（make+copy 新 slice 装同 `*AskQuery` 指针，mutate 元素 struct 仍回污染 cm——实证 serialization.go:327-328，与 §2.3 / channel-engine.md §7.6 一致）
 
 ---
+
+经 `RunSubAgent` 或编排成员直接续完某个子图后，父图仍可恢复。父图会拿回子图实际返回的事件，最终的任务提交信号仍由父图决定。重复递交原答案也只执行一次该子调用。旧档升级和结果写回失败的处理见[子调用存档](checkpoint.md#独立完成的子调用)。
+
+自定义模型返回的工具调用 ID 必须是有效 UTF-8。模型结果或 `OnModelEnd` 改写后的结果含非法字节时，整批调用在派发前终止。空 ID、合法替换字符 `�` 和多字节 ID 均可按原规则恢复。[工具 ID 回归](../../agent_v2/tool_call_id_encoding_test.go)
 
 ## 8. 嵌套子图 ResumeContext 隔离 opt-in
 

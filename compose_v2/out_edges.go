@@ -60,7 +60,7 @@ func evalOutEdges(ctx context.Context, g *Graph, from NodeID, chs Channels, ph c
 		// reducer panic 变成整批提交失败是同一档处置——两边都不留半应用状态。
 		t, err := safeCondRun(ph.forEdge(ctx, i), e.cond, chs, from)
 		if err != nil {
-			return nil, wrapCondFailure(from, e.condFailPolicy, err)
+			return nil, wrapCondFailure(ctx, from, e.condFailPolicy, err)
 		}
 		if t == "" {
 			targets = append(targets, EndNode) // 空字符串 = 路由到 EndNode
@@ -282,7 +282,7 @@ func walkErrTree(err error, visit func(error)) {
 
 // wrapCondFailure 按声明的策略给 cond 的失败定性——**只决定「返什么错」**，
 // 「谁重跑」由调用方把它当成成员失败之后交给既有的部分失败机件。
-func wrapCondFailure(from NodeID, policy CondFailPolicy, err error) error {
+func wrapCondFailure(ctx context.Context, from NodeID, policy CondFailPolicy, err error) error {
 	// **cond 禁止 interrupt**：中断的本质是要新输入；cond 需要新输入才能判断，说明判断
 	// 所需的信息还没备齐——那是**上游 node 没尽责**。让 cond 中断还自相矛盾：cond 是纯
 	// 判断，Resume 后要重新执行，用户答案只能从 channel 读——绕一圈还是得让上游备好。
@@ -298,6 +298,13 @@ func wrapCondFailure(from NodeID, policy CondFailPolicy, err error) error {
 				"  · HITL 请改在 **node 内**抛 InterruptError（node 内 writes 未提交，重跑自洽），后接 cond 读 channel 路由\n"+
 				"  · RoutingAgent 场景直接用 WithRoutingClassifier / WithRouter —— 两者都在 classify node 内跑，原生支持 HITL",
 			ErrRunAborted, from, ie.Reason)
+	}
+	// 调用方取消、软取消或存档准入失败均沿原控制流退出。条件策略只处理判断本身的失败。
+	if MustPropagate(ctx, err) {
+		if stop := ctx.Err(); stop != nil && !errors.Is(err, stop) {
+			err = errors.Join(err, stop)
+		}
+		return fmt.Errorf("condition from %q: %w", from, err)
 	}
 	// cond 是**纯判断**，故它报错只可能是「判断的前提不成立」= 上游产出的数据缺失/非法。
 	// 该重试还是该放弃，取决于**上游是不是确定性的**——纯计算上游重跑必拿同样的坏数据；

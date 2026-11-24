@@ -51,17 +51,8 @@ type StreamableTool interface {
 	StreamCall(ctx context.Context, arguments map[string]any) (*schema.StreamReader[*Result], error)
 }
 
-// Categorizer 是可选接口, 业务自定义 tool 实现它声明 trace 上的细分类型.
-//
-// **trace 后端对照** (业务自标 category attr):
-//   - langfuse: `langfuse.observation.type=retriever` attr 业务自标
-//
-// 我们 Go 项目用可选接口风格 (Go-idiomatic): 业务自定义 tool 实现 Categorizer 后,
-// framework 在 OnToolStart fire 之前自动透传 category 让 observability hook 创对应
-// span kind (retrieval / embedding / guardrail), 监控 UI 按类型渲染
-// 不同图标 / 颜色 / 过滤维度.
-//
-// **未实现 Categorizer 的 tool 默认 tool kind** — 向后兼容, 业务现有 tool 0 改动.
+// Categorizer 让工具声明观测类别。BasicAgent 根据本图实际绑定的工具填写开始钩子的
+// category 属性。观测层将 retrieval、embedding 和 guardrail 记入 crew.tool.category。
 //
 // **典型业务场景** (BasicAgent + RAG tool LLM-driven 路径):
 //
@@ -360,19 +351,26 @@ func (tk *Toolkit) Call(ctx context.Context, name string, arguments map[string]a
 }
 
 // StreamCall 按名称以流式方式调用工具。
-// 若工具未实现 StreamableTool，回退到 Call 并包装为单 chunk StreamReader。
+// 同步工具的结果包装为单块流。工具既未报告错误也未交付结果或流时返回错误。
 func (tk *Toolkit) StreamCall(ctx context.Context, name string, arguments map[string]any) (*schema.StreamReader[*Result], error) {
 	t := tk.Get(name)
 	if t == nil {
 		return nil, fmt.Errorf("toolkit: tool %q not found", name)
 	}
 	if st, ok := t.(StreamableTool); ok {
-		return st.StreamCall(ctx, arguments)
+		stream, err := st.StreamCall(ctx, arguments)
+		if err == nil && stream == nil {
+			return nil, fmt.Errorf("toolkit: tool %q returned a nil stream", name)
+		}
+		return stream, err
 	}
 	// 降级：执行同步调用，包装为单 chunk 流
 	result, err := t.Call(ctx, arguments)
 	if err != nil {
 		return nil, err
+	}
+	if result == nil {
+		return nil, fmt.Errorf("toolkit: tool %q returned a nil result", name)
 	}
 	return schema.NewSingleChunkReader(result), nil
 }

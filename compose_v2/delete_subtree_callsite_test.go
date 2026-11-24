@@ -49,6 +49,7 @@ type callSiteNote struct {
 
 // knownDeleteSubtreeCallSites 登记到**包 + receiver + 函数**粒度，值带条数。
 var knownDeleteSubtreeCallSites = map[string]callSiteNote{
+	"compose_v2/nested_completion.go:(*nestedTransfer).transfer":                    {1, "领取子结果时，父节点先保留回执，再按实际存储分区和世代删该子树。删除失败可由本次父调用重试，同分区还有父图收尾"},
 	"compose_v2/durability.go:deleteCpSubtree":                                      {1, "Run 出口——嵌套 Run 有祖先；根 Run 空前缀多数 backend 原子"},
 	"agent_v2/resume_helpers.go:commonResumePrep":                                   {1, "Abort——顶层空前缀；嵌套 Abort 无更外层清理者，残留留着"},
 	"agent_v2/history_slot.go:abandonTasksAtEntry":                                  {1, "WithAbandonedTasks 放弃旧任务，持有放弃许可并以空前缀删整个旧任务"},
