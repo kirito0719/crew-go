@@ -647,3 +647,48 @@ func TestDirectChildCompletionLateSelectedPartition(t *testing.T) {
 		})
 	}
 }
+
+func TestDirectChildCompletionCheckpointEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cp := compose_v2.NewInMemoryCheckpointer()
+	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+	child := mkEchoGraph(t, "receiptEvents", func(ctx context.Context, _ *schema.Message) (*schema.Message, error) {
+		return compose_v2.Ask(ctx, &compose_v2.AskQuery{Question: "确认提交？"})
+	})
+	parent := mkEchoGraph(t, "receiveEvents", func(ctx context.Context, in *schema.Message) (*schema.Message, error) {
+		events, err := agent_v2.RunSubAgent(ctx, "child", child, in)
+		return agent_v2.FinalMessage(events), err
+	})
+	sess := agent_v2.NewRunSession()
+	_, err := parent.Run(ctx, sess, schema.UserMessage("工单"))
+	qid := partitionQuestionID(t, err)
+	ns := directPendingNS(t, ctx, cp, sess.RunID, "child#")
+	log := &eventLog{}
+	ctx = agent_v2.WithCtxOrchHooks(compose_v2.WithEmitCpEventCtx(ctx, true), log)
+	answer := agent_v2.WithResumeUserInputs(map[string]*schema.Message{qid: schema.UserMessage("同意")})
+	if _, err := child.Resume(compose_v2.WithGraphNS(ctx, ns), sess.RunID, answer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parent.Resume(ctx, sess.RunID); err != nil {
+		t.Fatal(err)
+	}
+	var got []compose_v2.CpOperationType
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for _, event := range log.events {
+		action, _ := event.Metadata["action"].(*compose_v2.CpAction)
+		if action == nil {
+			continue
+		}
+		if a := action.Save; a != nil && a.SessionID == sess.RunID && a.NS == ns && a.Ok && a.ChannelsCount == 0 && a.PendingInterruptsCount == 0 {
+			got = append(got, action.Type)
+		}
+		if a := action.Cleanup; a != nil && a.SessionID == sess.RunID && a.NS == ns && a.Ok && a.Reason == "success" && a.DeletedCount == 1 {
+			got = append(got, action.Type)
+		}
+	}
+	if !slices.Equal(got, []compose_v2.CpOperationType{compose_v2.CpOperationSave, compose_v2.CpOperationCleanup}) {
+		t.Fatalf("子图完成回执应先报告落盘、后报告父图接管时的清理，实际 %v", got)
+	}
+}

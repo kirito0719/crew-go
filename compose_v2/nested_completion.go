@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // NestedCaller 记录嵌套 agent 的原调用位置和任务提交域。独立续跑子图时沿用这份归属，
@@ -138,28 +139,35 @@ func (m *nestedTransfer) transfer(outer, selected context.Context, partition Che
 		}
 	}
 	if current != nil {
-		slots, err := loadCheckpointSubtree(selected, partition, sid, ns)
+		start := time.Now()
+		n, err := deleteTransferredResult(selected, partition, sid, ns, source)
+		EmitCpCleanupHelper(selected, sid, ns, "success", n, time.Since(start).Milliseconds(), err)
 		if err != nil {
-			return err
-		}
-		matched := false
-		for _, slot := range slots {
-			if slot.NS == ns {
-				matched = sameStoredCheckpoint(source, slot.Checkpoint)
-			}
-			if checkpointRequiresTaskOwnership(slot.Checkpoint) && slot.Checkpoint.TaskID != source.TaskID {
-				return RejectCheckpointIdentity(slot.Checkpoint, "nested result subtree belongs to a different task")
-			}
-		}
-		if !matched {
-			return ErrCheckpointStale
-		}
-		if _, err := partition.DeleteSubtree(selected, sid, ns, CheckpointDeleteCondition{Expected: slots}); err != nil {
 			return fmt.Errorf("clear transferred nested result %q: %w", ns, err)
 		}
 	}
 	m.Cleared = true
 	return SaveStepResult(outer, key, *m)
+}
+
+func deleteTransferredResult(ctx context.Context, partition Checkpointer, sid, ns string, source *Checkpoint) (int32, error) {
+	slots, err := loadCheckpointSubtree(ctx, partition, sid, ns)
+	if err != nil {
+		return 0, err
+	}
+	matched := false
+	for _, slot := range slots {
+		if slot.NS == ns {
+			matched = sameStoredCheckpoint(source, slot.Checkpoint)
+		}
+		if checkpointRequiresTaskOwnership(slot.Checkpoint) && slot.Checkpoint.TaskID != source.TaskID {
+			return 0, RejectCheckpointIdentity(slot.Checkpoint, "nested result subtree belongs to a different task")
+		}
+	}
+	if !matched {
+		return 0, ErrCheckpointStale
+	}
+	return partition.DeleteSubtree(ctx, sid, ns, CheckpointDeleteCondition{Expected: slots})
 }
 
 // RestoreNestedCaller 为从子槽直接发起的 Resume 恢复原任务提交范围与信号接收者。
@@ -203,7 +211,11 @@ func (h *NestedCompletion) Complete(events any) error {
 func (h *NestedCompletion) awaitAgentResult(ctx context.Context, cfg *runOptions, cm *ChannelManager, graphID string) {
 	epoch := cm.CpEpochBaseline()
 	h.save = func(result json.RawMessage) error {
-		return exitStorageOp(ctx, exitOpWrite, "save nested result", func(c context.Context) error {
+		caller := h.caller
+		caller.Result = result
+		cp := &Checkpoint{Status: CPStatusCompleted, SchemaVer: CheckpointSchemaVer, GraphID: graphID, Caller: &caller}
+		start := time.Now()
+		err := exitStorageOp(ctx, exitOpWrite, "save nested result", func(c context.Context) error {
 			if err := CheckCheckpointTaskLease(c); err != nil {
 				return err
 			}
@@ -214,11 +226,12 @@ func (h *NestedCompletion) awaitAgentResult(ctx context.Context, cfg *runOptions
 			if current == nil || current.Status != CPStatusResuming || current.Epoch != epoch || current.GraphID != graphID || current.TaskID != cm.TaskID() {
 				return ErrCheckpointStale
 			}
-			caller := h.caller
-			caller.Result = result
-			cp := &Checkpoint{Status: CPStatusCompleted, SchemaVer: CheckpointSchemaVer, GraphID: graphID, Caller: &caller, ConsumedAnswers: cm.consumedAnswersSnapshot(), Signals: h.signals.drain()}
-			_, err = writeCp(c, cfg, cm, cp)
+			cp.ConsumedAnswers = cm.consumedAnswersSnapshot()
+			cp.Signals = h.signals.drain()
+			start, err = writeCp(c, cfg, cm, cp)
 			return err
 		})
+		emitCpSaveEvent(ctx, cfg, cp, start, err)
+		return err
 	}
 }
