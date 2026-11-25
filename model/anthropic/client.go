@@ -132,6 +132,8 @@ type Client struct {
 
 	// sdkOptions 只在构造期收集（WithBaseURL 等），NewClient 用完即清空。
 	sdkOptions []option.RequestOption
+	// customSDKOptions 表示调用方交给 SDK 的选项可在请求组装后改写消息。
+	customSDKOptions bool
 }
 
 var (
@@ -189,9 +191,12 @@ func WithHTTPClient(hc *http.Client) ClientOption {
 }
 
 // WithRequestOptions 透传 SDK 的请求选项，排在本包默认选项之后，同一项以这里为准（例如
-// option.WithMaxRetries(2) 打开 SDK 自己的重试）。
+// option.WithMaxRetries(2) 打开 SDK 自己的重试）。使用透传选项时，ReactiveCompact 根据本地消息视图裁剪。
 func WithRequestOptions(opts ...option.RequestOption) ClientOption {
-	return func(c *Client) { c.sdkOptions = append(c.sdkOptions, opts...) }
+	return func(c *Client) {
+		c.sdkOptions = append(c.sdkOptions, opts...)
+		c.customSDKOptions = c.customSDKOptions || len(opts) > 0
+	}
 }
 
 // WithMaxTokens 设默认的 max_tokens（不设时 [DefaultMaxTokens]），按次用 model.WithMaxTokens 覆盖。
@@ -339,14 +344,15 @@ func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts 
 	reqOpts := append(req.options(), option.WithRequestTimeout(c.attemptTimeout(req.params.MaxTokens)))
 	resp, err := c.sdk.Beta.Messages.New(ctx, req.params, reqOpts...)
 	if err != nil {
-		return nil, c.requestError(err)
+		return nil, model.WithCompactedHistoryStart(c.requestError(err), req.compactedStart)
 	}
 	if resp == nil {
 		return nil, &model.APIError{Provider: ProviderName, Err: errors.New("empty response")}
 	}
 	turn, err := c.interpret(ctx, resp, nil)
 	if err != nil {
-		return nil, model.WithFailureUsage(err, usageOf(resp.Usage), ProviderName, string(resp.Model))
+		err = model.WithFailureUsage(err, usageOf(resp.Usage), ProviderName, string(resp.Model))
+		return nil, model.WithCompactedHistoryStart(err, req.compactedStart)
 	}
 	return &schema.Message{
 		Role:             schema.RoleAssistant,
@@ -384,10 +390,10 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 	if err := stream.Err(); err != nil {
 		_ = stream.Close() // 请求已失败，关闭的错误没有下文
 		cancel()
-		return nil, c.requestError(err)
+		return nil, model.WithCompactedHistoryStart(c.requestError(err), req.compactedStart)
 	}
 	sr, send := schema.NewStreamReader[*schema.Message](8)
-	go c.consumeStream(ctx, cancel, stream, sr, send)
+	go c.consumeStream(ctx, cancel, stream, sr, send, req.compactedStart)
 	return sr, nil
 }
 

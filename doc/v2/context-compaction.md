@@ -402,7 +402,9 @@ AutoCompact 没拦住的兜底路径。
 5. 达到 MaxAttempts → 报错给 caller，不再重试
 ```
 
-> 本轮已应用的 AutoCompact 摘要继续随输入保留。ReactiveCompact 在当前视图上删最旧的可裁剪消息组，或在没有可删组时缩短过长的工具结果。失败重试期间沿用已有摘要。
+> 本轮已应用的 AutoCompact 摘要继续随输入保留。ReactiveCompact 在当前视图上删最旧的可裁剪消息组，或在没有可删组时缩短过长的工具结果。没有腾出空间时返回超窗错误。
+
+Claude 启用原生压缩时，失败请求可提供实际送出的摘要起点。ReactiveCompact 从该消息开始计算可裁轮次，保留摘要及其工具配对，把新生成的转存索引放在摘要轮后。摘要之前的消息仍随逻辑输入传给模型适配器，便于回退候选使用。见 [Claude 送模契约](model-adaptation.md#54-跟-crew-go-其他功能的冲突)。
 
 ### 「删最旧消息组」抢救算法
 
@@ -431,14 +433,13 @@ AutoCompact 没拦住的兜底路径。
    - `MicroCompactOffloadedAnnotation` (offload 占位符——删了 offload key 丢失无法重读)
    - `MicroCompactClearedAnnotation` (MicroCompact 清除标记——删了 cleared marker 链破坏)
    删任一 marker 组都破坏跨层契约 (4 层一致防护否则 silent bug)
-4. **全保护时不删返原 messages** (R21 audit HIGH-2 fix) — 让 callLLM retry 走外层
-   失败路径, 避免破坏 SkillBody 配对协议. **不要兜底丢最旧组**
+4. 没有可删组时，尝试在原位置缩短过长的工具结果，保留配对 ID。
 5. 用 caller（`ReactiveCompactRun`）经 `ParsePromptTooLongGap(callErr)` 解析出的 gap 入参决定删几组（本函数只收 `gap int`，自己不解析）
    有 gap：从最旧 droppable 组累加 token 直到 >= gap，删那么多组
    无 gap：删 `len(droppableIdx) * EmergencyDropPercent / 100` 组（默认 20%，至少 1）
 6. 永远保留至少 1 个 droppable 组（dropCount = len-1 兜底）
-7. 删后首条若是 assistant，前面补 user marker（默认 "[continued after context overflow]"，
-   `UserMarker` 配置）——API 要求 user-first
+7. 常规窗口删后首条非 system 消息若是 assistant，前面补 user marker（默认 "[continued after context overflow]"，
+   `UserMarker` 配置）。原生摘要窗口以摘要开头。
 8. 把 system 消息拼回最前
 ```
 

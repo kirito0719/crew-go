@@ -1,10 +1,12 @@
 package agent_v2
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"crew-go/compose_v2"
+	"crew-go/model"
 	"crew-go/schema"
 )
 
@@ -66,7 +68,7 @@ func TestEmergencyDrop_ShrinksWhenNothingDroppable(t *testing.T) {
 
 func assertShrunkNotDropped(t *testing.T, in []*schema.Message) {
 	t.Helper()
-	out := emergencyDropOldestGroups(in, 50, 5000, "[MARKER]")
+	out := emergencyDropOldestGroups(in, 50, 5000, "[MARKER]", false)
 
 	if len(out) != len(in) {
 		t.Errorf("条数变了（%d → %d）——就地挖空不该增删消息，那会破坏配对", len(in), len(out))
@@ -104,7 +106,7 @@ func TestEmergencyDrop_NoOversizedStillReturnsOriginal(t *testing.T) {
 	mem := schema.SystemMessage("记忆")
 	mem.Annotations = map[string]any{StoreInjectedAnnotation: true}
 	in := []*schema.Message{schema.SystemMessage("前导"), mem, schema.UserMessage("短")}
-	out := emergencyDropOldestGroups(in, 50, 5000, "[MARKER]")
+	out := emergencyDropOldestGroups(in, 50, 5000, "[MARKER]", false)
 	if compose_v2.EstimateMessageTokens(out) != compose_v2.EstimateMessageTokens(in) {
 		t.Errorf("没有超大单条却动了它——那时该返原样让业务拿到精准信号")
 	}
@@ -133,7 +135,7 @@ func TestEmergencyShrink_OnlyToolResults(t *testing.T) {
 	bigTool.Annotations = map[string]any{SkillBodyAnnotation: true}
 	in := []*schema.Message{bigSys, bigUser, bigTool}
 
-	out := emergencyDropOldestGroups(in, 50, 500, "[M]")
+	out := emergencyDropOldestGroups(in, 50, 500, "[M]", false)
 
 	if len(out) != 3 {
 		t.Fatalf("条数变了：%d", len(out))
@@ -161,7 +163,7 @@ func TestEmergencyShrink_DoesNotLeakIntoOriginal(t *testing.T) {
 	bigTool.Annotations = map[string]any{SkillBodyAnnotation: true}
 	in := []*schema.Message{schema.UserMessage("u"), bigTool}
 
-	out := emergencyDropOldestGroups(in, 50, 500, "[M]")
+	out := emergencyDropOldestGroups(in, 50, 500, "[M]", false)
 	last := out[len(out)-1]
 	if last.Annotations == nil {
 		t.Fatal("前提没搭对：挖空后 annotation 整个没了，marker 保护会失效")
@@ -187,7 +189,7 @@ func TestEmergencyDrop_AllSystemGivesUp(t *testing.T) {
 	mem.Annotations = map[string]any{StoreInjectedAnnotation: true}
 	in := []*schema.Message{schema.SystemMessage("前导"), mem}
 
-	out := emergencyDropOldestGroups(in, 50, 5000, "[MARKER]")
+	out := emergencyDropOldestGroups(in, 50, 5000, "[MARKER]", false)
 
 	if len(out) != len(in) {
 		t.Fatalf("条数变了（%d → %d）——这条路上什么都不该动", len(in), len(out))
@@ -198,5 +200,25 @@ func TestEmergencyDrop_AllSystemGivesUp(t *testing.T) {
 	}
 	if len(out[1].Content) != len(in[1].Content) {
 		t.Errorf("system 正文被改写了：%d → %d 字节", len(in[1].Content), len(out[1].Content))
+	}
+}
+
+func TestReactiveCompact_KeepsSpillIndexInsideProviderWindow(t *testing.T) {
+	prefix := schema.UserMessage("服务端摘要已覆盖的消息")
+	anchor := schema.AssistantMessage("服务端摘要")
+	old := schema.UserMessage(strings.Repeat("可裁旧轮 ", 1000))
+	const entry = `- id="sp_ab123" tool=lookup`
+	old.Annotations = map[string]any{spillIndexAnnotation: entry}
+	latest := schema.UserMessage("当前输入")
+	messages := []*schema.Message{prefix, anchor, old, latest}
+	callErr := model.WithCompactedHistoryStart(errors.New("input is too long"), anchor)
+	out, err := ReactiveCompactRun(t.Context(), &ReactiveCompactConfig{Enabled: true}, messages, callErr)
+	if err != nil || len(out) != 4 {
+		t.Fatalf("应在保留历史前缀时将旧轮替换成转存索引，实际 %v，错误 %v", out, err)
+	}
+	if out[0] != prefix || out[1] != anchor || out[3] != latest || out[2] == old ||
+		out[2].Role != schema.RoleUser || out[2].Annotations[spillIndexAnnotation] != entry ||
+		!strings.Contains(out[2].Content, "sp_ab123") || !strings.Contains(out[2].Content, ReadToolOutputToolName) {
+		t.Fatalf("摘要之后应留下模型可读取的转存索引，实际 %v", out)
 	}
 }

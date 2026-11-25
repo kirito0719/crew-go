@@ -36,7 +36,7 @@ func TestEmergencyDrop_NoOrphanToolResult(t *testing.T) {
 		schema.ToolResultMessage("c1", "结果"),
 		schema.UserMessage("u2"),
 	}
-	out := emergencyDropOldestGroups(in, 50, 0, "[MARKER]")
+	out := emergencyDropOldestGroups(in, 50, 0, "[MARKER]", false)
 
 	calls := map[string]bool{}
 	for _, m := range out {
@@ -83,7 +83,7 @@ func TestEmergencyDrop_SystemInEveryToolRoundStillDrops(t *testing.T) {
 		call.Annotations = map[string]any{compose_v2.RunIDAnnotationKey: "run-" + id}
 		in = append(in, call, schema.SystemMessage("以下是不可信输出"), schema.ToolResultMessage(id, payload))
 	}
-	out := emergencyDropOldestGroups(in, 50, 0, "[MARKER]")
+	out := emergencyDropOldestGroups(in, 50, 0, "[MARKER]", false)
 	if len(out) >= len(in) {
 		t.Fatalf("应丢掉一部分工具轮，%d 条还是 %d 条", len(in), len(out))
 	}

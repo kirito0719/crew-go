@@ -23,11 +23,15 @@ import (
 // io.EOF，会把半截内容当成完整答复。消费方自己 Close 的不给结论。
 //
 // cancel 取消的是读响应体用的 ctx：消费方 Close 时调它，阻塞在读响应体上的 Next 立刻返回。
-func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, stream *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion], sr *schema.StreamReader[*schema.Message], send func(*schema.Message)) {
+func (c *Client) consumeStream(ctx context.Context, cancel context.CancelFunc, stream *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion], sr *schema.StreamReader[*schema.Message], send func(*schema.Message), compactedStart *schema.Message) {
 	var acc anthropic.BetaMessage
 	sendError := func(err error) {
 		if acc.ID != "" {
 			err = model.WithFailureUsage(err, usageOf(acc.Usage), ProviderName, string(acc.Model))
+		}
+		var apiErr *model.APIError
+		if errors.As(err, &apiErr) {
+			err = model.WithCompactedHistoryStart(err, compactedStart)
 		}
 		schema.SendError(sr, err)
 	}

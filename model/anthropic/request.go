@@ -23,8 +23,9 @@ import (
 
 // wireRequest 是公共请求投影。配置 ExtraBody 时 body 保存合并后的请求体。
 type wireRequest struct {
-	params anthropic.BetaMessageNewParams
-	body   []byte
+	params         anthropic.BetaMessageNewParams
+	body           []byte
+	compactedStart *schema.Message
 }
 
 func (r *wireRequest) options() []option.RequestOption {
@@ -48,12 +49,9 @@ func (c *Client) buildRequest(ctx context.Context, messages []*schema.Message, o
 		maxTokens = int64(*o.MaxTokens)
 	}
 
-	system, msgs, err := convertMessages(ctx, messages)
+	system, msgs, compactedStart, err := convertMessages(ctx, messages, c.compaction != nil)
 	if err != nil {
 		return nil, err
-	}
-	if c.compaction != nil {
-		msgs = replayCompactedMessages(msgs)
 	}
 	params := anthropic.BetaMessageNewParams{
 		Model:     anthropic.Model(modelName),
@@ -161,7 +159,7 @@ func (c *Client) buildRequest(ctx context.Context, messages []*schema.Message, o
 	}
 	params.Betas = dedupeBetas(append(betas, c.betas...))
 
-	req := &wireRequest{params: params}
+	req := &wireRequest{params: params, compactedStart: compactedStart}
 	if len(c.extraBody) > 0 || len(o.ExtraBody) > 0 {
 		body, err := json.Marshal(params)
 		if err != nil {
@@ -173,35 +171,34 @@ func (c *Client) buildRequest(ctx context.Context, messages []*schema.Message, o
 		}
 		req.body = body
 	}
+	// 只有适配器能确定 messages 来源时，才能报告失败请求所用的摘要起点。
+	_, defaultOverride := c.extraBody["messages"]
+	_, callOverride := o.ExtraBody["messages"]
+	if defaultOverride || callOverride || c.customSDKOptions {
+		req.compactedStart = nil
+	}
 	return req, nil
 }
 
-// replayCompactedMessages 在已转换的请求中找到最近一个有效摘要。只裁切本次请求，保留原消息和回放快照。
-func replayCompactedMessages(messages []anthropic.BetaMessageParam) []anthropic.BetaMessageParam {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role != anthropic.BetaMessageParamRoleAssistant {
+// lastCompactionBlock 返回已转换的单条 assistant 消息里最近一次有效摘要的位置。
+func lastCompactionBlock(blocks []anthropic.BetaContentBlockParamUnion) int {
+	for i := len(blocks) - 1; i >= 0; i-- {
+		// compaction 由 assistant 回放快照以原始 JSON 生成。
+		value, _ := blocks[i].Overrides()
+		raw, ok := value.(json.RawMessage)
+		if !ok {
 			continue
 		}
-		blocks := messages[i].Content
-		for j := len(blocks) - 1; j >= 0; j-- {
-			// compaction 由 assistant 回放快照以原始 JSON 生成。
-			value, _ := blocks[j].Overrides()
-			raw, ok := value.(json.RawMessage)
-			if !ok {
-				continue
-			}
-			var block struct {
-				Type    string `json:"type"`
-				Content string `json:"content"`
-			}
-			// 失败的压缩块 content 为 null，不能覆盖更早的有效摘要或对话。
-			if json.Unmarshal(raw, &block) == nil && block.Type == "compaction" && block.Content != "" {
-				messages[i].Content = blocks[j:]
-				return messages[i:]
-			}
+		var block struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		}
+		// 失败的摘要 content 为 null，继续沿用此前的窗口。
+		if json.Unmarshal(raw, &block) == nil && block.Type == "compaction" && block.Content != "" {
+			return i
 		}
 	}
-	return messages
+	return -1
 }
 
 // convertMessages 把消息列表拆成顶层 system 与 messages。
@@ -215,7 +212,7 @@ func replayCompactedMessages(messages []anthropic.BetaMessageParam) []anthropic.
 //     排在最前（API 要求 tool_result 紧跟 tool_use），其余内容按原序排在后面。
 //
 // 内容为空的消息跳过：API 不接受空的 content。
-func convertMessages(ctx context.Context, in []*schema.Message) ([]anthropic.BetaTextBlockParam, []anthropic.BetaMessageParam, error) {
+func convertMessages(ctx context.Context, in []*schema.Message, useCompaction bool) ([]anthropic.BetaTextBlockParam, []anthropic.BetaMessageParam, *schema.Message, error) {
 	var system []anthropic.BetaTextBlockParam
 	i := 0
 	for ; i < len(in); i++ {
@@ -232,6 +229,7 @@ func convertMessages(ctx context.Context, in []*schema.Message) ([]anthropic.Bet
 	}
 
 	var out []anthropic.BetaMessageParam
+	var compactedStart *schema.Message
 	for ; i < len(in); i++ {
 		m := in[i]
 		if m == nil {
@@ -239,10 +237,17 @@ func convertMessages(ctx context.Context, in []*schema.Message) ([]anthropic.Bet
 		}
 		role, blocks, err := convertMessage(ctx, m)
 		if err != nil {
-			return nil, nil, fmt.Errorf("anthropic: message %d (%s): %w", i, m.Role, err)
+			return nil, nil, nil, fmt.Errorf("anthropic: message %d (%s): %w", i, m.Role, err)
 		}
 		if len(blocks) == 0 {
 			continue
+		}
+		if useCompaction && role == anthropic.BetaMessageParamRoleAssistant {
+			if block := lastCompactionBlock(blocks); block >= 0 {
+				blocks = blocks[block:]
+				out = nil
+				compactedStart = m
+			}
 		}
 		if n := len(out); n > 0 && out[n-1].Role == role {
 			out[n-1].Content = append(out[n-1].Content, blocks...)
@@ -255,7 +260,7 @@ func convertMessages(ctx context.Context, in []*schema.Message) ([]anthropic.Bet
 			out[k].Content = toolResultsFirst(out[k].Content)
 		}
 	}
-	return system, out, nil
+	return system, out, compactedStart, nil
 }
 
 // convertMessage 转一条非前言的消息，返回它在 API 里的角色与内容块。

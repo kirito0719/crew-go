@@ -16,7 +16,9 @@ Q13 子项以 `7fc5abf` 为基线。用实际父子 GraphAgent 模拟历史写�
 
 ## 2026-11-25 Claude 压缩回放与输入计数
 
-**Q08 的服务端压缩子项。** HTTP 桩提供两个有效摘要和一个后续空摘要。旧请求发送七条消息。修复后从最近的有效摘要发出四条，保持顶层 system、摘要后签名及同批工具结果。本地 HTTP 回归还核对了流式返回、存档 JSON 往返、编辑选项和缓存 TTL。ReactiveCompact 的本地裁剪策略仍沿用原消息流。 [压缩回归](../../model/anthropic/compaction_test.go) · [官方回放约定](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#passing-compaction-blocks-back)
+**Q08 的服务端压缩子项。** HTTP 桩提供两个有效摘要和一个后续空摘要。旧请求发送七条消息。修复后从最近的有效摘要发出四条，保持顶层 system、摘要后签名及同批工具结果。本地 HTTP 回归还核对了流式返回、存档 JSON 往返、编辑选项和缓存 TTL。[压缩回归](../../model/anthropic/compaction_test.go) · [官方回放约定](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#passing-compaction-blocks-back)
+
+以 `6d34025` 为基线，HTTP 400 与 SSE 超窗回归都复现了一次无效重试，裁掉的历史位于摘要之前。修复后两条路径各发送两次请求并获得最终答复，摘要、签名、工具结果和 system 均可从请求体核对。摘要后已无可裁轮次时只发送一次。转存索引和原始 API 错误有定向回归。另复现 `ExtraBody` 或 SDK 选项改写消息时的摘要校验，使用 SDK 透传选项的调用沿用通用裁剪。 [超窗端到端回归](../../model/anthropic/reactive_window_test.go)
 
 **A15 的本地计数对照。** 计数请求验证恢复后的隐藏 thinking 签名、工具大整数、按次选项及限流错误，与生成请求的输入投影一致。带凭据的对照用例已可编译，服务端计数和实际计费用量仍待验收。 [HTTP 回归](../../model/anthropic/token_count_test.go) · [真模型对照](../../example/model/anthropic_smoke/anthropic_smoke_test.go)
 

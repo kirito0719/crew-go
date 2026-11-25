@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"crew-go/compose_v2"
+	"crew-go/model"
 	"crew-go/schema"
 )
 
@@ -21,17 +23,9 @@ import (
 //
 // 触发：BasicAgent makeModelFn 内 callLLM retry 循环包围 streamOrGenerate 单次
 // 调用，捕获 prompt-too-long 错误（IsPromptTooLongError 判定 11 条精确字符串）。
-// 算法（emergencyDropOldestGroups 实际 8 步）：
-//   1) 隔离前导 system 消息（永不删）
-//   2) GroupMessagesByAPIRound 按 RunID 分组（user 总开新组）
-//   3) 识别 droppable 组（跳过 AutoCompactSummaryAnnotation / StoreInjectedAnnotation 保护组）
-//   4) 全保护时仍允许丢最旧组（兜底）
-//   5) 解析错误的 token gap：有 gap 累加到 >= gap；无 gap 用 EmergencyDropPercent
-//   6) 永远保留至少 1 个 droppable 组
-//   7) 删后第一条不是 system 的若是 assistant，在它前面补 user marker（API 要求 user-first）
-//   8) sys 拼回最前
-// 删完用压缩后 messages 重试，最多 MaxAttempts 次（compacted == nil 或长度 >= curMsgs 时提前 break）。
-// **不写回 channel** —— 仅 retry 循环局部变量 curMsgs 上覆盖，下轮 model Get 还是原 messages。
+// 失败请求带有效的服务端摘要时，只处理该摘要起的实际上下文。保留摘要和同组的工具配对。
+// 丢弃最旧的可裁轮次时保留至少一轮。无法丢组时尝试就地缩短大工具结果。
+// 重试仅使用局部视图，下一轮仍读取原消息流。
 
 // ReactiveCompactConfig 控制 ReactiveCompact 行为。
 type ReactiveCompactConfig struct {
@@ -142,7 +136,7 @@ func ParsePromptTooLongGap(err error) int {
 //  4. 至少保留 1 组——单组对话也要能跑下去
 //  5. 删后第一条不是 system 的若是 assistant，在它前面补 user marker（API 要求 user 开头）
 //  6. 把 system 重新拼回最前
-func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap int, marker string) []*schema.Message {
+func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap int, marker string, keepFirstGroup bool) []*schema.Message {
 	if len(messages) == 0 {
 		return messages
 	}
@@ -179,7 +173,7 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 	// 混着 system 的组可以丢，丢的时候 system 原地留下（见 isProtectedGroup 的「只有 system 的组」那一条）。
 	var droppableIdx []int
 	for i, g := range groups {
-		if isProtectedGroup(g) {
+		if (keepFirstGroup && i == 0) || isProtectedGroup(g) {
 			continue
 		}
 		droppableIdx = append(droppableIdx, i)
@@ -241,14 +235,17 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 		}
 		dropped = append(dropped, rest...)
 	}
-	kept := dropOrphanToolResults(compose_v2.FlattenGroups(keptGroups))
-	// 丢掉的组里带取回 id 的（转存过的工具结果、摘要附的索引）：全文还在 store 里，补一条索引放在最前，模型照样取得回
-	// （见 tool_spill.go 的 spillIndex）。它是 user 角色，保留部分以 assistant 开头时也就不用再补占位了。
+	// 转存索引须落在模型实际收到的窗口内。在服务端摘要之后插入时保留摘要组内的配对。
 	if idx := spillIndex(dropped); len(idx) > 0 {
 		indexMsg := schema.UserMessage(spillIndexText(idx))
 		indexMsg.Annotations = map[string]any{spillIndexAnnotation: strings.Join(idx, "\n")}
-		kept = append([]*schema.Message{indexMsg}, kept...)
+		at := 0
+		if keepFirstGroup {
+			at = 1
+		}
+		keptGroups = slices.Insert(keptGroups, at, []*schema.Message{indexMsg})
 	}
+	kept := dropOrphanToolResults(compose_v2.FlattenGroups(keptGroups))
 
 	// 删后第一条不是 system 的是 assistant → 在它前面补 user marker（API 要求 user-first，system 之后；丢掉的组里留下的
 	// system 可能排在它前面）
@@ -256,7 +253,7 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 		if m.Role == schema.RoleSystem {
 			continue
 		}
-		if m.Role == schema.RoleAssistant {
+		if m.Role == schema.RoleAssistant && !keepFirstGroup {
 			withMarker := make([]*schema.Message, 0, len(kept)+1)
 			withMarker = append(withMarker, kept[:i]...)
 			withMarker = append(withMarker, schema.UserMessage(marker))
@@ -386,7 +383,20 @@ func ReactiveCompactRun(ctx context.Context, cfg *ReactiveCompactConfig, message
 			},
 		})
 	}
-	out := emergencyDropOldestGroups(messages, dropPercent, gap, marker)
+	// 摘要之前的逻辑历史仍传给模型适配器。只裁它已经证实送出的窗口，避免改动前缀对其他候选的可用性。
+	start, keepFirstGroup := 0, false
+	if anchor := model.CompactedHistoryStart(callErr); anchor != nil && anchor.Role == schema.RoleAssistant {
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i] == anchor {
+				start, keepFirstGroup = i, true
+				break
+			}
+		}
+	}
+	out := emergencyDropOldestGroups(messages[start:], dropPercent, gap, marker, keepFirstGroup)
+	if start > 0 {
+		out = slices.Concat(messages[:start], out)
+	}
 	if hasEventSink(ctx) {
 		EmitCompactionEvent(ctx, &CompactionAction{
 			Layer: CompactionLayerReactive,

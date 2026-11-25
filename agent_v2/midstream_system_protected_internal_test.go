@@ -47,7 +47,7 @@ func TestMidStreamSystem_ProtectedByBothCompactionLayers(t *testing.T) {
 			schema.UserMessage("q2 " + strings.Repeat("x", 4000)),
 			schema.UserMessage("当前问题"),
 		}
-		out := emergencyDropOldestGroups(in, 50, 100000, "[MARKER]")
+		out := emergencyDropOldestGroups(in, 50, 100000, "[MARKER]", false)
 		if len(out) >= len(in) {
 			t.Fatalf("前提没搭对：一条都没丢（%d→%d）", len(in), len(out))
 		}
@@ -60,7 +60,7 @@ func TestMidStreamSystem_ProtectedByBothCompactionLayers(t *testing.T) {
 	t.Run("紧急删组不丢它", func(t *testing.T) {
 		in := build()
 		// gap 给大，逼 emergencyDrop 尽量多丢——不然丢不到中段那一组，测了个寂寞。
-		out := emergencyDropOldestGroups(in, 50, 100000, "[MARKER]")
+		out := emergencyDropOldestGroups(in, 50, 100000, "[MARKER]", false)
 		if len(out) >= len(in) {
 			t.Fatalf("前提没搭对：一条都没丢（%d→%d），被测路径没跑到", len(in), len(out))
 		}

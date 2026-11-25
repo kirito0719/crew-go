@@ -413,3 +413,5 @@ MicroCompact 给应用一个显式期限，默认由应用决定何时回收。�
 ### 2026-11-25 原生压缩的请求窗口
 
 Claude 服务端摘要已覆盖之前的消息。crew-go 在 Anthropic 请求组装时从最近有效摘要保留后续块，历史及摘要快照继续由调用方保存。与本地 AutoCompact 的摘要边界一样，下一次请求可使用已保存的摘要。Claude 的边界由服务端 compaction 块确定。原生计数复用同一请求窗口。 [Anthropic 回放与压缩](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#passing-compaction-blocks-back) · [本地请求回归](../../../model/anthropic/compaction_test.go)
+
+超窗重试由失败请求携带生效摘要的消息身份，裁剪只在可见窗口内进行。摘要和配对工具结果保留，新增的转存索引在摘要轮后提交。HTTP 和 SSE 回归根据实际请求体返回结果，验证一次重试确实能让窗口缩小。 [超窗回归](../../../model/anthropic/reactive_window_test.go)
