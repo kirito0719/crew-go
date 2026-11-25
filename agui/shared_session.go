@@ -31,7 +31,7 @@ type SessionRecord struct {
 	Answers         map[string]*schema.Message `json:"answers,omitempty"`
 }
 
-// SessionCancellation 保存已接受的取消或替换、请求身份与历史归属。清理成功前随原 TaskID 保留。
+// SessionCancellation 保存已接受的取消、替换或终态收尾。清理成功前随原 TaskID 保留。
 type SessionCancellation struct {
 	Owner              string               `json:"owner,omitempty"`
 	ThreadID           string               `json:"thread_id,omitempty"`
@@ -39,6 +39,8 @@ type SessionCancellation struct {
 	HistoryKey         *agent_v2.HistoryKey `json:"history_key,omitempty"`
 	CheckpointsDeleted bool                 `json:"checkpoints_deleted,omitempty"`
 	Replacement        bool                 `json:"replacement,omitempty"`
+	// Terminal 表示任务已产生终态，收尾不再交给 Agent 执行。
+	Terminal bool `json:"terminal,omitempty"`
 }
 
 // SessionStore 在同一共享后端保存会话记录、任务租约及图存档。key 由 Handler 生成，代表
@@ -48,7 +50,7 @@ type SessionStore interface {
 	compose_v2.Checkpointer
 	compose_v2.TaskLeaseProvider
 	LoadSession(ctx context.Context, key string) (*SessionRecord, error)
-	// ListCancellations 分页列举含取消意图的会话键。空 cursor 从头开始，空 next 表示本轮结束。
+	// ListCancellations 分页列举含取消、替换或终态收尾的会话键。空 cursor 从头开始，空 next 表示本轮结束。
 	// 一轮应枚举其间始终存在的取消意图，允许空页和重复键。游标独立于记录是否被删除。
 	// limit 控制一页扫描量，调用方会在持有租约后重读记录。
 	ListCancellations(ctx context.Context, cursor string, limit int) (keys []string, next string, err error)
@@ -58,7 +60,7 @@ type SessionStore interface {
 	SaveSession(ctx context.Context, key string, record *SessionRecord, dropTask string) (int32, error)
 }
 
-// WithSessionStore 启用共享会话、GET 挂起查询和后台取消补偿。store 同时提供 Checkpointer；
+// WithSessionStore 启用共享会话、GET 挂起查询及后台取消和终态补偿。store 同时提供 Checkpointer。
 // [WithSessionTTL] 和 [WithMaxSessions] 只作用于默认的进程内会话表。
 func WithSessionStore(store SessionStore) Option {
 	return func(h *handler) {
@@ -89,7 +91,8 @@ type sharedSession struct {
 	store              SessionStore
 	key                string
 	record             *SessionRecord
-	settledReplacement string // 本次请求完成收尾的旧任务，供新 Run 进场复核。
+	historyStore       agent_v2.HistoryStore // 本次执行实际绑定的历史后端。
+	settledReplacement string                // 本次请求完成收尾的旧任务，供新 Run 进场复核。
 }
 
 const sharedSessionPrefix = "agui-thread:"
@@ -149,7 +152,7 @@ func (h *handler) openSharedSession(ctx context.Context, key sessionKey) (contex
 	}()
 	shared := sharedSessionFrom(ctx)
 	if shared.record != nil && shared.record.Closing && shared.record.Cancellation == nil {
-		if err := h.finishSharedSession(ctx, shared); err != nil {
+		if err := shared.finish(ctx, nil, false); err != nil {
 			return ctx, nil, err
 		}
 	}
@@ -184,23 +187,42 @@ func (s *sharedSession) session() *agent_v2.RunSession {
 	return sess
 }
 
-func (s *sharedSession) bindHistory(ctx context.Context, hosted agent_v2.TaskHistoryDestination) context.Context {
+func (s *sharedSession) bindHistory(ctx context.Context, destination agent_v2.TaskHistoryDestination) context.Context {
 	sid, key := s.record.TaskID, s.record.HistoryKey
-	if key != (agent_v2.HistoryKey{}) {
-		destination := agent_v2.TaskHistoryDestination{Key: key, Source: s.record.HistorySource}
-		if destination.Source == agent_v2.TaskHistoryHost {
-			destination.Store = hosted.Store
-		}
-		return agent_v2.WithTaskHistoryBinding(ctx, sid, destination, nil)
+	bound := key != (agent_v2.HistoryKey{})
+	if bound {
+		destination.Key = key
+		destination.Source = s.record.HistorySource
 	}
-	return agent_v2.WithTaskHistoryBinding(ctx, sid, hosted, func(ctx context.Context, destination agent_v2.TaskHistoryDestination) error {
+	return agent_v2.WithTaskHistoryBinding(ctx, sid, destination, func(ctx context.Context, selected agent_v2.TaskHistoryDestination) error {
 		if s.record == nil || s.record.TaskID != sid || s.record.Closing {
 			return errPendingChanged
 		}
+		if bound {
+			if destination.Store == nil {
+				// 没有可直接解析的后端。本轮尚未写历史，只接受已保存过原任务的存储。
+				readCtx, cancel := context.WithTimeout(ctx, dropCPTimeout)
+				defer cancel()
+				query := agent_v2.HistoryQuery{Task: sid, Limit: 1}
+				page, err := selected.Store.Load(readCtx, key, query)
+				if err != nil {
+					return fmt.Errorf("verify original task history: %w", err)
+				}
+				if len(page.Messages) != 1 || !query.Matches(page.Messages[0]) {
+					return errHistoryResolverRequired
+				}
+			}
+			s.historyStore = selected.Store
+			return nil
+		}
 		next := *s.record
-		next.HistoryKey = destination.Key
-		next.HistorySource = destination.Source
-		return s.save(ctx, &next, "")
+		next.HistoryKey = selected.Key
+		next.HistorySource = selected.Source
+		if err := s.save(ctx, &next, ""); err != nil {
+			return err
+		}
+		s.historyStore = selected.Store
+		return nil
 	})
 }
 
@@ -229,6 +251,7 @@ var (
 	errPendingChanged          = errors.New("pending interrupts advanced before the task could be discarded")
 	errWorkflowUnavailable     = errors.New("the task's workflow version is not available on this instance")
 	errHistoryResolverRequired = errors.New("a resolver is required for the task's original history store")
+	errTerminalHistoryCleanup  = errors.New("terminal task history cleanup is pending")
 )
 
 type sharedCancellationRequest struct {
@@ -293,28 +316,34 @@ func cancelSharedSession(ctx context.Context, s *sharedSession, ag agent_v2.Agen
 				return 0, err
 			}
 		}
-		if s.record.Cancellation.CheckpointsDeleted {
-			return 0, nil
-		}
-		// 与删档原子提交，历史收尾可从该状态重试。
-		next := *s.record
-		progress := *next.Cancellation
-		progress.CheckpointsDeleted = true
-		next.Cancellation = &progress
-		return s.write(ctx, &next, sid)
+		return s.dropClosingCheckpoints(ctx)
 	}
-	finalize := func(ctx context.Context, sid string) error {
-		if s.record == nil || s.record.TaskID != sid || s.record.Cancellation == nil || !s.record.Cancellation.CheckpointsDeleted {
-			return errors.New("agui: cannot confirm cancellation before checkpoint cleanup")
-		}
-		// 即使没有存档，仍让后端原子核对会话及原任务的租约。
-		_, err := s.write(ctx, nil, sid)
-		return err
-	}
+	finalize := s.confirmClosure
 	_, err := ag.Resume(ctx, sess.RunID, append(opts, agent_v2.WithResumeAbortCleanup(cleanup, finalize))...)
 	if err == nil && s.record != nil {
 		return errors.New("the agent did not finalize the cancelled shared session")
 	}
+	return err
+}
+
+// dropClosingCheckpoints 将删档与保存进度原子提交。调用方已取得会话和任务租约。
+func (s *sharedSession) dropClosingCheckpoints(ctx context.Context) (int32, error) {
+	if s.record.Cancellation.CheckpointsDeleted {
+		return 0, nil
+	}
+	next := *s.record
+	progress := *next.Cancellation
+	progress.CheckpointsDeleted = true
+	next.Cancellation = &progress
+	return s.write(ctx, &next, next.TaskID)
+}
+
+func (s *sharedSession) confirmClosure(ctx context.Context, sid string) error {
+	if s.record == nil || s.record.TaskID != sid || s.record.Cancellation == nil || !s.record.Cancellation.CheckpointsDeleted {
+		return errors.New("agui: cannot confirm closure before checkpoint cleanup")
+	}
+	// 即使没有存档，仍让后端原子核对会话及原任务的租约。
+	_, err := s.write(ctx, nil, sid)
 	return err
 }
 
@@ -330,7 +359,7 @@ func (h *handler) openSharedSessionAfterCancellation(ctx context.Context, key se
 		return locked, activity, nil
 	}
 	activity.Release()
-	ag, buildErr := h.buildCancellationAgent(candidate.WorkflowVersion)
+	ag, buildErr := h.buildCleanupAgent(candidate)
 	if err := ctx.Err(); err != nil {
 		return ctx, nil, err
 	}
@@ -356,7 +385,7 @@ func (h *handler) openSharedSessionAfterCancellation(ctx context.Context, key se
 		if buildErr != nil {
 			return locked, nil, buildErr
 		}
-		if err := cancelSharedSession(locked, s, ag, sharedCancellationRequest{}, h.historyForCancellation(s)); err != nil {
+		if err := h.resumeSharedCleanup(locked, s, ag); err != nil {
 			return locked, nil, err
 		}
 		if beforeRun && candidate.Cancellation.Replacement {
@@ -404,7 +433,7 @@ func (h *handler) openSharedRunSession(ctx context.Context, key sessionKey) (con
 
 func sameCancellationTask(record, candidate *SessionRecord) bool {
 	return record != nil && record.Cancellation != nil && record.TaskID == candidate.TaskID &&
-		record.WorkflowVersion == candidate.WorkflowVersion
+		record.WorkflowVersion == candidate.WorkflowVersion && record.Cancellation.Terminal == candidate.Cancellation.Terminal
 }
 
 func (s *sharedSession) accept(ctx context.Context, answers map[string]*schema.Message) (map[string]*schema.Message, error) {
@@ -424,35 +453,114 @@ func (s *sharedSession) accept(ctx context.Context, answers map[string]*schema.M
 	return next.Answers, nil
 }
 
-func (h *handler) finishSharedSession(ctx context.Context, s *sharedSession) error {
+// finish 推进已终结任务的清档和历史收尾。历史操作保留会话和任务租约的取消信号。
+func (s *sharedSession) finish(ctx context.Context, resolve func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error), detachWrites bool) error {
 	if s.record == nil {
 		return nil
 	}
 	if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
 		return err
 	}
+	// 初次写终态和删档可与 HTTP 连接分离，存储在事务中核对租约。后台重试遵守退出信号。
+	writeCtx := ctx
+	if detachWrites {
+		writeCtx = context.WithoutCancel(ctx)
+	}
+	writeCtx, cancel := context.WithTimeout(writeCtx, dropCPTimeout)
+	defer cancel()
 	sid := s.record.TaskID
-	if compose_v2.CheckpointTaskLeaseToken(ctx, s.store.CheckpointTaskLeases(), sid) == "" {
-		dropCtx, activity, err := h.beginDropCP(ctx, sid)
+	if compose_v2.CheckpointTaskLeaseToken(writeCtx, s.store.CheckpointTaskLeases(), sid) == "" {
+		var activity *compose_v2.TaskActivity
+		var err error
+		writeCtx, activity, err = compose_v2.BeginTaskActivity(writeCtx, "", []string{sid})
 		if err != nil {
 			return err
 		}
 		defer activity.Release()
-		ctx = dropCtx
+		if detachWrites {
+			// 新领的任务租约已与原请求分离。只做带双令牌核对的持久写，历史交给补偿。
+			resolve = nil
+		} else {
+			ctx = writeCtx
+		}
 	}
-	if !s.record.Closing {
+	key := s.record.HistoryKey
+	owner, thread := compose_v2.GetOwner(ctx), compose_v2.GetThreadID(ctx)
+	hasHistory := key != (agent_v2.HistoryKey{})
+	if hasHistory && (key.Owner == "" || key.ConvID != thread || sharedSessionID(sessionKey{owner: owner, threadID: thread}) != s.key) {
+		return errors.New("agui: terminal history does not match the session")
+	}
+	if !s.record.Closing || (hasHistory && s.record.Cancellation == nil) {
 		next := *s.record
 		next.Closing = true
-		if err := s.save(ctx, &next, ""); err != nil {
+		if hasHistory {
+			next.Cancellation = &SessionCancellation{Owner: owner, ThreadID: thread, HistoryKey: &key, Terminal: true}
+			next.Prior, next.Answers, next.ModelData = nil, nil, ""
+		}
+		if _, err := s.write(writeCtx, &next, ""); err != nil {
 			return err
 		}
 	}
-	return s.save(ctx, nil, sid)
+	intent := s.record.Cancellation
+	if intent == nil {
+		_, err := s.write(writeCtx, nil, sid)
+		return err
+	}
+	if !intent.Terminal || intent.HistoryKey == nil || *intent.HistoryKey != key ||
+		intent.Owner != owner || intent.ThreadID != thread {
+		return errors.New("agui: terminal cleanup does not match the session")
+	}
+	if intent.CheckpointsDeleted {
+		// 已清档的任务不会再次写档。留住旧收尾进度，避免误删占用了同一 ID 的新档。
+		slots, err := s.store.LoadAllInSession(writeCtx, sid)
+		if err != nil {
+			return err
+		}
+		if len(slots) != 0 {
+			return fmt.Errorf("agui: terminal task %q has a checkpoint again", sid)
+		}
+	}
+	if _, err := s.dropClosingCheckpoints(writeCtx); err != nil {
+		return err
+	}
+	if resolve == nil {
+		return nil // 用已持久化的工作流版本和历史分区定位原后端后重试。
+	}
+	deadline, _ := writeCtx.Deadline()
+	historyCtx, cancelHistory := context.WithDeadline(ctx, deadline)
+	defer cancelHistory()
+	if err := historyCtx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", errTerminalHistoryCleanup, err)
+	}
+	history, err := resolve(historyCtx, key)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errTerminalHistoryCleanup, err)
+	}
+	if nilInterface(history) {
+		return fmt.Errorf("%w: %w", errTerminalHistoryCleanup, errHistoryResolverRequired)
+	}
+	destination := agent_v2.TaskHistoryDestination{Store: history, Key: key}
+	if err := agent_v2.CloseTerminalTaskHistory(historyCtx, destination, sid); err != nil {
+		return fmt.Errorf("%w: %w", errTerminalHistoryCleanup, err)
+	}
+	return s.confirmClosure(writeCtx, sid)
 }
 
 func (h *handler) completeSession(ctx context.Context, key sessionKey) error {
 	if s := sharedSessionFrom(ctx); s != nil {
-		return h.finishSharedSession(ctx, s)
+		var resolve func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error)
+		if s.historyStore != nil {
+			resolve = func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error) {
+				return s.historyStore, nil
+			}
+		}
+		err := s.finish(ctx, resolve, true)
+		if errors.Is(err, errTerminalHistoryCleanup) && !errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+			// 终态及清档进度已持久化，历史由后续请求或后台补偿。保持原运行结果。
+			slog.WarnContext(ctx, "agui: 终态任务的历史收尾未完成", "sid", s.record.TaskID, "err", err)
+			return nil
+		}
+		return err
 	}
 	h.removeEntry(key)
 	return nil
@@ -519,6 +627,10 @@ func (h *handler) servePending(w http.ResponseWriter, r *http.Request) {
 func sharedSessionError(ctx context.Context, err error) (int, string, string) {
 	if errors.Is(err, compose_v2.ErrTaskBusy) {
 		return http.StatusConflict, "busy", "an operation on this thread is in progress"
+	}
+	if errors.Is(err, errTerminalHistoryCleanup) {
+		slog.WarnContext(ctx, "agui: 终态任务的历史收尾未完成", "err", err)
+		return http.StatusConflict, "cleanup_pending", "the previous task still needs cleanup"
 	}
 	if errors.Is(err, errAnswerAccepted) {
 		return http.StatusConflict, "answer_already_accepted", errAnswerAccepted.Error()

@@ -2,6 +2,7 @@ package sql_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"crew-go/agent_v2"
+	"crew-go/agui"
 	"crew-go/hook"
 	"crew-go/schema"
 	crewsql "crew-go/sql"
@@ -39,6 +41,9 @@ func TestSQLiteAGUIResumeKeepsExecutionHistoryPartition(t *testing.T) {
 	historyOwner = "resume-request-partition"
 	if r := aguiPost(t, h, "same-auth-owner", aguiAnswer(pending.Interrupts[0].ID, "resolved", true)); !strings.Contains(r.Body.String(), `"type":"success"`) {
 		t.Fatal(r.Body)
+	}
+	if completed := aguiPending(t, h, "same-auth-owner"); len(completed.Interrupts) != 0 {
+		t.Fatalf("正常续跑完成后无需另配解析器，实际 %+v", completed)
 	}
 	final, err := agent_v2.LoadAllHistory(t.Context(), history, agent_v2.HistoryKey{Owner: "execution-partition", ConvID: "shared"})
 	if err != nil {
@@ -128,5 +133,82 @@ func TestSQLiteAGUICancelRemainsClosedWhenHistoryStoreUnavailable(t *testing.T) 
 	}
 	if pending := aguiPending(t, newHandler, "tenant"); len(pending.Interrupts) != 0 {
 		t.Fatalf("cancelled task remained pending: %+v", pending)
+	}
+}
+
+func TestSQLiteAGUIResumeUsesOriginalHistoryAfterMiddlewareSwitch(t *testing.T) {
+	for _, source := range []agent_v2.TaskHistorySource{agent_v2.TaskHistoryAgent, agent_v2.TaskHistoryRequest} {
+		t.Run(string(source), func(t *testing.T) {
+			db, cp, original := (sharedApprovalBackend{driver: "sqlite", dsn: "file:" +
+				filepath.Join(t.TempDir(), "switched-history.db") + "?_pragma=busy_timeout(3000)"}).open(t)
+			store := crewsql.NewAGUISessionStore(cp)
+			switched := crewsql.NewHistoryStore(db, crewsql.SQLite{}, crewsql.WithHistoryTable("switched_history"))
+			for _, setup := range []func(context.Context) error{store.Setup, original.Setup, switched.Setup} {
+				if err := setup(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			key := agent_v2.HistoryKey{Owner: "owner", ConvID: "shared"}
+			executed := 0
+			factory := func(h hook.Hooks) agent_v2.Agent {
+				return sharedApprovalAgent(original, func() { executed++ }, agent_v2.WithHooks(h))
+			}
+			withStore := func(base http.Handler, history agent_v2.HistoryStore) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					base.ServeHTTP(w, r.WithContext(agent_v2.WithHistoryCtx(r.Context(), history, key.Owner)))
+				})
+			}
+			first := sharedHandler(factory, store)
+			if source == agent_v2.TaskHistoryRequest {
+				first = withStore(first, original)
+			}
+			r := aguiPost(t, first, "owner", map[string]any{"threadId": "shared",
+				"messages": []map[string]any{{"role": "user", "content": "转账"}}})
+			pending := aguiPending(t, first, "owner")
+			if !strings.Contains(r.Body.String(), `"type":"interrupt"`) || len(pending.Interrupts) != 1 {
+				t.Fatalf("需要实际挂起审批，响应 %s 问题 %+v", r.Body, pending)
+			}
+			id := pending.Interrupts[0].ID
+			answer := aguiAnswer(id, "resolved", true)
+			next := withStore(sharedHandler(factory, store), switched)
+			if source == agent_v2.TaskHistoryRequest {
+				r = aguiPost(t, next, "owner", answer)
+				if !strings.Contains(r.Body.String(), "session_store_failed") || executed != 0 {
+					t.Fatalf("未知原后端时应停在原审批，执行 %d 次，响应 %s", executed, r.Body)
+				}
+				stillOpen := aguiPending(t, next, "owner")
+				if len(stillOpen.Interrupts) != 1 || stillOpen.Interrupts[0].ID != id {
+					t.Fatalf("拒绝换后端后应保留原审批，实际 %+v", stillOpen)
+				}
+				next = withStore(sharedHandler(factory, store, agui.WithCancellationHistory(
+					func(_ context.Context, resolved agent_v2.HistoryKey) (agent_v2.HistoryStore, error) {
+						if resolved != key {
+							return nil, errors.New("wrong original history key")
+						}
+						return original, nil
+					})), switched)
+			}
+			r = aguiPost(t, next, "owner", answer)
+			if !strings.Contains(r.Body.String(), `"type":"success"`) || executed != 1 {
+				t.Fatalf("绑定原后端后应只执行一次，实际 %d 次，响应 %s", executed, r.Body)
+			}
+			page, err := original.Load(t.Context(), key, agent_v2.HistoryQuery{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			results := 0
+			for _, msg := range page.Messages {
+				if schema.GetToolResultID(msg) == "transfer" && strings.Contains(msg.Content, "已转账") {
+					results++
+				}
+			}
+			other, err := switched.Load(t.Context(), key, agent_v2.HistoryQuery{})
+			if err != nil || results != 1 || len(other.Messages) != 0 {
+				t.Fatalf("真实工具结果应只写入原后端一次，原结果 %d 新历史 %v 错误 %v", results, other.Messages, err)
+			}
+			if got := aguiPending(t, next, "owner"); len(got.Interrupts) != 0 {
+				t.Fatalf("终态后应移除任务入口，实际 %+v", got)
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package agui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -41,6 +42,43 @@ func (h *handler) historyForCancellation(s *sharedSession) func(context.Context,
 		return nil
 	}
 	return func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error) { return store, nil }
+}
+
+// boundHistoryResolver 优先沿用记录来源。静态后端不可用时可由应用按分区恢复。
+func (h *handler) boundHistoryResolver(source agent_v2.TaskHistorySource, ag agent_v2.Agent) func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error) {
+	var store agent_v2.HistoryStore
+	switch source {
+	case agent_v2.TaskHistoryHost:
+		store = h.historyStore
+	case agent_v2.TaskHistoryAgent:
+		store = agent_v2.ConfiguredHistoryStore(ag)
+	}
+	if store == nil && source != agent_v2.TaskHistoryHost {
+		return h.cancellationHistory
+	}
+	return func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error) { return store, nil }
+}
+
+// bindSharedResumeHistory 优先从保存的来源定位后端，再交给任务绑定核对。
+func (h *handler) bindSharedResumeHistory(ctx context.Context, s *sharedSession, ag agent_v2.Agent) (context.Context, error) {
+	key, source := s.record.HistoryKey, s.record.HistorySource
+	var destination agent_v2.TaskHistoryDestination
+	if resolve := h.boundHistoryResolver(source, ag); key != (agent_v2.HistoryKey{}) && resolve != nil {
+		resolveCtx, cancel := context.WithTimeout(ctx, dropCPTimeout)
+		defer cancel()
+		store, err := resolve(resolveCtx, key)
+		if err != nil {
+			return ctx, fmt.Errorf("resolve original task history: %w", err)
+		}
+		if nilInterface(store) {
+			return ctx, errHistoryResolverRequired
+		}
+		destination.Store = store
+		if source == agent_v2.TaskHistoryHost {
+			ctx = agent_v2.WithHistoryCtx(ctx, store, key.Owner)
+		}
+	}
+	return s.bindHistory(ctx, destination), nil
 }
 
 // HistoryReference 将一条服务端记录与前端消息和工具调用相关联。

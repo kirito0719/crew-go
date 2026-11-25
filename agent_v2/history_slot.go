@@ -654,6 +654,16 @@ func borrowHistoryConfig(subs []Agent) (*historyConfig, *historyConflict) {
 	return chosen, nil
 }
 
+// ConfiguredHistoryStore 从 Agent 的静态定义查找历史后端，不读取请求上下文。
+// 未配置或多个成员的历史配置不一致时返回 nil。
+func ConfiguredHistoryStore(ag Agent) HistoryStore {
+	hc, _ := borrowHistoryConfig([]Agent{ag})
+	if hc == nil || isFrameworkNil(hc.store) {
+		return nil
+	}
+	return hc.store
+}
+
 // historyBorrowMaxVisits 是借配置这一趟最多看多少个子执行体。嵌套编排的规模远到不了这个数；到了多半是不可比较的值
 // 类型包装成了环（认不出走过，分叉的环按层数算是指数级）。
 const historyBorrowMaxVisits = 1024
@@ -841,6 +851,16 @@ func resolveHistoryConfigForAbort(ctx context.Context, subs []Agent) *historyCon
 // CloseAbandonedTaskHistory 为原历史分区里该任务尚无结果的工具调用补齐放弃结果。
 // 调用方须持有该任务的放弃许可，且已删除根存档。重试会跳过已有结果的调用。
 func CloseAbandonedTaskHistory(ctx context.Context, destination TaskHistoryDestination, task string) error {
+	return closeTaskHistory(ctx, destination, task, "任务已被放弃，此工具调用没有结果")
+}
+
+// CloseTerminalTaskHistory 为已终结任务补写缺失的工具结果。调用方须持有任务许可并完成清档。
+// 补写只表明没有记录到工具结果，工具可能已执行。重试跳过已有结果的调用。
+func CloseTerminalTaskHistory(ctx context.Context, destination TaskHistoryDestination, task string) error {
+	return closeTaskHistory(ctx, destination, task, "任务已结束，未记录此工具调用的结果")
+}
+
+func closeTaskHistory(ctx context.Context, destination TaskHistoryDestination, task, missingResult string) error {
 	store, key := destination.Store, destination.Key
 	if task == "" || isFrameworkNil(store) || key.Owner == "" || key.ConvID == "" {
 		return nil
@@ -864,7 +884,7 @@ func CloseAbandonedTaskHistory(ctx context.Context, destination TaskHistoryDesti
 		m := call.declaration
 		owner, _ := m.Annotations[HistoryAgentAnnotation].(string)
 		display, _ := m.Annotations[HistoryAgentDisplayAnnotation].(string)
-		closer := schema.ToolResultMessage(call.ID, "任务已被放弃，此工具调用没有结果")
+		closer := schema.ToolResultMessage(call.ID, missingResult)
 		closers = append(closers, stampHistoryAgent(closer, owner, display, task))
 	}
 	if len(closers) == 0 {

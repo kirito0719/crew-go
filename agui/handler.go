@@ -291,7 +291,7 @@ func WithOwnerResolver(fn compose_v2.OwnerResolver) Option {
 //
 // HITL 闭环：中断→前端收 RunFinished(interrupt)→用户答→带同 threadId + resume=[{interruptId,
 // status, payload}]（对齐官方 ResumeEntry）续发→server 走 Resume。会话默认在进程内持有。配置
-// [WithSessionStore] 可跨实例继续，并通过 GET 查询当前挂起项。共享 Handler 启动后主动补偿取消，
+// [WithSessionStore] 可跨实例继续，并通过 GET 查询当前挂起项。共享 Handler 启动后主动补偿取消和终态清理，
 // 关闭 HTTP 服务后调用返回值的 Close，等待补偿退出。
 // 存档须在构造 Handler 时配置，仅通过请求 ctx 注入的 Checkpointer 会被拒绝。
 // 当前任务及其嵌套图沿用 Handler 绑定的存档后端。
@@ -361,6 +361,7 @@ type sessionEntry struct {
 	abortCtx context.Context
 	// historyCleanupPending 表示旧任务已放弃，仍需补齐原历史。
 	historyCleanupPending bool
+	terminal              bool // 初次运行已异常终结，保留入口只为清档和补写历史。
 	history               agent_v2.TaskHistoryDestination
 	touchedAt             int64 // 最后活动 Unix nano，LRU 淘汰用
 	// open 按 InterruptID 记录挂起项类型。续跑的 resume 列表必须恰好覆盖它们。
@@ -734,14 +735,15 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 		if settled {
 			return
 		}
-		// 走到这儿 = ag.Run 没正常返回（Goexit）。补一个终态事件让前端的生命周期闭合，
-		// 并清掉空壳 entry + 它的 cp（那份档谁也够不着：Status=failed 列不出来、
-		// sess==nil 让 LRU 也清不了）。
+		// 初次 Run 没返回挂起问题，终结该任务。删档或补历史失败时保留清理入口。
+		var cleanupErr error
 		if shared == nil {
-			h.dropCP(ctx, sess.RunID)
+			cleanupErr = h.closeAbnormalLocalRun(cleanupCtx, key, claimed, sess)
+		} else {
+			cleanupErr = h.completeSession(ctx, key)
 		}
-		if err := h.completeSession(ctx, key); err != nil {
-			slog.WarnContext(ctx, "agui: 异常退出后会话记录清理失败", "err", err)
+		if cleanupErr != nil {
+			slog.WarnContext(ctx, "agui: 异常退出后会话记录清理失败", "err", cleanupErr)
 		}
 		adapter.finish() // 收尾在途的流式消息、发出攒着的撤回快照
 		_ = sse.WriteEvent(NewRunError("run terminated abnormally (goroutine exited without returning)", "agent_error"))
@@ -785,6 +787,10 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	if shared != nil {
 		if shared.record != nil {
 			if saved := shared.record.Cancellation; saved != nil {
+				if saved.Terminal {
+					_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the previous task still needs cleanup")
+					return
+				}
 				open := make(map[string]interruptKind, len(saved.InterruptIDs))
 				for _, id := range saved.InterruptIDs {
 					open[id] = openQuestion
@@ -835,6 +841,10 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 	}
 	if entry == nil {
 		_ = sse.Reject(http.StatusNotFound, "no_session", "no suspended session for thread (interrupt expired or wrong threadId)")
+		return
+	}
+	if entry.terminal {
+		_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the previous task still needs cleanup")
 		return
 	}
 	sess, open, prior := entry.sess, entry.open, entry.prior
@@ -1032,14 +1042,12 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 			settled = true
 			return
 		}
-		var hosted agent_v2.TaskHistoryDestination
-		if shared.record.HistorySource == agent_v2.TaskHistoryHost {
-			hosted = h.hostedHistory(key)
-			if hosted.Store != nil {
-				ctx = agent_v2.WithHistoryCtx(ctx, hosted.Store, shared.record.HistoryKey.Owner)
-			}
+		ctx, err = h.bindSharedResumeHistory(ctx, shared, ag)
+		if err != nil {
+			settled = true
+			rejectSharedSession(ctx, sse, err)
+			return
 		}
-		ctx = shared.bindHistory(ctx, hosted)
 	} else {
 		all = h.recordAnswers(key, answers)
 		ctx = entry.bindLocalHistory(ctx, sess.RunID)
@@ -1384,9 +1392,23 @@ func abortSession(entry *sessionEntry, ag agent_v2.Agent, deadline time.Time) er
 	return err
 }
 
-// retryAbort 构造清理用 agent，补偿无需连接任何 SSE 订阅者。
+// closeAbnormalLocalRun 保留已终结任务的清理入口。当前请求仍持有该条目的 busy。
+func (h *handler) closeAbnormalLocalRun(ctx context.Context, key sessionKey, entry *sessionEntry, sess *agent_v2.RunSession) error {
+	h.mu.Lock()
+	entry.sess = sess
+	entry.terminal = true
+	entry.abortCtx = context.WithoutCancel(ctx)
+	h.mu.Unlock()
+	if err := h.retryAbort(entry, time.Time{}); err != nil {
+		return err
+	}
+	h.removeEntry(key)
+	return nil
+}
+
+// retryAbort 在原任务身份下继续清理，无需连接 SSE 订阅者。
 func (h *handler) retryAbort(entry *sessionEntry, deadline time.Time) error {
-	if entry.historyCleanupPending {
+	if entry.terminal || entry.historyCleanupPending {
 		ctx, cancel := localHistoryCleanupContext(entry.abortCtx, deadline)
 		defer cancel()
 		ctx = compose_v2.WithCheckpointerCtx(ctx, h.cp)
@@ -1397,13 +1419,21 @@ func (h *handler) retryAbort(entry *sessionEntry, deadline time.Time) error {
 		}
 		defer activity.Release()
 		if h.cp != nil {
-			slots, err := h.cp.LoadAllInSession(ctx, sid)
-			if err != nil {
-				return fmt.Errorf("verify discarded task %q checkpoint: %w", sid, err)
+			if entry.historyCleanupPending {
+				slots, err := h.cp.LoadAllInSession(ctx, sid)
+				if err != nil {
+					return fmt.Errorf("verify discarded task %q checkpoint: %w", sid, err)
+				}
+				if len(slots) != 0 {
+					return fmt.Errorf("discarded task %q has a checkpoint again", sid)
+				}
+			} else if err := h.deleteCP(ctx, sid); err != nil {
+				return err
 			}
-			if len(slots) != 0 {
-				return fmt.Errorf("discarded task %q has a checkpoint again", sid)
-			}
+		}
+		if entry.terminal {
+			entry.historyCleanupPending = entry.history.Store != nil
+			return agent_v2.CloseTerminalTaskHistory(ctx, entry.history, sid)
 		}
 		return agent_v2.CloseAbandonedTaskHistory(ctx, entry.history, sid)
 	}

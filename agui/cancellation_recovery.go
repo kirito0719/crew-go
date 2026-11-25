@@ -41,7 +41,7 @@ func newServer(h *handler) *Server {
 	return s
 }
 
-// Close 停止后台取消补偿并等待在途尝试退出。可重复调用。
+// Close 停止后台会话补偿并等待在途尝试退出。可重复调用。
 // HTTP 服务由应用关闭。在途取消保留持久进度，其他实例或重启后可继续。
 // Close 会等待同步的 AgentFactory 返回。
 func (s *Server) Close() error {
@@ -52,9 +52,9 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// WithCancellationHistory 按已绑定的历史分区解析取消或替换所需的 HistoryStore。
-// 共享任务使用请求选择的历史后端，或旧记录中未注明后端来源时，替换需要此回调。
-// 回调使用服务凭据，并遵守 ctx 取消。替换在清档前解析，已有清理记录可继续重试。
+// WithCancellationHistory 按已绑定的历史分区定位共享任务的原 HistoryStore。
+// 请求选择后端或旧记录来源未知时，替换和后台终态收尾使用此回调。冷续跑也可用它绑定原后端。
+// 回调使用服务凭据，并遵守 ctx 取消。替换先解析后端，终态收尾可在清档后继续重试。
 func WithCancellationHistory(resolve func(ctx context.Context, key agent_v2.HistoryKey) (agent_v2.HistoryStore, error)) Option {
 	return func(h *handler) { h.cancellationHistory = resolve }
 }
@@ -237,6 +237,30 @@ func (h *handler) buildCancellationAgent(version string) (agent_v2.Agent, error)
 	return ag, nil
 }
 
+func (h *handler) buildCleanupAgent(record *SessionRecord) (agent_v2.Agent, error) {
+	if record.Cancellation.Terminal {
+		if record.HistorySource != agent_v2.TaskHistoryAgent ||
+			(h.workflowFactory(record.WorkflowVersion) == nil && h.cancellationHistory != nil) {
+			return nil, nil
+		}
+	}
+	return h.buildCancellationAgent(record.WorkflowVersion)
+}
+
+// resumeSharedCleanup 保留显式取消的 Agent 协议。已终结的任务直接收尾，不调用 Run 或 Resume。
+func (h *handler) resumeSharedCleanup(ctx context.Context, s *sharedSession, ag agent_v2.Agent, opts ...agent_v2.ResumeOption) error {
+	if !s.record.Cancellation.Terminal {
+		return cancelSharedSession(ctx, s, ag, sharedCancellationRequest{}, h.historyForCancellation(s), opts...)
+	}
+	resolve := h.boundHistoryResolver(s.record.HistorySource, ag)
+	if resolve == nil {
+		resolve = func(context.Context, agent_v2.HistoryKey) (agent_v2.HistoryStore, error) {
+			return nil, errHistoryResolverRequired
+		}
+	}
+	return s.finish(ctx, resolve, false)
+}
+
 func (h *handler) listCancellations(ctx context.Context, cursor string) (keys []string, next string, err error) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -275,7 +299,7 @@ func (h *handler) recoverCancellation(ctx context.Context, key string) (err erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	ag, err := h.buildCancellationAgent(candidate.WorkflowVersion)
+	ag, err := h.buildCleanupAgent(candidate)
 	if err != nil {
 		return err
 	}
@@ -307,5 +331,5 @@ func (h *handler) recoverCancellation(ctx context.Context, key string) (err erro
 	}
 	ctx = compose_v2.WithThreadIDCtx(ctx, thread)
 	ctx = compose_v2.WithOwner(ctx, intent.Owner)
-	return cancelSharedSession(ctx, s, ag, sharedCancellationRequest{}, h.historyForCancellation(s), agent_v2.WithResumeAbortContext(lifecycle))
+	return h.resumeSharedCleanup(ctx, s, ag, agent_v2.WithResumeAbortContext(lifecycle))
 }
