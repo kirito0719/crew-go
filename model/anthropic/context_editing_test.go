@@ -111,7 +111,7 @@ func TestContextEditingSnapshotsCallerOptions(t *testing.T) {
 	}
 }
 
-// 两种返回路径把实际编辑记入标注，序列化后仍能读取。下一轮的历史前缀、压缩块和签名按原形状发回。
+// 两种返回路径都保存实际编辑。存档往返后，下一轮从有效压缩块开始，保留后续签名和编辑设置。
 func TestContextEditingPreservesReplayAndCacheOptions(t *testing.T) {
 	for _, mode := range []string{"generate", "stream"} {
 		t.Run(mode, func(t *testing.T) {
@@ -244,10 +244,10 @@ func TestContextEditingPreservesReplayAndCacheOptions(t *testing.T) {
 				t.Fatalf("发出的旧工具结果及配对应保留，实际 %v", prior)
 			}
 			sent, ok := nextReq.body["messages"].([]any)
-			if !ok || len(sent) != len(prior)+2 || canon(t, sent[:len(prior)]) != canon(t, prior) {
-				t.Fatalf("下一轮改写了历史，实际发送 %v", sent)
+			if !ok || len(sent) != 2 || str(sent, 1, "content", 0, "text") != "continue" {
+				t.Fatalf("下一轮应从已确认的摘要开始，实际发送 %v", sent)
 			}
-			blocks := at(sent, len(prior), "content")
+			blocks := at(sent, 0, "content")
 			if got, want := canon(t, blocks), canon(t, []any{compaction, thinking, answer}); got != want {
 				t.Errorf("重放块与原响应不一致，实际 %s，期望 %s", got, want)
 			}

@@ -14,6 +14,12 @@ Q13 子项以 `7fc5abf` 为基线。用实际父子 GraphAgent 模拟历史写�
 
 工作树通过禁用测试缓存的四模块全量测试、五包竞态、覆盖率门禁及 `make vet`。嵌套冒烟通过 12/12，Plan Web 验证 SSE 挂起和补答及 HTTP 终态，A2A HITL mock 通过。教学集成 9 项 mock 通过，12 项真模型按范围跳过。编排断路器的半开时序断言在并行竞态套件中失败，单独复跑整个编排竞态套件通过。
 
+## 2026-11-25 Claude 压缩回放与输入计数
+
+**Q08 的服务端压缩子项。** HTTP 桩提供两个有效摘要和一个后续空摘要。旧请求发送七条消息。修复后从最近的有效摘要发出四条，保持顶层 system、摘要后签名及同批工具结果。本地 HTTP 回归还核对了流式返回、存档 JSON 往返、编辑选项和缓存 TTL。ReactiveCompact 的本地裁剪策略仍沿用原消息流。 [压缩回归](../../model/anthropic/compaction_test.go) · [官方回放约定](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#passing-compaction-blocks-back)
+
+**A15 的本地计数对照。** 计数请求验证恢复后的隐藏 thinking 签名、工具大整数、按次选项及限流错误，与生成请求的输入投影一致。带凭据的对照用例已可编译，服务端计数和实际计费用量仍待验收。 [HTTP 回归](../../model/anthropic/token_count_test.go) · [真模型对照](../../example/model/anthropic_smoke/anthropic_smoke_test.go)
+
 ## 2026-11-24 钩子链上下文隔离
 
 Q22 以 `5fe969b` 为基线。BasicAgent 处理第二个请求时，前置钩子返回第一个请求的 ctx，后续嵌套钩子实际读到第一个 Owner。低阶图也复现后续钩子读到外来 Owner 和任务 ID，同时丢失 deadline。两个回归在基线上失败。

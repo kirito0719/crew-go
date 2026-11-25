@@ -260,11 +260,10 @@ type Compaction struct {
 
 // WithCompaction 开服务端上下文压缩（beta compact-2026-01-12）：每次请求带 context_management 的
 // compact_20260112，输入达到阈值时 API 先把更早的内容摘要成一个 compaction 块、再接着答。这个块随
-// 回放快照（[AssistantContentAnnotation]）原样发回，API 据它把块之前的历史换成摘要——调用方的历史只追加、
-// 不用改，preserved thinking 的前缀校验也不把它当改动（压缩之后从 compaction 块算起）。
+// 回放快照（[AssistantContentAnnotation]）发回。请求从最近一个有效摘要块开始，沿用原 system、工具和
+// 摘要之后的块。调用方持有完整消息历史。失败的空摘要不作为裁切边界。
 //
-// 代价：压缩让 prompt cache 从头开始；压缩之前的 thinking 不会带到之后。摘要那一步的用量不在顶层 usage
-// 里（顶层只算模型答这一轮），记在 [CompactionAnnotation]。消息照常全发，本包不替调用方删历史。
+// 压缩后 prompt cache 从摘要重新建立。摘要用量单独记入 [CompactionAnnotation]。
 //
 // 不支持 pause_after_compaction（那会让一次调用只返回 compaction 块、stop_reason=compaction）。
 func WithCompaction(cfg Compaction) ClientOption {
@@ -337,7 +336,7 @@ func (c *Client) Generate(ctx context.Context, messages []*schema.Message, opts 
 	if err != nil {
 		return nil, err
 	}
-	reqOpts := append(req.opts, option.WithRequestTimeout(c.attemptTimeout(req.params.MaxTokens)))
+	reqOpts := append(req.options(), option.WithRequestTimeout(c.attemptTimeout(req.params.MaxTokens)))
 	resp, err := c.sdk.Beta.Messages.New(ctx, req.params, reqOpts...)
 	if err != nil {
 		return nil, c.requestError(err)
@@ -375,9 +374,9 @@ func (c *Client) Stream(ctx context.Context, messages []*schema.Message, opts ..
 	// 读响应体用一个可单独取消的 ctx：消费方 Close 时取消它，正阻塞在读响应体上的 goroutine 立刻
 	// 返回，连接随之释放。
 	streamCtx, cancel := context.WithCancel(ctx)
-	reqOpts := req.opts
+	reqOpts := req.options()
 	if c.streamIdleTimeout > 0 {
-		reqOpts = append(append([]option.RequestOption(nil), req.opts...), idleMiddleware(c.streamIdleTimeout))
+		reqOpts = append(reqOpts, idleMiddleware(c.streamIdleTimeout))
 	}
 	stream := c.sdk.Beta.Messages.NewStreaming(streamCtx, req.params, reqOpts...)
 	// SDK 在 NewStreaming 里就发出了请求：HTTP 层的错误（4xx / 5xx / 网络）此刻已在 Err 上，

@@ -129,7 +129,7 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 快照里 `tool_use.input` 用响应原文：SDK 把块转成请求形状时会把 input 解成 `any`，超过 2^53 的整数（雪花 ID、纳秒时间戳）与高精度小数会变成 float64 近似值——值变了既是改了前缀，也让模型看到的参数跟实际执行的不一样。
 - `max_tokens` 截在工具调用中间（结束原因 `max_tokens` 且最后一块是 `tool_use`）：这个调用带着解析不了的参数交出（流式是收到的原文，非流式是去掉末尾 `}` 的 input），框架按「参数非法」拒掉、以失败结果交回模型，不会拿残缺的参数执行（SDK 累积流式响应时会把截断的参数换成 `{}`，照它交出工具就会拿空参数跑）。同一条响应里更早的、完整的工具调用照常执行。
 - 服务端回退在中途切换模型时，切换点之前被拒模型的 thinking 与工具调用作废：不回放、工具调用不交出（所以流式把工具调用压到最后一片才交），文本照常保留；切换经过记在标注 `anthropic.fallback`（`anthropic.Fallbacks(msg)` 读）。
-- 服务端压缩返回的 compaction 块跟别的块一样进快照、原样回放（排在服务端回退切换点之前的也保留：压缩的是这次请求的输入，跟哪个模型接着答无关），API 据它把块之前的历史换成摘要；调用方的历史照常只追加、全量发送，本包不删。
+- 服务端返回的 compaction 块进入回放快照，包括排在服务端回退切换点之前的摘要。配置 `WithCompaction` 时，生成、流式及计数请求从最近一个有效摘要块开始，保留原 `system`、工具定义和摘要之后的块。失败的空摘要不作为新边界，调用方仍持有完整历史。 [Anthropic compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#passing-compaction-blocks-back)
 - API 对输入的改动（丢掉的 thinking 块等）按（种类, 原因）归并计数，记在标注 `anthropic.input_transformations`（`anthropic.InputTransformations(msg)` 读），每条响应打一条告警。不逐块记：历史改过之后，后面每次请求都会把同一批块再丢一遍，逐块记会让会话标注按轮数的平方增长。
 - 服务端实际应用的上下文清理记在 `anthropic.context_edits`。`anthropic.AppliedContextEdits(msg)` 可从完整答复或流式聚合消息读取清理策略、释放的输入 token 数及被清理的工具调用或 thinking 轮数。消息用量沿用服务端计费字段。
 
@@ -143,6 +143,8 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 用量：`InputTokens` 含 cache 读写两部分，`CachedInputTokens` = cache 读，`CacheCreationInputTokens` = cache 写，`OutputTokens` 是 API 的 `output_tokens` 原样（含 thinking，计费口径），`ThinkTokens` = 其中的 `output_tokens_details.thinking_tokens`。服务端回退时只计接着答的那次尝试（被拒的那次在 `usage.iterations` 里，不汇总）。服务端压缩那一步的用量也不在顶层 usage 里（顶层只算模型答的那一轮，`InputTokens` 就是压缩之后的上下文，按它估上下文大小仍然对），每次压缩一项记在标注 `anthropic.compaction`（`anthropic.Compactions(msg)` 读；iterations 没报而 content 里有 compaction 块时补一项 0）。
 - 采样参数（`model.WithTemperature` / `WithTopP`）原样转发：Opus 4.7 起的 Opus 模型只要带上就返回 400，Fable 5.1 / Haiku 5.5 只接受默认值；确定性失败、不重试。
 
+调用方可用 `client.CountInputTokens(ctx, messages, opts...)` 获取 Claude 计数端点返回的输入 token 估计。它复用生成请求的可计数字段，保留签名 thinking、工具参数和合并后的 `ExtraBody`。调用方显式发起计数，Agent 的本地压缩阈值沿用消息估算。计费及缓存指标以生成响应的 `Usage` 为准。 [Anthropic token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
+
 ### 5.4 跟 crew-go 其他功能的冲突
 
 下列功能会改写更早的消息、`system` 或工具集，之后的 thinking 块对不上前缀。默认 `drop_block` 下请求照常，但 API 丢的是第一个对不上的块**以及它之后的每一个 thinking 块**（直到下一个 compaction 块），并且之后每次请求都再丢一遍——改动之后这场会话基本没有回放的推理可用，模型可能多想补回来；`PrefixMismatchError` 下之后每次请求都 400。同时 prompt cache 从改动处失效：
@@ -152,9 +154,9 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 - 每次 Run 变化的开头 system 消息：`WithStoreMemory` 每次 Run 检索一次，结果作为开头的 system 消息进顶层 `system`。
 - Handoff 的 Raw 历史（`HistoryForRaw`）把别的 agent 的 assistant 消息连同回放快照原样交给接手的 agent：那些 thinking 是在另一套 `system` / tools 下产生的，必然对不上。
 
-上下文管理换成服务端压缩（`WithCompaction`）就不冲突：客户端历史不改，前缀校验从最近的 compaction 块算起，压缩之后产生的 thinking 照常回放（见 5.5 实测）；代价是压缩让 prompt cache 从头开始，压缩之前的 thinking 不带到之后。已知局限：客户端仍发全量历史，ReactiveCompact 按本地全量估 token、从最旧的组删起，而最新 compaction 块之前的内容服务端本来就不看——它的头几次重试在服务端眼里输入没变；另外 SDK 累积流式响应时 `compaction_delta` 是赋值不是追加，真 API 若把摘要拆成多段 delta 只剩最后一段（SDK 行为，未见实例）。
+服务端压缩的回放前缀从有效 compaction 块开始，后续 thinking 随块原样回放。ReactiveCompact 仍按本地消息流裁剪，若只删到摘要之前，有效送模输入可能不变。服务端流式压缩以一次 `compaction_delta` 交付完整摘要。 [Anthropic compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#streaming)
 
-`WithContextEditing` 同样发送原会话。对支持 preserved thinking 的模型，Anthropic 在服务端清理时维护 thinking 签名有效性。清理会使编辑位置起的 prompt cache 失效，后续请求可复用新的缓存前缀。工具结果清理可用 `ClearAtLeastTokens` 设每次清理的最低收益。 [Anthropic 缓存与清理约定](https://platform.claude.com/docs/en/build-with-claude/context-editing#context-editing-and-prompt-caching)
+`WithContextEditing` 在服务端按策略编辑请求视图。对支持 preserved thinking 的模型，Anthropic 在服务端清理时维护 thinking 签名有效性。清理会使编辑位置起的 prompt cache 失效，后续请求可复用新的缓存前缀。工具结果清理可用 `ClearAtLeastTokens` 设每次清理的最低收益。 [Anthropic 缓存与清理约定](https://platform.claude.com/docs/en/build-with-claude/context-editing#context-editing-and-prompt-caching)
 
 `agent_v2.NewLLMPlanner` 读取 `StructuredCapability`。Claude 由提示词引导自动选择本轮绑定的 `plan` 或 `respond`，模型没有返回工具调用时可用 `errors.Is` 判断 `ErrPlannerNoToolCall`。
 
@@ -163,6 +165,8 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 ### 5.5 测试
 
 单测（`model/anthropic/*_test.go`）用 httptest 桩断言请求体；真 API 冒烟 `example/model/anthropic_smoke`（`//go:build integration`，需 `ANTHROPIC_API_KEY`），全部用例都在 `prefix_mismatch_behavior: "error"` 下跑：BasicAgent 跨两次 Run 的多轮工具调用、中途 system 消息、prompt cache 命中、并行工具结果合并、服务端压缩。压缩用例 2026-10-23 实跑（`claude-haiku-5-5`、阈值 5 万、自定义 instructions）：第一轮约 7.5 万 token 的输入触发压缩，响应带 compaction 块、`Compactions` 记下一项；第二轮原样回放它（连同第一轮的 thinking），没有 400，计费输入只剩一两千 token（两次实跑 655 / 1221），模型凭摘要答出开头埋的暗号。
+
+`TestSmoke_ThinkingInputTokens` 比较同一段可见历史带签名和只保留文本时的输入估计，并记录真实生成用量和本地字符估算。测试需要 `ANTHROPIC_API_KEY`。 [计数冒烟](../../example/model/anthropic_smoke/anthropic_smoke_test.go)
 
 `TestSmoke_ContextEditing` 覆盖两种清理的实际统计、配上 compaction 的请求和严格前缀校验下的流式回放。真 API 验收记录在待办 A06。 [冒烟测试](../../example/model/anthropic_smoke/context_editing_test.go) · [A06](../code/todo.md#p3--窄路径扩展与设计决策)
 

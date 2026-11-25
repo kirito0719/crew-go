@@ -36,11 +36,11 @@
 | A06 | 验收 | Anthropic 真流、错误分类与服务端上下文清理 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。跑 `TestSmoke_ContextEditing` 确认两种清理的实际统计、与 compaction 组合的请求以及严格前缀回放。另核对实际触发压缩后的交互和编辑前后的缓存用量。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [流式冒烟命令](../description/smoke-test-recipes.md) · [清理冒烟](../../example/model/anthropic_smoke/context_editing_test.go) |
 | A07 | 验收 | 跑齐 thinking 多轮回放、关停和 provider 变体 | 使用现有模型集成入口补 3 轮以上及中途关闭的对照。Anthropic 的空闲/计费另见 A06。历史 TODO 570。 |
 | A09 | 验收 | Plan Web 生产入口与生命周期 | mock 已覆盖挂起、续跑及完成态。目标环境仍需验鉴权、Cookie、反向代理、状态 TTL 和故障恢复。共享 Redis 迁移、双副本切换和跨副本续跑暂缓。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
-| A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `ReasoningContent` 文本已计入，签名块可能仅存在标注。优先用真实回放的服务端 input usage 对照触发点。历史 TODO 329。 [估算](../../compose_v2/token_estimate.go) · [Anthropic](../../model/anthropic/client.go) |
+| A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `CountInputTokens` 已通过签名回放与请求字段的本地回归。用 `TestSmoke_ThinkingInputTokens` 比较签名、可见文本、实际输入用量与本地估算，确定压缩触发点。需要 Anthropic 凭据。历史 TODO 329。 [计数入口](../../model/anthropic/token_count.go) · [实测用例](../../example/model/anthropic_smoke/anthropic_smoke_test.go) |
 | Q01 | 待决 | 可插拔 Sandbox 的一致性边界 | 现有 `Sandbox` 和工具适配器只提供约定及单测。确定哪些文件、网络、进程及取消语义由每个应用实现保证，是否要落可共享 conformance。 [现行契约](../v2/sandbox.md) · [接口](../../sandbox/sandbox.go) |
 | Q05 | 待决 | 引入 AgenticMessage 或继续使用现行消息契约 | 对照现行 `schema.Message`、历史与流式适配器，决定是否需要双格式。依赖明确的跨 provider/消息生命周期诉求。 [演进状态](../description/three-way-comparison/eino-langgraph-upgrades.md) |
 | Q06 | 待决 | 故障分析 RCA 立项 | 已有设计提案。确认业务场景、知识来源和可信验收样本，再选择最小实现范围。 [设计](../v2/fault-analysis-system.md) |
-| Q08 | 待决 | 让 Claude 的签名 thinking 与压缩、工具和缓存前缀共存 | 列清历史/System/工具表改变导致签名失效的形状，分别决定何时 drop，何时重建，何时不承诺缓存复用。历史 TODO 321、352、525。 |
+| Q08 | 待决 | 让 Claude 的签名 thinking 与压缩、工具和缓存前缀共存 | 服务端压缩请求已从有效摘要块开始回放。继续核对本地压缩、System 与工具集变化对签名和缓存的影响。历史 TODO 321、352、525。 [送模契约](../v2/model-adaptation.md#54-跟-crew-go-其他功能的冲突) |
 | Q11 | 待决 | 工具审批如何按风险升级和允许模型请求 | Handoff 共享 MCP 目录的成员审批与执行已回归。风险默认行为、异步观察转同步确认、模型主动申请及理由仍需业务风险策略。历史 TODO 410、417、438。 |
 | Q12 | 待决 | 框架任务状态和调度约束的演进 | 阶段进度及租约接手已验收。检查 visit/化身、按调用单元声明 replay-safety、节点外围部署的预算、goal 的显式激活。历史 TODO 356、407、574。 |
 | Q13 | 待决 | 观测数据源与历史写入的权威 | 确定 Events 回放的作用域、历史异步写失败策略、条件否决重算时的 append 审计记录与送模投影、用户放弃时的原话/标记。历史 TODO 106、448 及 ISSUE-98。嵌套调用输入可根据同一调用的挂起记录恢复，写入后确认丢失不会重复追加。 |

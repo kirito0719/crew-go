@@ -21,11 +21,17 @@ import (
 	"crew-go/schema"
 )
 
-// wireRequest 是一次调用要发的东西：SDK 参数，加上这次调用专属的请求选项（合并了 ExtraBody 的
-// 请求体）。
+// wireRequest 是公共请求投影。配置 ExtraBody 时 body 保存合并后的请求体。
 type wireRequest struct {
 	params anthropic.BetaMessageNewParams
-	opts   []option.RequestOption
+	body   []byte
+}
+
+func (r *wireRequest) options() []option.RequestOption {
+	if r.body == nil {
+		return nil
+	}
+	return []option.RequestOption{option.WithRequestBody("application/json", r.body)}
 }
 
 // buildRequest 把 crew-go 的消息与选项转成一次 Messages API 请求。
@@ -45,6 +51,9 @@ func (c *Client) buildRequest(ctx context.Context, messages []*schema.Message, o
 	system, msgs, err := convertMessages(ctx, messages)
 	if err != nil {
 		return nil, err
+	}
+	if c.compaction != nil {
+		msgs = replayCompactedMessages(msgs)
 	}
 	params := anthropic.BetaMessageNewParams{
 		Model:     anthropic.Model(modelName),
@@ -162,9 +171,37 @@ func (c *Client) buildRequest(ctx context.Context, messages []*schema.Message, o
 		if err != nil {
 			return nil, fmt.Errorf("anthropic: merge extra body: %w", err)
 		}
-		req.opts = append(req.opts, option.WithRequestBody("application/json", body))
+		req.body = body
 	}
 	return req, nil
+}
+
+// replayCompactedMessages 在已转换的请求中找到最近一个有效摘要。只裁切本次请求，保留原消息和回放快照。
+func replayCompactedMessages(messages []anthropic.BetaMessageParam) []anthropic.BetaMessageParam {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != anthropic.BetaMessageParamRoleAssistant {
+			continue
+		}
+		blocks := messages[i].Content
+		for j := len(blocks) - 1; j >= 0; j-- {
+			// compaction 由 assistant 回放快照以原始 JSON 生成。
+			value, _ := blocks[j].Overrides()
+			raw, ok := value.(json.RawMessage)
+			if !ok {
+				continue
+			}
+			var block struct {
+				Type    string `json:"type"`
+				Content string `json:"content"`
+			}
+			// 失败的压缩块 content 为 null，不能覆盖更早的有效摘要或对话。
+			if json.Unmarshal(raw, &block) == nil && block.Type == "compaction" && block.Content != "" {
+				messages[i].Content = blocks[j:]
+				return messages[i:]
+			}
+		}
+	}
+	return messages
 }
 
 // convertMessages 把消息列表拆成顶层 system 与 messages。

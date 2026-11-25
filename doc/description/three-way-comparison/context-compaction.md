@@ -408,3 +408,8 @@ OpenAI Agents SDK 本地 `6c4e4a29` 的 `src/agents/models/_response_terminal.py
 ### 2026-11-24 转存记录的保留期限
 
 MicroCompact 给应用一个显式期限，默认由应用决定何时回收。工具原文和存档各有生命周期，应用选择可覆盖挂起窗口的期限。SQLite 磁盘验证同时保留永久与限时引用，关闭重开后按原 key 读取，限时条目到期后原有永久记录仍能读到。ReactiveCompact 继续裁剪已经送模的当轮视图，已有摘要随同视图受保护。[保留与恢复](../../v2/context-compaction.md#第-1-层microcompact-微压缩) · [SQLite 对照](../../../sql/microcompact_retention_test.go)
+
+
+### 2026-11-25 原生压缩的请求窗口
+
+Claude 服务端摘要已覆盖之前的消息。crew-go 在 Anthropic 请求组装时从最近有效摘要保留后续块，历史及摘要快照继续由调用方保存。与本地 AutoCompact 的摘要边界一样，下一次请求可使用已保存的摘要。Claude 的边界由服务端 compaction 块确定。原生计数复用同一请求窗口。 [Anthropic 回放与压缩](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#passing-compaction-blocks-back) · [本地请求回归](../../../model/anthropic/compaction_test.go)

@@ -104,7 +104,7 @@ func TestGenerate_CompactionBlockReplayed(t *testing.T) {
 		t.Fatalf("第二轮 Generate: %v", err)
 	}
 	wantContent := `[{"content":"之前聊了部署","encrypted_content":"enc-1","signature":"sig-c","type":"compaction"},{"text":"好的","type":"text"}]`
-	if got := canon(t, at(rec.at(t, 1).body, "messages", 1, "content")); got != wantContent {
+	if got := canon(t, at(rec.at(t, 1).body, "messages", 0, "content")); got != wantContent {
 		t.Errorf("回放的 assistant content =\n%s\n期望\n%s", got, wantContent)
 	}
 }
@@ -151,7 +151,7 @@ func TestStream_CompactionBlockReplayed(t *testing.T) {
 		t.Fatalf("第二轮 Generate: %v", err)
 	}
 	want := `[{"content":"之前聊了部署","encrypted_content":"enc-1","type":"compaction"},{"text":"好的","type":"text"}]`
-	if got := canon(t, at(rec.at(t, 1).body, "messages", 1, "content")); got != want {
+	if got := canon(t, at(rec.at(t, 1).body, "messages", 0, "content")); got != want {
 		t.Errorf("回放的 assistant content =\n%s\n期望\n%s", got, want)
 	}
 }
@@ -171,5 +171,87 @@ func TestGenerate_CompactionBlockWithoutUsageStillRecorded(t *testing.T) {
 	}
 	if got := anthropic.Compactions(msg); !slices.Equal(got, []anthropic.CompactionUsage{{}}) {
 		t.Errorf("Compactions = %+v，期望一项用量为 0 的记录", got)
+	}
+}
+
+func TestGenerate_ReplaysFromNewestSuccessfulCompaction(t *testing.T) {
+	srv, rec := newServer(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		switch n {
+		case 1:
+			replyJSON(w, http.StatusOK, message([]any{
+				map[string]any{"type": "compaction", "content": "旧摘要", "encrypted_content": "old"},
+				map[string]any{"type": "text", "text": "旧答复"},
+			}, "end_turn", nil))
+		case 2:
+			replyJSON(w, http.StatusOK, message([]any{
+				map[string]any{"type": "text", "text": "摘要前的同条内容"},
+				map[string]any{"type": "compaction", "content": "最新摘要", "encrypted_content": "new", "signature": "sig-summary"},
+				map[string]any{"type": "thinking", "thinking": "", "signature": "sig-after"},
+				map[string]any{"type": "tool_use", "id": "lookup-id", "name": "lookup", "input": map[string]any{"id": 3}},
+			}, "tool_use", nil))
+		case 3:
+			replyJSON(w, http.StatusOK, message([]any{
+				map[string]any{"type": "compaction", "content": nil, "signature": nil},
+				map[string]any{"type": "text", "text": "仍需回放的答复"},
+			}, "end_turn", nil))
+		default:
+			textReply(w, r, n)
+		}
+	})
+	ctx := t.Context()
+	client := newClient(srv, anthropic.WithCompaction(anthropic.Compaction{}))
+	var replies []*schema.Message
+	for range 3 {
+		reply, err := client.Generate(ctx, []*schema.Message{schema.UserMessage("准备回放材料")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		replies = append(replies, reply)
+	}
+	msgs := []*schema.Message{
+		schema.SystemMessage("保留 system"), schema.UserMessage("已摘要的旧前缀"), replies[0],
+		schema.UserMessage("新摘要覆盖的请求"), replies[1], schema.ToolResultMessage("lookup-id", "结果"),
+		replies[2], schema.UserMessage("下一轮"),
+	}
+	before := canon(t, msgs)
+	if _, err := client.Generate(ctx, msgs); err != nil {
+		t.Fatal(err)
+	}
+	if got := canon(t, msgs); got != before {
+		t.Fatal("组装请求必须保留调用方持有的完整历史")
+	}
+	body := rec.at(t, 3).body
+	if got := str(body, "system", 0, "text"); got != "保留 system" {
+		t.Fatalf("system = %q", got)
+	}
+	history := body["messages"].([]any)
+	if len(history) != 4 {
+		t.Fatalf("应从最近有效摘要开始保留四条 API 消息，实际 %s", canon(t, history))
+	}
+	want := `[{"content":"最新摘要","encrypted_content":"new","signature":"sig-summary","type":"compaction"},` +
+		`{"signature":"sig-after","thinking":"","type":"thinking"},{"id":"lookup-id","input":{"id":3},"name":"lookup","type":"tool_use"}]`
+	if got := canon(t, at(history, 0, "content")); got != want {
+		t.Fatalf("应从有效摘要块开始，保持签名与后续工具调用：%s", got)
+	}
+	if str(history, 1, "content", 0, "tool_use_id") != "lookup-id" ||
+		str(history, 2, "content", 0, "type") != "compaction" ||
+		at(history, 2, "content", 0, "content") != nil ||
+		str(history, 3, "content", 0, "text") != "下一轮" {
+		t.Fatalf("工具配对、失败摘要和后续消息必须原样保留：%s", canon(t, history))
+	}
+
+	if _, err := client.Generate(ctx, []*schema.Message{schema.UserMessage("失败摘要不覆盖此前请求"), replies[2], schema.UserMessage("继续")}); err != nil {
+		t.Fatal(err)
+	}
+	failedOnly := rec.at(t, 4).body
+	if got := str(failedOnly, "messages", 0, "content", 0, "text"); got != "失败摘要不覆盖此前请求" {
+		t.Fatalf("仅有失败摘要时首条请求必须保留，得到 %q", got)
+	}
+	without := newClient(srv)
+	if _, err := without.Generate(ctx, msgs); err != nil {
+		t.Fatal(err)
+	}
+	if got := str(rec.at(t, 5).body, "messages", 0, "content", 0, "text"); got != "已摘要的旧前缀" {
+		t.Fatalf("未启用服务端压缩时首条请求必须保留，得到 %q", got)
 	}
 }

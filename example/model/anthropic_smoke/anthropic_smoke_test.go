@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -416,19 +417,71 @@ func TestSmoke_Compaction(t *testing.T) {
 	}
 	reqs := rec.requests(t)
 	msgs, _ := reqs[len(reqs)-1]["messages"].([]any)
-	replayed := false
-	for _, m := range msgs {
-		blocks, _ := m.(map[string]any)["content"].([]any)
-		for _, b := range blocks {
-			if bm, _ := b.(map[string]any); bm["type"] == "compaction" {
-				replayed = true
-			}
-		}
+	if len(msgs) != 2 {
+		t.Fatalf("第二轮应发送摘要与最新用户消息，实际消息数 %d", len(msgs))
 	}
-	if !replayed {
-		t.Error("第二轮请求里没有回放 compaction 块")
+	firstWire, _ := msgs[0].(map[string]any)
+	blocks, _ := firstWire["content"].([]any)
+	if len(blocks) == 0 {
+		t.Fatal("第二轮未回放摘要")
+	}
+	summary, _ := blocks[0].(map[string]any)
+	if firstWire["role"] != "assistant" || summary["type"] != "compaction" || summary["content"] == nil {
+		t.Fatal("第二轮应从有效的 compaction 块开始")
 	}
 	if replayedThinking(reqs[len(reqs)-1:]) == 0 {
 		t.Error("第二轮没有回放压缩之后的 thinking 块，证明不了压缩不算改动")
 	}
+}
+
+// TestSmoke_ThinkingInputTokens 测量同一段可见历史有无签名时的输入估计，并记录实际生成用量。
+func TestSmoke_ThinkingInputTokens(t *testing.T) {
+	c, rec := newClient(t, anthropic.WithEffort(anthropic.EffortHigh),
+		anthropic.WithThinkingDisplay(anthropic.DisplayOmitted))
+	firstInput := schema.UserMessage("计算长度为 32 的二进制字符串中，恰有 8 个 1 且没有两个 1 相邻的字符串数量。用中文给出推导。")
+	first, err := c.Generate(t.Context(), []*schema.Message{firstInput})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Content == "" || first.ReasoningContent != "" || first.Metadata == nil || first.Metadata.Usage == nil || len(schema.GetToolCalls(first)) != 0 {
+		t.Fatalf("需要纯文本答复与隐藏的 thinking，实际 %+v", first)
+	}
+	followUp := schema.UserMessage("如果字符串长度改为 36，其余条件不变，数量是多少？")
+	history := []*schema.Message{firstInput, first, followUp}
+	withSignature, err := c.CountInputTokens(t.Context(), history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqs := rec.requests(t)
+	if withSignature <= 0 || replayedThinking(reqs[len(reqs)-1:]) == 0 {
+		t.Fatal("需要包含签名的实际计数请求")
+	}
+	// 从实际计数请求移除 thinking，保持可见块的边界和值作为对照。
+	control, _ := reqs[len(reqs)-1]["messages"].([]any)
+	for _, row := range control {
+		msg, _ := row.(map[string]any)
+		if msg["role"] != "assistant" {
+			continue
+		}
+		blocks, _ := msg["content"].([]any)
+		msg["content"] = slices.DeleteFunc(blocks, func(block any) bool {
+			b, _ := block.(map[string]any)
+			return b["type"] == "thinking" || b["type"] == "redacted_thinking"
+		})
+	}
+	withoutSignature, err := c.CountInputTokens(t.Context(), history, model.WithExtraBody(map[string]any{"messages": control}))
+	if err != nil || withoutSignature <= 0 {
+		t.Fatalf("可见文本对照计数 = %d，错误 %v", withoutSignature, err)
+	}
+	second, err := c.Generate(t.Context(), history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNoPrefixMismatch(t, second)
+	if second.Metadata == nil || second.Metadata.Usage == nil || second.Metadata.Usage.InputTokens <= 0 {
+		t.Fatal("生成响应缺少输入用量")
+	}
+	t.Logf("model=%s output_thinking=%d signed_input_estimate=%d visible_input_estimate=%d generate_input_usage=%d local_estimate=%d",
+		first.Metadata.Model, first.Metadata.Usage.ThinkTokens, withSignature, withoutSignature, second.Metadata.Usage.InputTokens,
+		compose_v2.EstimateMessageTokens(history))
 }
