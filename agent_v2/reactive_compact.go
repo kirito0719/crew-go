@@ -24,7 +24,7 @@ import (
 // 触发：BasicAgent makeModelFn 内 callLLM retry 循环包围 streamOrGenerate 单次
 // 调用，捕获 prompt-too-long 错误（IsPromptTooLongError 判定 11 条精确字符串）。
 // 失败请求带有效的服务端摘要时，只处理该摘要起的实际上下文。保留摘要和同组的工具配对。
-// 丢弃最旧的可裁轮次时保留至少一轮。无法丢组时尝试就地缩短大工具结果。
+// 保留最近的用户原始输入、最新的对话组和之后的补充。无法丢组时尝试就地缩短大工具结果。
 // 重试仅使用局部视图，下一轮仍读取原消息流。
 
 // ReactiveCompactConfig 控制 ReactiveCompact 行为。
@@ -35,12 +35,12 @@ type ReactiveCompactConfig struct {
 	// MaxAttempts 同一轮 LLM 调用最大重试次数。<= 0 时使用默认值 3。
 	MaxAttempts int
 
-	// EmergencyDropPercent token gap 解析失败时按 N% 删除最旧消息组。
+	// EmergencyDropPercent token gap 解析失败时按可裁剪组数的 N% 删除最旧组。
 	// <= 0 时使用默认值 20。
 	EmergencyDropPercent int
 
 	// UserMarker 删消息后第一条不是 system 的若是 assistant，在它前面补这条 user 消息（API 要求 user 开头）。
-	// 空时使用 defaultUserMarker。
+	// 空时使用默认重试提示。
 	UserMarker string
 }
 
@@ -48,6 +48,7 @@ const (
 	defaultReactiveMaxAttempts = 3
 	defaultReactiveDropPercent = 20
 	defaultReactiveUserMarker  = "[continued after context overflow]"
+	reactiveCompactNote        = "crew_reactive_compact_note"
 )
 
 // promptTooLongMarkers 跨 provider 已知的"上下文超限"错误特征短语（小写匹配）。
@@ -129,12 +130,17 @@ func ParsePromptTooLongGap(err error) int {
 // emergencyDropOldestGroups 按 token gap 或固定百分比删最旧的消息组。
 //
 // 算法：
+//
 //  1. 隔离前导 system 消息（永不删——丢 system prompt 会让 LLM 行为崩溃）
+//
 //  2. 对 conv 部分做 GroupMessagesByAPIRound 分组——保 tool_use ↔ tool_result 配对完整
-//  3. gap > 0：按 token 估算从最旧累加直到达到 gap
-//     gap == 0：删最旧 dropPercent %
-//  4. 至少保留 1 组——单组对话也要能跑下去
+//
+//  3. 保留用户原始输入组、最近的对话组及之后的补充，并排除其他受保护组。
+//
+//  4. gap > 0 时按 token 估算从最旧累加直到达到 gap；gap == 0 时按可裁剪组数的比例删除。
+//
 //  5. 删后第一条不是 system 的若是 assistant，在它前面补 user marker（API 要求 user 开头）
+//
 //  6. 把 system 重新拼回最前
 func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap int, marker string, keepFirstGroup bool) []*schema.Message {
 	if len(messages) == 0 {
@@ -162,30 +168,28 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 		return giveUpOrShrink(messages, gap)
 	}
 
+	// 索引会在裁剪后按转存引用重建，先取出已有的索引，避免本次只删掉一条会原样补回的消息。
+	conv, spillSources := separateReactiveSpillIndexes(conv)
 	groups := compose_v2.GroupMessagesByAPIRound(conv)
 	if len(groups) <= 1 {
 		return giveUpOrShrink(messages, gap)
 	}
 
-	// 步骤 1.5：识别 droppable 组——含 AutoCompactSummaryAnnotation 的组保护
-	// （丢 summary 等于丢早期所有压缩历史，比丢一个普通 round 严重得多）。
-	// droppableIdx 按从旧到新的顺序记录可丢弃组的全局索引。
-	// 混着 system 的组可以丢，丢的时候 system 原地留下（见 isProtectedGroup 的「只有 system 的组」那一条）。
+	// 最后一条业务消息定近期边界。附在后面的插话、闸门反馈和框架提示仍可使用该轮的回复与工具结果。
+	tail := len(groups) - 1
+	for tail > 0 && !slices.ContainsFunc(groups[tail], func(m *schema.Message) bool {
+		return m.Role != schema.RoleSystem && !IsFrameworkNote(m) && !isPendingUserInput(m)
+	}) {
+		tail--
+	}
+	request := lastUserGroupIndex(groups, false)
 	var droppableIdx []int
-	for i, g := range groups {
-		if (keepFirstGroup && i == 0) || isProtectedGroup(g) {
+	for i, group := range groups[:tail] {
+		if i == request || (keepFirstGroup && i == 0) || isProtectedGroup(group) {
 			continue
 		}
 		droppableIdx = append(droppableIdx, i)
 	}
-	// **R21 audit HIGH-2 修订**：原"全 protected 兜底删 groups[0]"会破坏 SkillBody
-	// 配对——若 groups[0] 是 [asst tool_call, tool_result(ack with marker)]，删后
-	// kept[0]=[user(body of skill1)] 但配对 asst 已删，孤儿 user message；更糟
-	// groups[0]=[asst tool_call] groups[1]=[tool_result(ack)] 时删 [0] 后 kept 起
-	// 头是 RoleTool → API 422 "tool messages must immediately follow assistant"。
-	//
-	// 改：全 protected 时**不删**——返原 messages 让 callLLM 重试外层走 retry 失败
-	// 路径，最终业务看到 prompt-too-long 错误（精准信号）而非 silent 破坏 pair。
 	if len(droppableIdx) == 0 {
 		return giveUpOrShrink(messages, gap)
 	}
@@ -202,17 +206,7 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 			}
 		}
 	} else {
-		dropCount = len(droppableIdx) * dropPercent / 100
-		if dropCount < 1 {
-			dropCount = 1
-		}
-	}
-	if dropCount >= len(droppableIdx) {
-		dropCount = len(droppableIdx) - 1
-	}
-	// 永远保留至少 1 组对话——单组 droppable 时 dropCount=0 → 不动
-	if dropCount <= 0 {
-		return giveUpOrShrink(messages, gap)
+		dropCount = max(1, len(droppableIdx)*min(dropPercent, 100)/100)
 	}
 
 	// 构造 toDrop set：droppableIdx 的最旧 dropCount 个
@@ -223,7 +217,6 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 
 	// 按原顺序保留未被 drop 的组
 	keptGroups := make([][]*schema.Message, 0, len(groups)-dropCount)
-	var dropped []*schema.Message
 	for i, g := range groups {
 		if !toDrop[i] {
 			keptGroups = append(keptGroups, g)
@@ -233,12 +226,15 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 		if len(sysMsgs) > 0 {
 			keptGroups = append(keptGroups, sysMsgs)
 		}
-		dropped = append(dropped, rest...)
+		spillSources = append(spillSources, rest...)
 	}
 	// 转存索引须落在模型实际收到的窗口内。在服务端摘要之后插入时保留摘要组内的配对。
-	if idx := spillIndex(dropped); len(idx) > 0 {
+	if idx := spillIndex(spillSources); len(idx) > 0 {
 		indexMsg := schema.UserMessage(spillIndexText(idx))
-		indexMsg.Annotations = map[string]any{spillIndexAnnotation: strings.Join(idx, "\n")}
+		indexMsg.Annotations = map[string]any{
+			spillIndexAnnotation: strings.Join(idx, "\n"),
+			reactiveCompactNote:  true,
+		}
 		at := 0
 		if keepFirstGroup {
 			at = 1
@@ -256,7 +252,9 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 		if m.Role == schema.RoleAssistant && !keepFirstGroup {
 			withMarker := make([]*schema.Message, 0, len(kept)+1)
 			withMarker = append(withMarker, kept[:i]...)
-			withMarker = append(withMarker, schema.UserMessage(marker))
+			notice := schema.UserMessage(marker)
+			notice.Annotations = map[string]any{reactiveCompactNote: true}
+			withMarker = append(withMarker, notice)
 			kept = append(withMarker, kept[i:]...)
 		}
 		break
@@ -267,6 +265,32 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 	out = append(out, sys...)
 	out = append(out, kept...)
 	return out
+}
+
+// separateReactiveSpillIndexes 取出先前重试生成的索引，按原顺序保留索引和对话消息各自的内容。
+func separateReactiveSpillIndexes(messages []*schema.Message) (dialogue, indexes []*schema.Message) {
+	isIndex := func(m *schema.Message) bool {
+		if m == nil || m.Role != schema.RoleUser {
+			return false
+		}
+		note, _ := m.Annotations[reactiveCompactNote].(bool)
+		index, _ := m.Annotations[spillIndexAnnotation].(string)
+		return note && index != ""
+	}
+	first := slices.IndexFunc(messages, isIndex)
+	if first < 0 {
+		return messages, nil
+	}
+	dialogue = make([]*schema.Message, 0, len(messages)-1)
+	dialogue = append(dialogue, messages[:first]...)
+	for _, m := range messages[first:] {
+		if isIndex(m) {
+			indexes = append(indexes, m)
+		} else {
+			dialogue = append(dialogue, m)
+		}
+	}
+	return dialogue, indexes
 }
 
 // isProtectedGroup 检查组内任意消息是否带受保护 marker；带 marker 的组视为
@@ -452,10 +476,7 @@ func splitSystem(group []*schema.Message) (sysMsgs, rest []*schema.Message) {
 // giveUpOrShrink 是**「一组也丢不动」时的统一兜底**：先试着就地把超大的单条挖空，
 // 挖不动才返原样。
 //
-// ⚠️ **「丢不动」有四个出口**（对话段为空 / 只剩一组 / 全 protected / 算下来 dropCount 为 0），
-// 四个都得走这里——只挂其中一个的话，另外几个照旧直接放弃，而它们同样可能面对
-// 「里头有一条巨物」。**这条是写测试时撞出来的**：第一版只挂了「全 protected」那个，
-// fixture 却先撞上「只剩一组」那个早退，于是被测路径根本没执行。
+// 对话段为空、只剩一组，或保留近期对话和受保护组后无组可删时，均经过此处。
 //
 // 为什么就地挖空安全而「丢组」不安全：它**不动条数、不动 role 序、不碰 tool_call ID**
 // ⟹ tool_use ↔ tool_result 的配对约束天然不受影响，而那正是丢组时最容易破坏的东西。

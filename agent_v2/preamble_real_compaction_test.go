@@ -19,12 +19,14 @@ import (
 // 怎么走（建流失败曾经还会再调一次 Generate），按次数计的桩会把要测的那一次错位、让重试
 // 那条路根本没跑到。
 type ptlModel struct {
-	mu   sync.Mutex
-	last []*schema.Message
+	mu        sync.Mutex
+	last      []*schema.Message
+	overflows int
 }
 
 func (m *ptlModel) Generate(_ context.Context, msgs []*schema.Message, _ ...model.Option) (*schema.Message, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.last = append([]*schema.Message(nil), msgs...)
 	nTool, total := 0, 0
 	for _, x := range msgs {
@@ -33,23 +35,16 @@ func (m *ptlModel) Generate(_ context.Context, msgs []*schema.Message, _ ...mode
 		}
 		total += len(x.Content)
 	}
-	m.mu.Unlock()
-	// 见到紧急压缩补的那条 marker 就收尾——它是「压缩已经真跑过」的内容证据，
-	// 用它当收敛条件比按次数计数可靠（降级路径会把次数打乱）。
-	for _, x := range msgs {
-		if strings.Contains(x.Content, "[continued after context") {
-			return schema.AssistantMessage("最终答复"), nil
-		}
-	}
 	if nTool < 2 {
 		return schema.AssistantToolCallMessage([]schema.ToolCall{{
 			ID: fmt.Sprintf("c%d", nTool), Type: "function",
 			Function: schema.FunctionCall{Name: "bulk", Arguments: `{}`},
 		}}), nil
 	}
-	if total > 20000 {
+	if total > 35000 {
+		m.overflows++
 		return nil, errors.New(`{"error":{"code":"context_length_exceeded","message":` +
-			`"This model's maximum context length is 8192 tokens. However, your messages resulted in 50000 tokens."}}`)
+			`"This model's maximum context length is 8192 tokens. However, your messages resulted in 12288 tokens."}}`)
 	}
 	return schema.AssistantMessage("最终答复"), nil
 }
@@ -102,14 +97,15 @@ func TestPreamble_SurvivesRealEmergencyCompaction(t *testing.T) {
 		agent_v2.WithReactiveCompact(&agent_v2.ReactiveCompactConfig{Enabled: true}),
 		agent_v2.WithMaxRounds(6),
 	)
-	if _, err := ag.Run(context.Background(), agent_v2.NewRunSession(), schema.UserMessage("开始")); err != nil {
+	const oldHistory = "较早的任务记录"
+	session := agent_v2.NewRunSession()
+	seedAsst(session, "probe", "old-run", oldHistory+strings.Repeat(" old fact", 1900))
+	if _, err := ag.Run(t.Context(), session, schema.UserMessage("开始")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// 前提：紧急压缩真的发生过。没有它，下面那条断言在「压缩压根没触发」时恒真。
-	if !containsContent(m.last, "[continued after context") {
-		t.Fatalf("前提没搭对：没看到紧急压缩补的 marker，压缩那条路没跑到，本用例什么也没测。"+
-			"模型实收：%s", renderRoles(m.last))
+	if m.overflows != 1 || containsContent(m.last, oldHistory) {
+		t.Fatalf("模型应先遇到超窗，再收到裁掉旧历史的请求。超窗 %d 次，最终输入 %s", m.overflows, renderRoles(m.last))
 	}
 
 	// 承重：压缩跑完之后，四条前言必须一条不少地还在模型的入参里。

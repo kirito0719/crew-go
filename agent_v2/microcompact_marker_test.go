@@ -76,11 +76,8 @@ func (errSimulatedPromptTooLong) Error() string {
 //
 // **R21 audit HIGH-2 重评（false positive but 代码改进）**：
 // audit 报"全 protected 兜底删 groups[0] 破 SkillBody pair"——但原代码已有
-// `dropCount >= len(droppableIdx) { dropCount = len-1 }` 保护，单元素 droppableIdx
-// 时 dropCount 被 cap 到 0 → 早返回 → 实际不删。**所以原代码 functionally 安全**。
-// 但代码可读性差（隐式 cap 才避免 bug）——R21 改 explicit early return 让意图清晰。
-//
-// 本测试验证 explicit fix 不引入回归（全 protected 时返原 messages）。
+// 旧实现把当前轮算进可删候选，最终靠至少保留一组的上限避免丢组。
+// 现在先识别当前轮和受保护的组。此用例验证剩余候选为空时保留所有原消息。
 func TestReactiveCompact_R21_HIGH2_AllProtectedReturnsUnchanged(t *testing.T) {
 	// 全 protected 场景：4 个 group 全标 SkillBody marker
 	msgs := []*schema.Message{schema.SystemMessage("sys")}

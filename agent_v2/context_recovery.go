@@ -199,15 +199,8 @@ func foldContextRecovery(ctx context.Context, agent string, cfg *ContextRecovery
 		return msgs, -1
 	}
 	groups := compose_v2.GroupMessagesByAPIRound(msgs)
-	lastUser := lastUserGroupIndex(groups)
-	currentUser := -1
-	for i, group := range groups {
-		for _, msg := range group {
-			if msg != nil && msg.Role == schema.RoleUser && !IsFrameworkNote(msg) && !isPendingUserInput(msg) {
-				currentUser = i
-			}
-		}
-	}
+	lastUser := lastUserGroupIndex(groups, true)
+	currentUser := lastUserGroupIndex(groups, false)
 	pendingStart := len(groups)
 	if lastUser >= 0 && allPendingUserInput(groups[lastUser]) {
 		pendingStart = lastUser

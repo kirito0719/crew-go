@@ -457,7 +457,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		if len(newGroups) == 0 {
 			return messages, nil
 		}
-		t := lastUserGroupIndex(newGroups)
+		t := lastUserGroupIndex(newGroups, true)
 		if t < 0 {
 			t = len(newGroups) - 1 // 新增部分里没有用户消息（同一次 Run 的 ReAct 轮）：最后 1 组作 tail
 		}
@@ -468,7 +468,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		if len(groups) <= 1 {
 			return messages, nil
 		}
-		tailStartIdx = lastUserGroupIndex(groups)
+		tailStartIdx = lastUserGroupIndex(groups, true)
 		if tailStartIdx <= 0 {
 			// user 在第 1 组或没有 user → 兜底用最后 1 组作 tail
 			tailStartIdx = len(groups) - 1
@@ -852,16 +852,15 @@ func groupContainsProtectedMarker(group []*schema.Message) bool {
 	return false
 }
 
-// lastUserGroupIndex 返回 groups 中含最后一条 user 消息的组索引；找不到返回 -1。
-// AutoCompact 用此确定 tail 边界——从含 user 的组起作为 tail（保留用户提问 +
-// 之后所有 agent 轮次完整上下文）。
-func lastUserGroupIndex(groups [][]*schema.Message) int {
+// lastUserGroupIndex 返回最近的用户消息所在组，找不到时返回 -1。
+// includePending 控制是否计入运行中收到的插话和闸门反馈。
+func lastUserGroupIndex(groups [][]*schema.Message, includePending bool) int {
 	for i := len(groups) - 1; i >= 0; i-- {
 		for _, m := range groups[i] {
 			// 框架以 user 角色追加的提示（后台任务通知、重复调用提醒、inline skill 正文，见 IsFrameworkNote）不是用户说的
 			// 话：它们排在用户这一轮的提问之后，按它们定尾部会把用户刚问的话连同这一轮的工具往返摘进摘要（实测）。跳过，
 			// 尾部跟没有这些提示时一样。
-			if m != nil && m.Role == schema.RoleUser && !IsFrameworkNote(m) {
+			if m != nil && m.Role == schema.RoleUser && !IsFrameworkNote(m) && (includePending || !isPendingUserInput(m)) {
 				return i
 			}
 		}

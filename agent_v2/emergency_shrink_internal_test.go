@@ -34,15 +34,7 @@ func protectedBig() []*schema.Message {
 // **为什么就地挖空是安全的，而丢组不是**：它不动条数、不动 role 序、不碰 tool_call ID
 // ⟹ 配对约束天然不受影响。所以这条同时断言「变小了」**和**「一条都没少、配对锚点没动」。
 func TestEmergencyDrop_ShrinksWhenNothingDroppable(t *testing.T) {
-	// **能挖空的三个出口各跑一遍**：只挂其中一个的话，其余照旧直接放弃——第一版就是那样，
-	// 而 fixture 恰好先撞上「只剩一组」那个早退，被测路径根本没执行（fixture 陷阱：
-	// 早退兜底盖过 fix 路径）。
-	//
-	// ⚠️ 这里原先写着「三个出口」而 cases 只有两条，`dropCount 归零` 那个出口一直没人跑
-	// （coverage 实测 0）——而它是最常见的形态：**只有一组可丢**时 dropCount 被钳成 0。
-	// 第四个出口 `len(conv) == 0`（整条消息流全是前导 system）**结构上挖不动**：挖空只
-	// 认 `RoleTool` 且 >2000 字节，而前导 system 块里不可能有 tool 消息 ⟹ 它是纯放弃，
-	// 由下面的 TestEmergencyDrop_AllSystemGivesUp 单独钉。
+	// 单组、全带保护标记，以及当前轮无标记但其余组受保护时，都要尝试缩短工具结果。
 	cases := map[string][]*schema.Message{
 		// 出口一：conv 只切出一组
 		"只剩一组": protectedBig(),
@@ -53,10 +45,10 @@ func TestEmergencyDrop_ShrinksWhenNothingDroppable(t *testing.T) {
 			s2.Annotations = map[string]any{SkillBodyAnnotation: true}
 			return append(out, schema.UserMessage("u2"), s2)
 		}(),
-		// 出口三：多组、有可丢的，但**只有一组**可丢 ⟹ dropCount 被钳成 0（保底留 1 组）
-		"只有一组可丢": func() []*schema.Message {
+		// 出口三：唯一无保护标记的组是当前轮。
+		"只剩当前轮无标记": func() []*schema.Message {
 			out := protectedBig() // [system 前导][system 记忆][user u1][tool skill body]（受保护）
-			// 第二组不带任何保护 marker ⟹ droppable，且正文更大，确保它被优先挖空
+			// 第二组的工具正文更大，会优先被缩短。
 			free := schema.ToolResultMessage("c3", "H3"+strings.Repeat("w", 50000)+"T3")
 			return append(out, schema.UserMessage("u2"), free)
 		}(),
