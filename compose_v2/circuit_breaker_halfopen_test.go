@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"crew-go/compose_v2"
@@ -16,32 +17,35 @@ import (
 // sanity：revert 修复（Allow cooldown 过后无 probing 全放行）后，N 个并发 Allow 都返 true
 // → allowed==N != 1 → FAIL 精确指向 thundering herd。
 func TestCircuitBreaker_HalfOpen_SingleProbe(t *testing.T) {
-	cb := compose_v2.NewCircuitBreakerWithCooldown(1, 10*time.Millisecond)
-	cb.RecordFailure() // maxFailures=1 → trip
-	if cb.Allow() {
-		t.Fatal("刚 trip cooldown 未过应 false")
-	}
-	time.Sleep(25 * time.Millisecond) // cooldown 过
+	synctest.Test(t, func(t *testing.T) {
+		cb := compose_v2.NewCircuitBreakerWithCooldown(1, 10*time.Millisecond)
+		cb.RecordFailure() // maxFailures=1 → trip
+		if cb.Allow() {
+			t.Fatal("刚 trip cooldown 未过应 false")
+		}
+		time.Sleep(25 * time.Millisecond) // 推进到半开。
 
-	const N = 32
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	var allowed atomic.Int64
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start // 屏障：强制真正并发（防 Go scheduler 串行化 thundering herd）
-			if cb.Allow() {
-				allowed.Add(1)
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
-	if got := allowed.Load(); got != 1 {
-		t.Fatalf("half-open 应只放行单次探测，got %d 个 Allow=true（thundering herd）", got)
-	}
+		const N = 32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		var allowed atomic.Int64
+		// 同时释放请求。竞争期间虚拟时钟不前进，探测不会在本批内过期。
+		for i := 0; i < N; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if cb.Allow() {
+					allowed.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if got := allowed.Load(); got != 1 {
+			t.Fatalf("half-open 应只放行单次探测，got %d 个 Allow=true（thundering herd）", got)
+		}
+	})
 }
 
 // TestCircuitBreaker_HalfOpen_ProbeStuckRecovers 验证 probing 卡死兜底：探测方

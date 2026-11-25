@@ -207,7 +207,8 @@ func WithCheckpointer(cp compose_v2.Checkpointer) Option {
 //     部署下回收会拖后——没请求就不扫。可以接受，因为没请求也就不新增；而且第 1 段已经
 //     保证了「过期的绝不会被用上」。
 //
-// 已取消且清理失败的任务仍可接收重试取消。TTL 回收也会尝试完成其清理。
+// 回收任务时先清理已配置的存档，再在原历史分区补齐工具结果。补写失败保留清理入口，
+// 同线程新 Run 或后续回收可继续清理。已配置存档的会话也可用原中断 ID 重试取消。
 //
 // 拆开是有意的：把「什么时候真删」和「什么时候算过期」绑在一起的话，回收延迟就变成了
 // 语义延迟——一条早该过期的会话在下次扫描之前仍然续得起来。
@@ -235,7 +236,8 @@ func WithSessionTTL(d time.Duration) Option {
 }
 
 // WithMaxSessions 设挂起会话上限（默认 DefaultMaxSessions）。超上限时淘汰一个空闲挂起
-// 会话 + 清其 cp，防前端放弃中断（关页面 / 断网）导致 sessions map 长跑 OOM。
+// 会话并清理存档，防前端放弃中断（关页面 / 断网）导致 sessions map 长跑 OOM。
+// 清档后的历史收尾与 [WithSessionTTL] 相同。
 // <=0 表示不限（不推荐生产用——AG-UI 无 a2a Cancel 那样的显式释放入口）。
 //
 // **淘汰谁：份额最大的那个 owner 出，且到达者不赢平局。** 单租户部署（resolver 返固定
@@ -243,10 +245,10 @@ func WithSessionTTL(d time.Duration) Option {
 // **可用会话数不打折**。多租户下，一个租户狂开会话挤掉的恒是它自己的；开个新会话就想
 // 挤掉别人挂起的 HITL 会话（连 cp 一起清）这条路是堵死的。
 //
-// ⚠️ **这个上限因此是软的**，两种情况下表会暂时超出它：
+// ⚠️ **这个上限因此是软的**，以下情况会让会话表暂时超出上限。
 //
 //   - 该出账的那个分区没有空闲会话可淘汰（典型：到达者只有刚插入的那条在途 entry）；
-//   - 要淘汰的会话正在途（busy）——在途的动不得，它正被一个请求驱动着。
+//   - 要淘汰的会话正在途（busy），或会话清理失败仍需重试。
 //
 // 换算下来实际占用约是 `max(maxSessions, 有挂起会话的租户数) + 在途请求数`。硬上限
 // 要靠「满了就拒绝新请求」来换，而那等于把一个安静的跨租户 DoS 换成一个吵闹的：任何
@@ -355,12 +357,12 @@ type sessionEntry struct {
 	sess       *agent_v2.RunSession // 中断挂起的 sess（待续发 Resume 续用）；busy 壳期间可能 nil
 	busy       bool                 // 有在途 Run/Resume 或正在回收
 	reclaiming bool                 // 正在回收的条目暂不计入淘汰配额
-	// abortCtx 记录取消时的值（包括业务历史归属），等待清档。由持有 busy 的请求读写。
+	// abortCtx 保存原任务清理所需的上下文。由持有 busy 的请求读写。
 	abortCtx context.Context
-	// replacementHistoryPending 只在旧存档已经删除、但原历史尚未补齐时为真。
-	replacementHistoryPending bool
-	history                   agent_v2.TaskHistoryDestination
-	touchedAt                 int64 // 最后活动 Unix nano，LRU 淘汰用
+	// historyCleanupPending 表示旧任务已放弃，仍需补齐原历史。
+	historyCleanupPending bool
+	history               agent_v2.TaskHistoryDestination
+	touchedAt             int64 // 最后活动 Unix nano，LRU 淘汰用
 	// open 按 InterruptID 记录挂起项类型。续跑的 resume 列表必须恰好覆盖它们。
 	open    map[string]interruptKind
 	schemas answerSchemas
@@ -569,7 +571,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			if started {
 				return
 			}
-			if stale != nil && (!replacing || stale.replacementHistoryPending || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
+			if stale != nil && (!replacing || stale.historyCleanupPending || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
 				h.restoreEntry(key, stale)
 				claimed = stale
 			} else {
@@ -619,7 +621,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the cancelled task still needs cleanup")
 			return
 		}
-		if stale.replacementHistoryPending {
+		if stale.historyCleanupPending {
 			runOpts = append(runOpts, agent_v2.WithSettledAbandonedTask(stale.sess.RunID))
 		}
 		stale = nil
@@ -693,13 +695,13 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			}
 			if stale.history.Store != nil {
 				stale.abortCtx = context.WithoutCancel(cleanupCtx)
-				stale.replacementHistoryPending = true
-				if err := closeReplacementHistory(dropCtx, stale, time.Time{}); err != nil {
+				stale.historyCleanupPending = true
+				if err := closeLocalTaskHistory(dropCtx, stale, time.Time{}); err != nil {
 					slog.WarnContext(ctx, "agui: 替换任务的历史收尾未完成", "sid", oldTask, "err", err)
 					_ = sse.Reject(http.StatusConflict, "cleanup_pending", "the previous task still needs cleanup")
 					return
 				}
-				stale.replacementHistoryPending = false
+				stale.historyCleanupPending = false
 			}
 			dropActivity.Release()
 		}
@@ -990,7 +992,7 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 			if entry.abortCtx == nil {
 				entry.abortCtx = context.WithoutCancel(agent_v2.WithCallerHistoryCtx(abortBase, prior))
 			}
-			if entry.replacementHistoryPending {
+			if entry.historyCleanupPending {
 				err = h.retryAbort(entry, time.Time{})
 			} else {
 				err = abortSession(entry, ag, time.Time{})
@@ -1384,13 +1386,26 @@ func abortSession(entry *sessionEntry, ag agent_v2.Agent, deadline time.Time) er
 
 // retryAbort 构造清理用 agent，补偿无需连接任何 SSE 订阅者。
 func (h *handler) retryAbort(entry *sessionEntry, deadline time.Time) error {
-	if entry.replacementHistoryPending {
-		ctx, activity, err := compose_v2.BeginTaskActivity(entry.abortCtx, "", []string{entry.sess.RunID})
+	if entry.historyCleanupPending {
+		ctx, cancel := localHistoryCleanupContext(entry.abortCtx, deadline)
+		defer cancel()
+		ctx = compose_v2.WithCheckpointerCtx(ctx, h.cp)
+		sid := entry.sess.RunID
+		ctx, activity, err := compose_v2.BeginTaskActivity(ctx, "", []string{sid})
 		if err != nil {
 			return err
 		}
 		defer activity.Release()
-		return closeReplacementHistory(ctx, entry, deadline)
+		if h.cp != nil {
+			slots, err := h.cp.LoadAllInSession(ctx, sid)
+			if err != nil {
+				return fmt.Errorf("verify discarded task %q checkpoint: %w", sid, err)
+			}
+			if len(slots) != 0 {
+				return fmt.Errorf("discarded task %q has a checkpoint again", sid)
+			}
+		}
+		return agent_v2.CloseAbandonedTaskHistory(ctx, entry.history, sid)
 	}
 	ag := h.build(hook.NoOpHooks{})
 	if agent_v2.IsNilAgent(ag) {
@@ -1399,12 +1414,12 @@ func (h *handler) retryAbort(entry *sessionEntry, deadline time.Time) error {
 	return abortSession(entry, ag, deadline)
 }
 
-// tryEvictLocked 先取得进程内许可。需要清档的条目保持 busy，等锁外取得共享租约并完成删档。
+// tryEvictLocked 先取得进程内许可。需要清档或补历史的条目保持 busy，等锁外完成回收。
 func (h *handler) tryEvictLocked(key sessionKey, entry *sessionEntry) (evictedTask, bool) {
 	task := evictedTask{key: key, entry: entry}
 	if entry.sess != nil {
 		task.sid = entry.sess.RunID
-		if task.sid != "" && (h.cp != nil || entry.replacementHistoryPending) {
+		if task.sid != "" && (h.cp != nil || entry.history.Store != nil) {
 			if entry.abortCtx == nil {
 				_, activity, err := compose_v2.BeginTaskActivity(context.Background(), "", []string{task.sid})
 				if err != nil {
@@ -1421,7 +1436,7 @@ func (h *handler) tryEvictLocked(key sessionKey, entry *sessionEntry) (evictedTa
 	return task, true
 }
 
-// cleanupEvicted 在 h.mu 外申请共享租约并清档。失败时恢复条目的可回收状态。
+// cleanupEvicted 在 h.mu 外申请共享租约、清档及补齐历史。失败时恢复条目的可回收状态。
 func (h *handler) cleanupEvicted(ctx context.Context, tasks []evictedTask) {
 	defer func() {
 		for _, task := range tasks {
@@ -1432,7 +1447,7 @@ func (h *handler) cleanupEvicted(ctx context.Context, tasks []evictedTask) {
 	var skipped map[sessionKey]bool
 	for len(tasks) > 0 {
 		task := tasks[0]
-		leaseCtx := context.WithoutCancel(ctx)
+		leaseCtx := context.Background()
 		if task.capacity {
 			if capacityCtx == nil {
 				var cancel context.CancelFunc
@@ -1441,10 +1456,12 @@ func (h *handler) cleanupEvicted(ctx context.Context, tasks []evictedTask) {
 			}
 			leaseCtx = capacityCtx
 		}
+		// 回收可由其他 owner 触发，存储操作沿用被回收任务的身份。
+		leaseCtx = compose_v2.WithThreadIDCtx(compose_v2.WithOwner(leaseCtx, task.key.owner), task.key.threadID)
+		deadline, _ := leaseCtx.Deadline()
 		var err error
 		switch {
 		case task.entry.abortCtx != nil:
-			deadline, _ := leaseCtx.Deadline()
 			err = h.retryAbort(task.entry, deadline)
 			if err != nil {
 				slog.WarnContext(ctx, "agui: 无法完成已取消任务的清理", "sid", task.sid, "err", err)
@@ -1454,7 +1471,17 @@ func (h *handler) cleanupEvicted(ctx context.Context, tasks []evictedTask) {
 			var cleanupCtx context.Context
 			cleanupCtx, err = task.activity.WithCheckpointLeases(leaseCtx, h.cp)
 			if err == nil {
-				err = h.deleteCP(cleanupCtx, task.sid)
+				if h.cp != nil {
+					err = h.deleteCP(cleanupCtx, task.sid)
+				}
+				if err == nil && task.entry.history.Store != nil {
+					task.entry.abortCtx = context.WithoutCancel(leaseCtx)
+					task.entry.historyCleanupPending = true
+					err = closeLocalTaskHistory(cleanupCtx, task.entry, deadline)
+					if err != nil {
+						slog.WarnContext(ctx, "agui: 回收任务的历史收尾未完成", "sid", task.sid, "err", err)
+					}
+				}
 			} else if !errors.Is(err, compose_v2.ErrTaskBusy) {
 				slog.WarnContext(ctx, "agui: 无法取得任务回收租约", "sid", task.sid, "err", err)
 			}
@@ -1617,11 +1644,8 @@ func (h *handler) hasTaskCheckpoint(ctx context.Context, sid string) bool {
 
 // deleteCP 在持有任务的删档许可时调用。
 func (h *handler) deleteCP(ctx context.Context, sid string) error {
-	// detached ctx——cp 清理不受 request ctx 取消影响（client 断开时仍要清孤儿 cp；honor-ctx
-	// 的 backend 如 PG/Redis 尤其需要，否则 ctx 取消让 DeleteSubtree 失败反而漏清）。对齐
-	// a2a executor 的 context.WithoutCancel。另加上限：后端挂住时 handler 不一直卡着（同引擎出口的宽限期）。
-	// 调用方根据操作是否以清档为前置条件处理返回的错误。
-	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
+	// 调用方已从请求取消中分离，保留回收预算和任务租约的取消。
+	dctx, cancel := context.WithTimeout(ctx, dropCPTimeout)
 	defer cancel()
 	_, err := h.cp.DeleteSubtree(dctx, sid, "")
 	if err != nil {

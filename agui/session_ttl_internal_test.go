@@ -150,7 +150,7 @@ func TestServeRun_DoesNotRestoreEntryDeletedBeforeTaskConflict(t *testing.T) {
 				}
 				entry := h.sessions[key]
 				entry.abortCtx = ctx
-				entry.replacementHistoryPending = true
+				entry.historyCleanupPending = true
 			}
 			h.build = func(hooks hook.Hooks) agent_v2.Agent {
 				return &beforeReplacementRun{

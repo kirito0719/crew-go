@@ -15,12 +15,16 @@ func (e *sessionEntry) bindLocalHistory(ctx context.Context, sid string) context
 	})
 }
 
-// closeReplacementHistory 在放弃许可范围内补齐已清档任务的历史。
-func closeReplacementHistory(ctx context.Context, entry *sessionEntry, deadline time.Time) error {
-	if deadline.IsZero() {
-		deadline = time.Now().Add(dropCPTimeout)
-	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+// closeLocalTaskHistory 在放弃许可范围内补齐已清档任务的历史。
+func closeLocalTaskHistory(ctx context.Context, entry *sessionEntry, deadline time.Time) error {
+	ctx, cancel := localHistoryCleanupContext(ctx, deadline)
 	defer cancel()
 	return agent_v2.CloseAbandonedTaskHistory(ctx, entry.history, entry.sess.RunID)
+}
+
+func localHistoryCleanupContext(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithTimeout(ctx, dropCPTimeout)
+	}
+	return context.WithDeadline(ctx, deadline)
 }
