@@ -380,6 +380,8 @@ ReactiveCompact 的 prompt-too-long 检测与重试语义、9 段切分算法、
 
 这个实现采用分层恢复思路，没有复现 Folio 的 dossier、成本优化器和论文任务集结果。API、预算边界与生产回归见[使用文档](../../v2/context-recovery.md)。
 
+2026-11-26 核对工具归档边界。归档资格复用会话历史的配对规则，在完整送模视图中按任务、成员与声明顺序逐块消费结果。配对跨越分组边界时保留涉及的组。有界清单按块列出工具结果 ID，整组共用一个原文定位符。 [折叠契约](../../v2/context-recovery.md)
+
 ### 同轮补充：失败用量与过程评测
 
 OpenAI Agents SDK 本地 `6c4e4a29` 的 `src/agents/models/_response_terminal.py` 将失败 Responses 的 usage 放到错误上，重试层再记账。crew-go 采用保留原错误链的 `model.WithFailureUsage`，在实际失败尝试处登记回执，处理 fallback、嵌套调用与共享限流门重复呈现旧错误的场景。成功答复和 Resume 复用仍沿原有 `OnModelEnd` 契约；只统计已报告用量，不估算未知 token。

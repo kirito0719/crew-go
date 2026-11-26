@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/model"
 	"crew-go/schema"
 	"crew-go/store"
@@ -313,5 +315,103 @@ func TestContextRecoveryLoopUsesStableHistorySlot(t *testing.T) {
 	events, err := loop.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("find old fact"))
 	if err != nil || dumps != 3 || llm.calls != 6 || agent_v2.FinalMessage(events) == nil || agent_v2.FinalMessage(events).Content != "recovered needle_47" {
 		t.Fatalf("cross-iteration recovery failed: dumps=%d calls=%d err=%v", dumps, llm.calls, err)
+	}
+}
+
+type mergeRecoveryResults struct{ hook.NoOpHooks }
+
+func (mergeRecoveryResults) OnModelStart(ctx context.Context, _ *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
+	for i := 0; i+1 < len(in.Messages); i++ {
+		a, b := in.Messages[i], in.Messages[i+1]
+		if schema.GetToolResultID(a) != "lookup-first" || schema.GetToolResultID(b) != "lookup-second" {
+			continue
+		}
+		merged := *a
+		merged.ContentBlocks = slices.Concat(a.ContentBlocks, b.ContentBlocks)
+		in.Messages = slices.Concat(in.Messages[:i], []*schema.Message{&merged}, in.Messages[i+2:])
+		break
+	}
+	return ctx, nil
+}
+
+func TestContextRecoveryBasicAgentArchivesMergedToolResults(t *testing.T) {
+	const (
+		name         = "recovery-merged-results"
+		originalFact = "SECOND_LOOKUP_EVIDENCE"
+	)
+	key := agent_v2.HistoryKey{Owner: "tenant", ConvID: "merged-tool-results"}
+	ctx := compose_v2.WithOwner(compose_v2.WithThreadIDCtx(t.Context(), key.ConvID), key.Owner)
+	history := agent_v2.NewInMemoryHistoryStore()
+	prior := []*schema.Message{
+		schema.UserMessage("上次查两份证据"),
+		schema.AssistantToolCallMessage([]schema.ToolCall{
+			{ID: "lookup-first", Function: schema.FunctionCall{Name: "lookup", Arguments: `{"n":1}`}},
+			{ID: "lookup-second", Function: schema.FunctionCall{Name: "lookup", Arguments: `{"n":2}`}},
+		}),
+		schema.ToolResultMessage("lookup-first", strings.Repeat("first older evidence ", 500)),
+		schema.ToolResultMessage("lookup-second", strings.Repeat("second older evidence ", 500)+originalFact),
+	}
+	for _, m := range prior {
+		m.Annotations = map[string]any{agent_v2.HistoryAgentAnnotation: name, agent_v2.HistoryTaskAnnotation: "old-task"}
+	}
+	if err := history.Append(ctx, key, prior); err != nil {
+		t.Fatal(err)
+	}
+
+	var archiveID string
+	llm := recoveryInspectModel{inspect: func(_ context.Context, in []*schema.Message) (*schema.Message, error) {
+		if archiveID != "" {
+			if last := in[len(in)-1]; schema.GetToolResultID(last) == "read-old" && strings.Contains(last.Content, originalFact) {
+				return schema.AssistantMessage("找到了第二份证据"), nil
+			}
+			return nil, errors.New("read_context did not return the second result from the archive")
+		}
+		for _, m := range in {
+			match := recoveryIDPattern.FindStringSubmatch(m.Content)
+			if match == nil {
+				continue
+			}
+			if !strings.Contains(m.Content, "result=lookup-first") || !strings.Contains(m.Content, "result=lookup-second") {
+				return nil, errors.New("recovery manifest did not list both result blocks")
+			}
+			archiveID = match[1]
+			return schema.AssistantToolCallMessage([]schema.ToolCall{{ID: "read-old", Function: schema.FunctionCall{
+				Name:      agent_v2.ReadContextToolName,
+				Arguments: fmt.Sprintf(`{"id":%q,"query":%q}`, archiveID, originalFact),
+			}}}), nil
+		}
+		for _, m := range in {
+			if schema.GetToolResultID(m) == "lookup-first" && len(m.ContentBlocks) == 2 {
+				return nil, errors.New("complete merged tool results were not archived")
+			}
+		}
+		return nil, errors.New("test did not present the merged tool result to the model")
+	}}
+	a := agent_v2.NewBasicAgent(
+		agent_v2.WithName(name), agent_v2.WithHistory(history, key.Owner), agent_v2.WithModel(llm),
+		agent_v2.WithHooks(mergeRecoveryResults{}),
+		agent_v2.WithContextRecovery(&agent_v2.ContextRecoveryConfig{
+			Store: store.NewInMemoryStore(), MaxTokens: 600, KeepRecentRounds: 1,
+		}),
+	)
+	events, err := a.Run(ctx, agent_v2.NewRunSession(), schema.UserMessage("找回第二份证据"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final := agent_v2.FinalMessage(events); archiveID == "" || final == nil || final.Content != "找到了第二份证据" {
+		t.Fatalf("定位符 %q，最终答复 %+v", archiveID, final)
+	}
+	retained, err := agent_v2.LoadAllHistory(ctx, history, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retained) < len(prior) {
+		t.Fatalf("历史只剩 %d 条，至少应保留原有 %d 条", len(retained), len(prior))
+	}
+	for i, original := range prior[2:] {
+		m := retained[i+2]
+		if schema.GetToolResultID(m) != schema.GetToolResultID(original) || m.Content != original.Content || len(m.ContentBlocks) != 1 {
+			t.Fatalf("旧结果 %d 的原始历史被改写", i)
+		}
 	}
 }

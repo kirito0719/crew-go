@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -139,5 +140,87 @@ func TestContextRecoveryPendingAndProtectedRoundsStayWhole(t *testing.T) {
 	got, tail = foldContextRecovery(t.Context(), "a", &ContextRecoveryConfig{Store: store.NewInMemoryStore(), MaxTokens: 1, KeepRecentRounds: 1}, msgs)
 	if tail != -1 || len(got) != len(msgs) {
 		t.Fatal("protected skill body was folded")
+	}
+}
+
+func TestContextRecoveryKeepsOldGroupsWithUnmatchedToolBlocks(t *testing.T) {
+	call := func(ids ...string) *schema.Message {
+		calls := make([]schema.ToolCall, 0, len(ids))
+		for _, id := range ids {
+			calls = append(calls, schema.ToolCall{ID: id, Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`}})
+		}
+		return schema.AssistantToolCallMessage(calls)
+	}
+	stamp := func(m *schema.Message, task, agent string) *schema.Message {
+		m.Annotations = map[string]any{HistoryTaskAnnotation: task, HistoryAgentAnnotation: agent}
+		return m
+	}
+	for _, tc := range []struct {
+		name   string
+		blocks []*schema.Message
+	}{
+		{"one_result_for_two_calls", []*schema.Message{call("reused", "reused"), schema.ToolResultMessage("reused", "only one")}},
+		{"result_from_another_task", []*schema.Message{
+			stamp(call("shared"), "first-task", "reader"), stamp(schema.ToolResultMessage("shared", "other task"), "second-task", "reader"),
+		}},
+		{"result_from_another_member", []*schema.Message{
+			stamp(call("shared"), "task", "first-member"), stamp(schema.ToolResultMessage("shared", "other member"), "task", "second-member"),
+		}},
+		{"extra_result_without_a_call", []*schema.Message{
+			call("matched"), schema.ToolResultMessage("matched", "expected"), schema.ToolResultMessage("orphan", "unexpected"),
+		}},
+		{"result_preceding_its_call", []*schema.Message{schema.ToolResultMessage("early", "before call"), call("early")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewInMemoryStore()
+			cfg := &ContextRecoveryConfig{Store: st, MaxTokens: 100, KeepRecentRounds: 1}
+			in := append([]*schema.Message{schema.UserMessage(strings.Repeat("仍需保留的旧请求 ", 1000))}, tc.blocks...)
+			in = append(in, schema.UserMessage("当前问题"))
+			out, tail := foldContextRecovery(t.Context(), "reader", cfg, in)
+			if tail != -1 || !slices.Equal(out, in) {
+				t.Fatalf("包含未配对工具块的旧组应原样保留，折叠边界 %d，输出长度 %d", tail, len(out))
+			}
+			items, err := st.Search(t.Context(), recoveryNamespace(t.Context(), "reader"))
+			if err != nil || len(items) != 0 {
+				t.Fatalf("不完整的组不应写归档，条数 %d，错误 %v", len(items), err)
+			}
+		})
+	}
+}
+
+func TestContextRecoveryKeepsToolsPairedAcrossGroupBoundaries(t *testing.T) {
+	call := func(run string) *schema.Message {
+		m := schema.AssistantToolCallMessage([]schema.ToolCall{{ID: "same", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`}}})
+		m.Annotations = map[string]any{HistoryTaskAnnotation: "a", HistoryAgentAnnotation: "reader", compose_v2.RunIDAnnotationKey: run}
+		return m
+	}
+	result := func(content string) *schema.Message {
+		m := schema.ToolResultMessage("same", content)
+		m.Annotations = map[string]any{HistoryTaskAnnotation: "a", HistoryAgentAnnotation: "reader"}
+		return m
+	}
+	old, newer := call("old"), call("new")
+	firstReply, secondReply := result(strings.Repeat("first evidence ", 1000)), result("second evidence")
+	msgs := []*schema.Message{
+		schema.UserMessage("first request"), old,
+		schema.UserMessage(strings.Repeat("interleaved request ", 500)), newer, firstReply,
+		schema.UserMessage("current request"), secondReply,
+	}
+	pairs := pairToolResults(msgs)
+	if len(pairs) != 2 || pairs[0].declaredAt != 1 || pairs[0].resultAt != 4 || pairs[1].declaredAt != 3 || pairs[1].resultAt != 6 {
+		t.Fatalf("工具调用未按预期顺序跨组配对： %+v", pairs)
+	}
+	groups := compose_v2.GroupMessagesByAPIRound(msgs)
+	if len(groups) != 3 || !slices.Contains(groups[1], firstReply) || slices.Contains(groups[1], old) {
+		t.Fatalf("未构造出配对跨越分组边界的输入： %+v", groups)
+	}
+	st := store.NewInMemoryStore()
+	got, cut := foldContextRecovery(t.Context(), "reader", &ContextRecoveryConfig{Store: st, MaxTokens: 100, KeepRecentRounds: 1}, msgs)
+	items, err := st.Search(t.Context(), recoveryNamespace(t.Context(), "reader"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cut != -1 || !slices.Equal(got, msgs) || len(items) != 0 {
+		t.Fatalf("跨组配对应保留原文和两组结果，边界 %d，消息 %d，归档 %d", cut, len(got), len(items))
 	}
 }

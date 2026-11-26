@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -139,17 +140,36 @@ func recoveryArchive(group []*schema.Message) (string, error) {
 	return string(data), err
 }
 
-func recoveryClosed(group []*schema.Message) bool {
-	pending := make(map[string]bool)
-	for _, m := range group {
-		for _, tc := range schema.GetToolCalls(m) {
-			pending[tc.ID] = true
-		}
-		if id := schema.GetToolResultID(m); id != "" {
-			delete(pending, id)
+// incompleteRecoveryGroups 在完整送模视图中配对，标记有未配对工具块或配对跨组的组。
+func incompleteRecoveryGroups(groups [][]*schema.Message) []bool {
+	messages := compose_v2.FlattenGroups(groups)
+	groupAt := make([]int, 0, len(messages))
+	incomplete := make([]bool, len(groups))
+	unmatchedResults := make([]int, len(groups))
+	for i, group := range groups {
+		for _, m := range group {
+			groupAt = append(groupAt, i)
+			if m == nil || m.Role != schema.RoleTool {
+				continue
+			}
+			ids := toolResultIDs(m)
+			incomplete[i] = incomplete[i] || len(ids) == 0 || slices.Contains(ids, "")
+			unmatchedResults[i] += len(ids)
 		}
 	}
-	return len(pending) == 0
+
+	for _, pair := range pairToolResults(messages) {
+		callGroup := groupAt[pair.declaredAt]
+		if pair.result == nil || groupAt[pair.resultAt] != callGroup {
+			incomplete[callGroup] = true
+			continue
+		}
+		unmatchedResults[callGroup]--
+	}
+	for i, n := range unmatchedResults {
+		incomplete[i] = incomplete[i] || n != 0
+	}
+	return incomplete
 }
 
 func recoveryPlaceholder(ctx context.Context, agent string, cfg *ContextRecoveryConfig, group []*schema.Message, id string) *schema.Message {
@@ -168,8 +188,10 @@ func recoveryPlaceholder(ctx context.Context, agent string, cfg *ContextRecovery
 			for _, tc := range schema.GetToolCalls(m) {
 				fmt.Fprintf(&manifest, " call=%s(%s)", truncateWithEllipsis(tc.Function.Name, 80), truncateWithEllipsis(tc.ID, 80))
 			}
-			if result := schema.GetToolResultID(m); result != "" {
-				fmt.Fprintf(&manifest, " result=%s", truncateWithEllipsis(result, 80))
+			if m.Role == schema.RoleTool {
+				for _, result := range toolResultIDs(m) {
+					fmt.Fprintf(&manifest, " result=%s", truncateWithEllipsis(result, 80))
+				}
 			}
 			manifest.WriteByte('\n')
 		}
@@ -199,6 +221,10 @@ func foldContextRecovery(ctx context.Context, agent string, cfg *ContextRecovery
 		return msgs, -1
 	}
 	groups := compose_v2.GroupMessagesByAPIRound(msgs)
+	if len(groups) <= cfg.recent() {
+		return msgs, -1
+	}
+	incomplete := incompleteRecoveryGroups(groups)
 	lastUser := lastUserGroupIndex(groups, true)
 	currentUser := lastUserGroupIndex(groups, false)
 	pendingStart := len(groups)
@@ -213,7 +239,7 @@ func foldContextRecovery(ctx context.Context, agent string, cfg *ContextRecovery
 	for i, group := range groups {
 		consumed += len(group)
 		protected := isProtectedGroup(group) || groupContainsProtectedMarker(group) || groupContainsSystem(group)
-		if tokens <= cfg.budget() || i >= len(groups)-cfg.recent() || i == lastUser || i == currentUser || i >= pendingStart || protected || !recoveryClosed(group) {
+		if tokens <= cfg.budget() || i >= len(groups)-cfg.recent() || i == lastUser || i == currentUser || i >= pendingStart || protected || incomplete[i] {
 			out = append(out, group...)
 			continue
 		}
