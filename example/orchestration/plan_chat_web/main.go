@@ -217,11 +217,14 @@ func runOrResume(
 		})
 	}
 
+	sendError := func(message string) {
+		sink.complete("error", map[string]any{"message": message, "status": statusError},
+			map[string]any{"status": statusError})
+	}
 	finish := func(status, pendingID string) bool {
 		if err := settle(status, pendingID, slot.historySize+len(slot.sess.History())); err != nil {
 			log.Printf("[plan_chat_web] 更新会话终态: %v", err)
-			sink.send("error", map[string]any{"message": "session state unavailable", "status": statusError})
-			sink.send("done", map[string]any{"status": statusError})
+			sendError("session state unavailable")
 			return false
 		}
 		return true
@@ -244,13 +247,13 @@ func runOrResume(
 		if query != nil {
 			payload["query"] = query
 		}
-		sink.send("interrupted", payload)
-		sink.send("done", map[string]any{"interrupted": true, "session_id": slot.sess.RunID, "status": statusInterrupted})
+		sink.complete("interrupted", payload,
+			map[string]any{"interrupted": true, "session_id": slot.sess.RunID, "status": statusInterrupted})
 	}
 	sendUnconfirmed := func() {
 		if finish(statusResumeUnconfirmed, "") {
-			sink.send("resume_unconfirmed", map[string]any{"session_id": slot.sess.RunID, "status": statusResumeUnconfirmed})
-			sink.send("done", map[string]any{"session_id": slot.sess.RunID, "status": statusResumeUnconfirmed})
+			data := map[string]any{"session_id": slot.sess.RunID, "status": statusResumeUnconfirmed}
+			sink.complete("resume_unconfirmed", data, data)
 		}
 	}
 	if isResume && slot.verifyResume && slot.resumeAction != agent_v2.ResumeActionAbort {
@@ -266,8 +269,7 @@ func runOrResume(
 			sendUnconfirmed()
 		default:
 			if finish(statusError, "") {
-				sink.send("error", map[string]any{"message": "no resumable checkpoint", "status": statusError})
-				sink.send("done", map[string]any{"status": statusError})
+				sendError("no resumable checkpoint")
 			}
 		}
 		return
@@ -341,8 +343,7 @@ func runOrResume(
 		if !finish(statusError, "") {
 			return
 		}
-		sink.send("error", map[string]any{"message": err.Error(), "status": statusError})
-		sink.send("done", map[string]any{"status": statusError})
+		sendError(err.Error())
 		return
 	}
 
@@ -351,8 +352,8 @@ func runOrResume(
 		if !finish(statusCancelled, "") {
 			return
 		}
-		sink.send("aborted", map[string]any{"session_id": slot.sess.RunID, "status": statusCancelled})
-		sink.send("done", map[string]any{"aborted": true, "session_id": slot.sess.RunID, "status": statusCancelled})
+		sink.complete("aborted", map[string]any{"session_id": slot.sess.RunID, "status": statusCancelled},
+			map[string]any{"aborted": true, "session_id": slot.sess.RunID, "status": statusCancelled})
 		return
 	}
 
@@ -361,18 +362,20 @@ func runOrResume(
 		return
 	}
 
+	done := map[string]any{
+		"history_size": slot.historySize + len(slot.sess.History()),
+		"status":       statusSuccess,
+		"session_id":   slot.sess.RunID,
+	}
 	if msg := agent_v2.FinalMessage(events); msg != nil {
 		data := map[string]any{"content": msg.Content}
 		if rid, ok := msg.Annotations["run_id"].(string); ok && rid != "" {
 			data["run_id"] = rid
 		}
-		sink.send("final", data)
+		sink.complete("final", data, done)
+		return
 	}
-	sink.send("done", map[string]any{
-		"history_size": slot.historySize + len(slot.sess.History()),
-		"status":       statusSuccess,
-		"session_id":   slot.sess.RunID,
-	})
+	sink.complete("", nil, done)
 }
 
 // buildChatEntryAgent 构造 chat_entry BasicAgent，按 mode 装载不同 system prompt。

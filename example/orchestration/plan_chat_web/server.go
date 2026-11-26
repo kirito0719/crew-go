@@ -357,6 +357,7 @@ func writeSessionJSON(w http.ResponseWriter, value any) {
 }
 
 func writeSessionError(w http.ResponseWriter, err error) {
+	w.Header().Set("Cache-Control", "no-store")
 	var finished finishedSession
 	switch {
 	case errors.Is(err, errSessionMissing):

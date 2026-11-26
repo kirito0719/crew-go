@@ -7,7 +7,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -169,6 +172,120 @@ func TestPlanWebInMemorySessionExpiry(t *testing.T) {
 	_, err := app.load(t.Context(), key)
 	if !errors.Is(err, errSessionMissing) {
 		t.Fatalf("过期的终态会话应已清理: %v", err)
+	}
+}
+
+func TestPlanWebHTTPSProxySessionLifecycle(t *testing.T) {
+	const ttl = time.Minute
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	mini := miniredis.RunT(t)
+	redis := goredis.NewClient(&goredis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = redis.Close() })
+	m := &pauseModel{started: make(chan struct{}), proceed: make(chan struct{})}
+	proceed := sync.OnceFunc(func() { close(m.proceed) })
+	defer proceed()
+	app := &chatServer{model: m, obs: observability.New(),
+		sessions: &redisSessions{client: redis, ttl: ttl},
+		cp:       agentRedis.NewCheckpointer(redis, agentRedis.WithCheckpointerPrefix("crew-plan-web")),
+		durable:  true, secureCookie: true,
+	}
+	origin := httptest.NewServer(app.routes())
+	t.Cleanup(origin.Close)
+	target, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(target))
+	t.Cleanup(proxy.Close)
+	newBrowser := func() *http.Client {
+		t.Helper()
+		jar, err := cookiejar.New(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Client{Transport: proxy.Client().Transport, Jar: jar}
+	}
+	type result struct {
+		resp *http.Response
+		body []byte
+		err  error
+	}
+	request := func(browser *http.Client, method, path string) result {
+		req, err := http.NewRequestWithContext(ctx, method, proxy.URL+path, nil)
+		if err != nil {
+			return result{err: err}
+		}
+		resp, err := browser.Do(req)
+		if err != nil {
+			return result{err: err}
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return result{resp: resp, body: body, err: err}
+	}
+	check := func(got result, status int) {
+		t.Helper()
+		if got.err != nil || got.resp.StatusCode != status || got.resp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("代理响应应为 %d 且禁止缓存，响应=%v 正文=%s 错误=%v", status, got.resp, got.body, got.err)
+		}
+	}
+
+	browser, visitor := newBrowser(), newBrowser()
+	home := request(browser, http.MethodGet, "/")
+	check(home, http.StatusOK)
+	cookies := home.resp.Cookies()
+	if len(cookies) != 1 || cookies[0].Name != ownerCookie || !validOwner(cookies[0].Value) ||
+		!cookies[0].Secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode || cookies[0].Path != "/" {
+		t.Fatalf("HTTPS 代理下的会话 Cookie 不正确: %v", cookies)
+	}
+	check(request(visitor, http.MethodGet, "/"), http.StatusOK)
+	stream := make(chan result, 1)
+	go func() { stream <- request(browser, http.MethodGet, "/api/chat?q=start") }()
+	select {
+	case <-m.started:
+	case stopped := <-stream:
+		t.Fatalf("启动模型前连接已结束，正文=%s 错误=%v", stopped.body, stopped.err)
+	case <-ctx.Done():
+		t.Fatal("代理后的模型未启动")
+	}
+
+	list := request(browser, http.MethodGet, "/api/sessions?status=running")
+	check(list, http.StatusOK)
+	var rows []sessionRecord
+	if err := json.Unmarshal(list.body, &rows); err != nil || len(rows) != 1 || rows[0].ID == "" {
+		t.Fatalf("同一 Cookie 应能查到正在运行的会话: %s, %v", list.body, err)
+	}
+	id := rows[0].ID
+	detail := "/api/sessions/" + id
+	resume := "/api/chat?session_id=" + id
+	check(request(visitor, http.MethodGet, detail), http.StatusNotFound)
+	check(request(browser, http.MethodGet, detail), http.StatusOK)
+
+	if got := request(browser, http.MethodPost, "/api/interrupt?session_id="+id); got.err != nil || got.resp.StatusCode != http.StatusOK {
+		t.Fatalf("暂停失败，正文=%s 错误=%v", got.body, got.err)
+	}
+	proceed()
+	paused := <-stream
+	check(paused, http.StatusOK)
+	if !strings.Contains(string(paused.body), `"status":"interrupted"`) {
+		t.Fatalf("应通过代理看到挂起事件: %s", paused.body)
+	}
+	mini.FastForward(2 * ttl)
+	check(request(browser, http.MethodGet, detail), http.StatusOK)
+	resumed := request(browser, http.MethodGet, resume+"&action=continue")
+	check(resumed, http.StatusOK)
+	if !strings.Contains(string(resumed.body), `"status":"success"`) {
+		t.Fatalf("超过终态 TTL 的挂起会话应仍能续跑: %s", resumed.body)
+	}
+	check(request(browser, http.MethodGet, resume), http.StatusGone)
+	check(request(browser, http.MethodGet, detail), http.StatusOK)
+	mini.FastForward(2 * ttl)
+	check(request(browser, http.MethodGet, detail), http.StatusNotFound)
+	expired := request(browser, http.MethodGet, "/api/sessions")
+	check(expired, http.StatusOK)
+	if strings.TrimSpace(string(expired.body)) != "[]" {
+		t.Fatalf("终态过期后应从会话索引消失: %s", expired.body)
 	}
 }
 

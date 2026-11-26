@@ -6,6 +6,12 @@
 
 **证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，剩余目标 CI、真实 provider 和业务数据验收见 A02、A03、A05–A07。
 
+## 2026-11-26 Plan Web 与 thinking 本地验收
+
+**A09。** 以 `c417934` 为基线。在 Plan Web 的生产 Agent 入口用流式模型桩发送 512 个增量，writer 开始消费前队列已满。旧版在成功及挂起时都丢了结果和 `done`。修复后先发送已排队的进度，再发送完整答复或带待答 ID 的挂起事件及 `done`。HTTPS 反代试验也复现了错误 Cookie 查询的 404 缺少缓存控制。会话错误响应补上 `no-store`。两个 CookieJar 验证隔离，推进 Redis 桩时钟验证挂起后跨 TTL 续跑及终态过期。 [SSE 回归](../../example/orchestration/plan_chat_web/sse_internal_test.go) · [反代回归](../../example/orchestration/plan_chat_web/server_test.go)
+
+**A07。** Qwen 和 DeepSeek 客户端通过 HTTP 桩发送真实 JSON 请求。BasicAgent 的三轮推理和第四轮关闭 thinking 复用同一历史，桩逐轮核验已聚合的推理内容和开关字段。另在只返回推理增量时关闭 reader，桩收到请求取消。 [推理回放回归](../../agent_v2/thinking_replay_http_test.go)
+
 ## 2026-11-26 待答输入与压缩备忘
 
 以 `0534d11` 为基线。BasicAgent 实测，在运行中补充的输入之间插入框架提醒和 system 消息时，AutoCompact 和可取回折叠都会丢失较早补充及其引用的工具配对。仅剩受保护前文时，AutoCompact 也曾把保留起点挪到末尾框架提示，摘要了未回答的输入。三层压缩共享最近业务组的判据，自动压缩在容量兜底后应用待答边界。独立复审复现了插话与工具调用、结果同组时整组被误摘要。按消息顺序判断有没有模型回应，并以已回应输入做对照。迟到工具回执隔开多条待答消息时，三层压缩继续保留待答前缀与跨组工具配对。 [保留边界回归](../../agent_v2/autocompact_pending_tail_test.go)

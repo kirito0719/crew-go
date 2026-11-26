@@ -18,18 +18,14 @@ type uiEvent struct {
 	Data map[string]any `json:"data,omitempty"`
 }
 
-// eventSink 是 hook 层与 SSE writer 的单向通道。
-// 容量 256 已足够单次 PlanAgent 运行——hook 端满了就 drop 并记 warn，
-// 保证 demo 不会因为浏览器慢消费而阻塞后端.
-//
-// **iter-5-N HIGH-3 修 drop 可观测性**: 原 silent drop 让业务排查 SSE 事件丢失
-// 时找不到证据 (注释承诺 warn 但代码没记). 加 dropCount atomic 累计 + writeSSE
-// 协程内每 5s log warn (业务能在 stderr 看到 SSE 背压).
+// eventSink 汇集本次请求的 SSE 事件。进度队列满时允许丢弃，避免钩子等待网络。
+// 请求收尾事件单独保留，writer 排空进度后再发送。
 type eventSink struct {
-	ch        chan uiEvent
-	closed    chan struct{}
-	once      sync.Once
-	dropCount atomic.Int64 // iter-5-N HIGH-3: silent drop 计数, writeSSE 周期 log warn
+	ch         chan uiEvent
+	closed     chan struct{}
+	once       sync.Once
+	dropCount  atomic.Int64
+	completion []uiEvent
 }
 
 func newEventSink() *eventSink {
@@ -39,25 +35,34 @@ func newEventSink() *eventSink {
 	}
 }
 
-// send 非阻塞投递一条事件。通道满或已关闭时返回 false (调用方无需处理).
-//
-// **iter-5-N HIGH-3**: 通道满时 dropCount.Add(1) 让业务可观测背压. writeSSE 周期
-// log warn (5s 节流) 把 drop 数 + 总投递数报出来.
+func newUIEvent(kind string, data map[string]any) uiEvent {
+	return uiEvent{Type: kind, TS: time.Now().UnixMilli(), Data: data}
+}
+
+// send 非阻塞投递进度事件。队列满时累计丢弃数量。
 func (s *eventSink) send(kind string, data map[string]any) bool {
-	ev := uiEvent{Type: kind, TS: time.Now().UnixNano() / 1e6, Data: data}
+	ev := newUIEvent(kind, data)
 	select {
 	case <-s.closed:
 		return false
 	case s.ch <- ev:
 		return true
 	default:
-		// 通道满——drop + 累计计数, writeSSE 周期 log warn.
 		s.dropCount.Add(1)
 		return false
 	}
 }
 
-// close 幂等关闭。SSE handler 完整写出完后调用。
+// complete 由执行协程在结束时调用一次。可选结果先于 done，内容由 close 发布给 writer。
+func (s *eventSink) complete(kind string, data, done map[string]any) {
+	s.completion = make([]uiEvent, 0, 2)
+	if kind != "" {
+		s.completion = append(s.completion, newUIEvent(kind, data))
+	}
+	s.completion = append(s.completion, newUIEvent("done", done))
+}
+
+// close 由执行协程在退出时调用，通知 SSE writer 排出剩余事件。
 func (s *eventSink) close() {
 	s.once.Do(func() { close(s.closed) })
 }
@@ -95,12 +100,15 @@ func writeSSE(w http.ResponseWriter, r *http.Request, sink *eventSink) {
 		case <-ctx.Done():
 			return
 		case <-sink.closed:
-			// 把 sink 里剩余已入队事件排空再退出
+			// 先排空进度，避免浏览器处理 done 后还收到前一阶段的事件。
 			for {
 				select {
 				case ev := <-sink.ch:
 					writeOne(w, flusher, ev)
 				default:
+					for _, ev := range sink.completion {
+						writeOne(w, flusher, ev)
+					}
 					if curDrop := sink.dropCount.Load(); curDrop > lastDropCount {
 						log.Printf("[plan_chat_web] SSE backpressure drop final=%d (since session start) — 浏览器慢消费 / 网络慢", curDrop)
 					}

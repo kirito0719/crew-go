@@ -34,8 +34,8 @@
 | ID | 类型 | 待办 | 完成条件和证据 |
 | --- | --- | --- | --- |
 | A06 | 验收 | Anthropic 真流、错误分类与服务端上下文清理 | 核对空闲流处理、SSE 间隔、真实计费拒绝及 prompt-too-long 原文的可识别性。跑 `TestSmoke_ContextEditing` 确认两种清理的实际统计、与 compaction 组合的请求以及严格前缀回放。另核对实际触发压缩后的交互和编辑前后的缓存用量。依赖 `ANTHROPIC_API_KEY` 与实际返回条件。 [流式冒烟命令](../description/smoke-test-recipes.md) · [清理冒烟](../../example/model/anthropic_smoke/context_editing_test.go) |
-| A07 | 验收 | 跑齐 thinking 多轮回放、关停和 provider 变体 | 使用现有模型集成入口补 3 轮以上及中途关闭的对照。Anthropic 的空闲/计费另见 A06。历史 TODO 570。 |
-| A09 | 验收 | Plan Web 生产入口与生命周期 | mock 已覆盖挂起、续跑及完成态。目标环境仍需验鉴权、Cookie、反向代理、状态 TTL 和故障恢复。共享 Redis 迁移、双副本切换和跨副本续跑暂缓。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) |
+| A07 | 验收 | 跑齐 thinking 多轮回放、关停和 provider 变体 | 本地 HTTP 桩已覆盖 Qwen、DeepSeek 三轮回放、按请求关闭 thinking 和推理中途关闭流。真模型继续用现有集成入口验收。Anthropic 的空闲和计费见 A06。历史 TODO 570。 [本地回归](../../agent_v2/thinking_replay_http_test.go) |
+| A09 | 验收 | Plan Web 生产入口与生命周期 | 本地验证 HTTPS 反代下的 Cookie 隔离、挂起后跨 TTL 续跑、终态过期和 SSE 背压。目标入口仍需验鉴权、代理设置及故障恢复。共享 Redis 迁移、双副本切换和跨副本续跑暂缓。 [ISSUE-90](../issue/issue-90-plan-chat-web-lifecycle-prod.md) · [实测](backlog-audit.md#2026-11-26-plan-web-与-thinking-本地验收) |
 | A15 | 验收 | 把 Anthropic 回放的隐藏 thinking 纳入预算核对 | `CountInputTokens` 已通过签名回放与请求字段的本地回归。用 `TestSmoke_ThinkingInputTokens` 比较签名、可见文本、实际输入用量与本地估算，确定压缩触发点。需要 Anthropic 凭据。历史 TODO 329。 [计数入口](../../model/anthropic/token_count.go) · [实测用例](../../example/model/anthropic_smoke/anthropic_smoke_test.go) |
 | Q01 | 待决 | 可插拔 Sandbox 的一致性边界 | 现有 `Sandbox` 和工具适配器只提供约定及单测。确定哪些文件、网络、进程及取消语义由每个应用实现保证，是否要落可共享 conformance。 [现行契约](../v2/sandbox.md) · [接口](../../sandbox/sandbox.go) |
 | Q05 | 待决 | 引入 AgenticMessage 或继续使用现行消息契约 | 对照现行 `schema.Message`、历史与流式适配器，决定是否需要双格式。依赖明确的跨 provider/消息生命周期诉求。 [演进状态](../description/three-way-comparison/eino-langgraph-upgrades.md) |
