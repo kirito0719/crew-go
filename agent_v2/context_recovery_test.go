@@ -415,3 +415,62 @@ func TestContextRecoveryBasicAgentArchivesMergedToolResults(t *testing.T) {
 		}
 	}
 }
+
+type switchRecoveryNote struct {
+	hook.NoOpHooks
+	note, older, recent *schema.Message
+}
+
+func (h switchRecoveryNote) OnModelStart(ctx context.Context, info *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
+	note := *h.note
+	if info.Round == 0 {
+		note.Annotations = map[string]any{agent_v2.RepeatToolReminderAnnotation: true}
+	}
+	in.Messages = slices.Concat(in.Messages[:1], []*schema.Message{&note, h.older, h.recent}, in.Messages[1:])
+	return ctx, nil
+}
+
+func TestContextRecoveryUserClassificationInvalidatesMemo(t *testing.T) {
+	note := schema.UserMessage(strings.Repeat("待确认的输入 ", 1000) + "USER_INPUT_TAIL")
+	h := switchRecoveryNote{
+		note:   note,
+		older:  withRunID(schema.AssistantMessage("旧的工具提示之后的说明"), "older"),
+		recent: withRunID(schema.AssistantMessage("最新的执行状态"), "recent"),
+	}
+	var calls int
+	llm := recoveryInspectModel{inspect: func(_ context.Context, msgs []*schema.Message) (*schema.Message, error) {
+		calls++
+		var sawArchive, sawUser bool
+		for _, m := range msgs {
+			sawArchive = sawArchive || recoveryIDPattern.MatchString(m.Content)
+			sawUser = sawUser || m.ID == note.ID && m.Role == schema.RoleUser &&
+				!agent_v2.IsFrameworkNote(m) && m.Content == note.Content
+		}
+		if calls == 1 {
+			if !sawArchive || strings.Contains(inputText(msgs), "USER_INPUT_TAIL") {
+				return nil, errors.New("framework note was not folded in the first round")
+			}
+			return schema.AssistantToolCallMessage([]schema.ToolCall{{
+				ID: "verify-note", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`},
+			}}), nil
+		}
+		if !sawUser {
+			return nil, errors.New("old recovery memo hid the input after it became a user message")
+		}
+		return schema.AssistantMessage("已收到本轮改为用户输入的内容"), nil
+	}}
+	kit := tool.NewToolkit()
+	kit.Register(tool.NewFuncTool("lookup", "查询", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (*tool.Result, error) { return tool.Success("已验证"), nil }))
+	a := agent_v2.NewBasicAgent(agent_v2.WithName("recovery-note"), agent_v2.WithModel(llm),
+		agent_v2.WithHooks(h), agent_v2.WithToolkit(kit), agent_v2.WithContextRecovery(&agent_v2.ContextRecoveryConfig{
+			Store: store.NewInMemoryStore(), MaxTokens: 600, KeepRecentRounds: 1,
+		}))
+	events, err := a.Run(t.Context(), agent_v2.NewRunSession(), schema.UserMessage("初始输入"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final := agent_v2.FinalMessage(events); calls != 2 || final == nil || final.Content != "已收到本轮改为用户输入的内容" {
+		t.Fatalf("模型调用 %d 次，最终答复 %+v", calls, final)
+	}
+}

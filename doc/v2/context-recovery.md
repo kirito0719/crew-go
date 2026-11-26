@@ -65,7 +65,7 @@ sequenceDiagram
 | 状态 | producer 与 consumer | 寿命 |
 | --- | --- | --- |
 | 原始消息 | 模型与工具产生，channel、工具账与 HistoryStore 使用 | 按原有 Run、checkpoint 与会话历史契约 |
-| 折叠备忘 | model 节点产生，后续模型轮次使用 | 随 checkpoint 序列化；原前缀或相关标注变化后重新计算 |
+| 折叠备忘 | model 节点产生，后续模型轮次使用 | 随 checkpoint 序列化，原前缀、框架提示分类或其他相关标注变化后重新计算 |
 | 跨 Run 视图 | 从完整历史重新按预算折叠 | 不发布折叠历史快照，避免覆盖并发任务追加；同内容沿用原定位符 |
 | 归档原文 | 折叠器写入，`read_context` 读取 | Store 决定；不会在单次 Run 成功清档时删除 |
 

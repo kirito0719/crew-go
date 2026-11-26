@@ -227,13 +227,7 @@ func foldContextRecovery(ctx context.Context, agent string, cfg *ContextRecovery
 	incomplete := incompleteRecoveryGroups(groups)
 	lastUser := lastUserGroupIndex(groups, true)
 	currentUser := lastUserGroupIndex(groups, false)
-	pendingStart := len(groups)
-	if lastUser >= 0 && allPendingUserInput(groups[lastUser]) {
-		pendingStart = lastUser
-		for pendingStart > 0 && allPendingUserInput(groups[pendingStart]) {
-			pendingStart--
-		}
-	}
+	pendingStart := pendingUserTailStart(groups, 0)
 	out := make([]*schema.Message, 0, len(msgs))
 	consumed, lastFold := 0, 0
 	for i, group := range groups {

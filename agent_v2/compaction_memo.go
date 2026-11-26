@@ -101,6 +101,9 @@ func prefixAnchor(msgs []*schema.Message) string {
 // writeCompactionAnnotations 只接收压缩链路使用的分组、保护和取回标注。
 func writeCompactionAnnotations(h hash.Hash64, m *schema.Message) {
 	annotations := m.Annotations
+	// 直接记分类结果，跟随压缩时使用的同一判据。
+	writeAnchorField(h, strconv.FormatBool(IsFrameworkNote(m)))
+	writeAnchorField(h, strconv.FormatBool(IsUnresolvedCallsRecord(m)))
 	for _, key := range [...]string{
 		SkillBodyAnnotation, StoreInjectedAnnotation, AutoCompactSummaryAnnotation,
 		MicroCompactClearedAnnotation, MicroCompactOffloadedAnnotation, autoCompactReinjectAnnotation,

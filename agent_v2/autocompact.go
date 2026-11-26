@@ -447,7 +447,7 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	//    - 兜底：若 user 在第 1 组（典型 ReAct：1 user + N agent rounds），用最后 1 组作 tail
 	//      这种情况下用户消息会被 summarize 进 summary（trade-off：换取压缩能力）
 	var groups [][]*schema.Message
-	var tailStartIdx int
+	var tailStartIdx, newGroupStart int
 	if headInConv := headLenInConv(cut, sysEnd, len(conv)); headInConv > 0 {
 		// 套用了上一次的压缩结果：Head 与新增部分分开分组——合在一起分的话，Head 末尾那条摘要（user 角色）
 		// 会把新增的 assistant / tool 消息吞进它的组；尾部只在新增部分里找（Head 里的摘要、重注入不是用户的
@@ -457,12 +457,13 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 		if len(newGroups) == 0 {
 			return messages, nil
 		}
+		newGroupStart = len(headGroups)
 		t := lastUserGroupIndex(newGroups, true)
 		if t < 0 {
-			t = len(newGroups) - 1 // 新增部分里没有用户消息（同一次 Run 的 ReAct 轮）：最后 1 组作 tail
+			t = len(newGroups) - 1 // 同一次 Run 的 ReAct 轮用最后一组。
 		}
 		groups = append(headGroups, newGroups...)
-		tailStartIdx = len(headGroups) + t
+		tailStartIdx = newGroupStart + t
 	} else {
 		groups = compose_v2.GroupMessagesByAPIRound(conv)
 		if len(groups) <= 1 {
@@ -488,14 +489,8 @@ func autoCompactRun(ctx context.Context, cfg *AutoCompactConfig, messages []*sch
 	if headLenInConv(cut, sysEnd, len(conv)) == 0 && tailStartIdx > 0 && allProtectedGroups(groups[:tailStartIdx]) {
 		tailStartIdx = len(groups) - 1
 	}
-	// 末尾是刚接进消息流、模型还没回应的插话 / 闸门反馈（user 消息，各自单独成组）：tail 从它们前面那一轮
-	// 算起。插话说的是刚才那批工具结果（「只看 2026 年的」），闸门反馈说的是刚才那条答复（「漏了价格」）——
-	// 只按「最后一条 user 所在的组」起算，那一轮就被摘要掉，模型只能对着摘要回应。退到 0 时整段都是 tail、
-	// 这一轮不压（同只有一组时）。放在上面那条重置之后：先往前带的话，前面只剩受保护组时又会被它重置回最后
-	// 一组（只剩插话），那一轮照样被摘要掉（审计实测）。
-	for tailStartIdx > 0 && allPendingUserInput(groups[tailStartIdx]) {
-		tailStartIdx--
-	}
+	// 容量兜底之后仍要保留下游待答输入及其引用的最近业务组。
+	tailStartIdx = min(tailStartIdx, pendingUserTailStart(groups, newGroupStart))
 	earlyGroups := groups[:tailStartIdx]
 	tailGroups := groups[tailStartIdx:]
 	tail := compose_v2.FlattenGroups(tailGroups)
@@ -866,22 +861,6 @@ func lastUserGroupIndex(groups [][]*schema.Message, includePending bool) int {
 		}
 	}
 	return -1
-}
-
-// allPendingUserInput 报 g 是不是整组都是模型还没回应的、框架接进消息流的用户输入（运行中插话 / 闸门反馈，
-// 见 isPendingUserInput）。空组不算。
-func allPendingUserInput(g []*schema.Message) bool {
-	n := 0
-	for _, m := range g {
-		if m == nil {
-			continue
-		}
-		if !isPendingUserInput(m) {
-			return false
-		}
-		n++
-	}
-	return n > 0
 }
 
 // allProtectedGroups 判 groups 内每个 group 是否全是 protected message——即每条

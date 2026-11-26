@@ -2,12 +2,16 @@ package agent_v2_test
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 
 	"crew-go/agent_v2"
 	"crew-go/compose_v2"
+	"crew-go/hook"
 	"crew-go/schema"
+	"crew-go/store"
 )
 
 // withRunID 给一条 assistant 打上模型调用的 RunID：分组按它把每次模型调用分成一组。
@@ -139,5 +143,184 @@ func TestAutoCompact_PendingTailSurvivesProtectedLeadingGroup(t *testing.T) {
 	}
 	if orphans := orphanToolResults(out); len(orphans) > 0 {
 		t.Errorf("输出含孤儿 tool_result %v", orphans)
+	}
+}
+
+type appendPendingCompactionView struct {
+	hook.NoOpHooks
+	tail []*schema.Message
+}
+
+func (h appendPendingCompactionView) OnModelStart(ctx context.Context, _ *hook.AgentInfo, in *schema.ModelInput) (context.Context, error) {
+	in.Messages = slices.Concat(in.Messages, h.tail)
+	return ctx, nil
+}
+
+func TestCompaction_PendingInputsSurviveFrameworkSeparators(t *testing.T) {
+	const name = "pending-compaction"
+	old := "可压缩的旧历史 " + strings.Repeat("history ", 1200)
+	recent := strings.Repeat("本轮工具证据 ", 700) + "LATEST_TOOL_EVIDENCE"
+	first := strings.Repeat("第一次插话的修订细节 ", 500) + "FIRST_PENDING_DETAILS"
+	second := "末次追加条件"
+	tail := []*schema.Message{
+		withRunID(schema.AssistantMessage("第一段处理"), "earlier-step"),
+		withRunID(schema.AssistantToolCallMessage([]schema.ToolCall{{
+			ID: "latest-read", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`},
+		}}), "recent-step"),
+		schema.ToolResultMessage("latest-read", recent),
+		pendingUser(first, agent_v2.InterjectionAnnotation),
+		pendingUser("框架工具提醒", agent_v2.RepeatToolReminderAnnotation),
+		schema.SystemMessage("维护本次输出约束"),
+		pendingUser(second, agent_v2.TurnGateFeedbackAnnotation),
+	}
+	cases := []struct {
+		name string
+		opt  agent_v2.Option
+	}{
+		{"auto", agent_v2.WithAutoCompact(&agent_v2.AutoCompactConfig{
+			Enabled: true, Model: &countingSummarizer{}, ModelContextWindow: 600, SummaryMaxTokens: 100,
+			SummaryBufferTokens: 80, MinCompactableTokens: 1,
+		})},
+		{"recovery", agent_v2.WithContextRecovery(&agent_v2.ContextRecoveryConfig{
+			Store: store.NewInMemoryStore(), MaxTokens: 600, KeepRecentRounds: 1,
+		})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			llm := recoveryInspectModel{inspect: func(_ context.Context, msgs []*schema.Message) (*schema.Message, error) {
+				view := inputText(msgs)
+				if strings.Contains(view, old) {
+					return nil, errors.New("fixture did not compact the previous history")
+				}
+				var call, result, firstInput, secondInput bool
+				for _, m := range msgs {
+					for _, tc := range schema.GetToolCalls(m) {
+						call = call || tc.ID == "latest-read"
+					}
+					result = result || schema.GetToolResultID(m) == "latest-read" && m.Content == recent
+					firstInput = firstInput || m.Role == schema.RoleUser && m.Content == first
+					secondInput = secondInput || m.Role == schema.RoleUser && m.Content == second
+				}
+				if !call || !result || !firstInput || !secondInput {
+					return nil, errors.New("compaction lost the preceding tool pair or an unanswered user input")
+				}
+				return schema.AssistantMessage("已按两条追加条件整理证据"), nil
+			}}
+			a := agent_v2.NewBasicAgent(agent_v2.WithName(name), agent_v2.WithModel(llm),
+				agent_v2.WithHooks(appendPendingCompactionView{tail: tail}), tc.opt)
+			sess := agent_v2.NewRunSession()
+			sess.AddEvent(agent_v2.NewOutputEvent(name, schema.UserMessage(old)))
+			sess.AddEvent(agent_v2.NewOutputEvent(name, schema.AssistantMessage("上一轮完成")))
+			events, err := a.Run(t.Context(), sess, schema.UserMessage("按条件总结本轮证据"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final := agent_v2.FinalMessage(events); final == nil || final.Content != "已按两条追加条件整理证据" {
+				t.Fatalf("最终答复=%+v", final)
+			}
+		})
+	}
+}
+
+func TestAutoCompact_PendingInputSurvivesTrailingNoteAfterProtectedPrefix(t *testing.T) {
+	memory := pendingUser("长期记忆", agent_v2.StoreInjectedAnnotation)
+	pending := pendingUser(strings.Repeat("尚未回应的补充 ", 800), agent_v2.InterjectionAnnotation)
+	note := pendingUser("框架提示", agent_v2.RepeatToolReminderAnnotation)
+	in := []*schema.Message{memory, pending, note}
+	sm := &countingSummarizer{}
+	out, err := agent_v2.AutoCompactRun(t.Context(), &agent_v2.AutoCompactConfig{
+		Enabled: true, Model: sm, ModelContextWindow: 500, SummaryMaxTokens: 100,
+		SummaryBufferTokens: 80, MinCompactableTokens: 1,
+	}, in)
+	if err != nil || !slices.Equal(out, in) || sm.count() != 0 {
+		t.Fatalf("受保护前缀之后的待答输入应完整保留，输出 %d 条、摘要 %d 次，错误 %v", len(out), sm.count(), err)
+	}
+}
+
+func TestAutoCompact_UnansweredInputInsideToolGroup(t *testing.T) {
+	call := withRunID(schema.AssistantToolCallMessage([]schema.ToolCall{{
+		ID: "same", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`},
+	}}), "r1")
+	pending := pendingUser(strings.Repeat("追加条件 ", 500), agent_v2.InterjectionAnnotation)
+	result := schema.ToolResultMessage("same", strings.Repeat("工具证据 ", 700))
+	note := pendingUser("框架状态提示", agent_v2.RepeatToolReminderAnnotation)
+	for _, answered := range []bool{false, true} {
+		name := "待答"
+		if answered {
+			name = "已有模型回应"
+		}
+		t.Run(name, func(t *testing.T) {
+			in := []*schema.Message{schema.UserMessage("查交易记录"), call, pending, result}
+			if answered {
+				in = append(in, withRunID(schema.AssistantMessage("已经按条件检查结果"), "r2"))
+			}
+			in = append(in, note)
+			groups := compose_v2.GroupMessagesByAPIRound(in)
+			if len(groups) < 2 || !slices.Equal(groups[0], in[:4]) {
+				t.Fatal("插话应与工具调用和结果位于同一个 API 组")
+			}
+			sm := &countingSummarizer{}
+			out, err := agent_v2.AutoCompactRun(t.Context(), &agent_v2.AutoCompactConfig{
+				Enabled: true, Model: sm, ModelContextWindow: 500, SummaryMaxTokens: 100,
+				SummaryBufferTokens: 80, MinCompactableTokens: 1,
+			}, in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if answered {
+				if sm.count() != 1 || slices.Contains(out, pending) {
+					t.Fatalf("模型回应后可以摘要前一轮，摘要 %d 次，输出 %d 条", sm.count(), len(out))
+				}
+				return
+			}
+			if !slices.Equal(out, in) || sm.count() != 0 {
+				t.Fatalf("待答输入和相邻工具往返应保留，摘要 %d 次，输出 %d 条", sm.count(), len(out))
+			}
+		})
+	}
+}
+
+func TestCompaction_UnansweredInputsAndPairsSurviveLateToolReceipt(t *testing.T) {
+	makeCall := func(run string) *schema.Message {
+		return withRunID(schema.AssistantToolCallMessage([]schema.ToolCall{{
+			ID: "same", Function: schema.FunctionCall{Name: "lookup", Arguments: `{}`},
+		}}), run)
+	}
+	old := schema.UserMessage(strings.Repeat("可压缩的旧任务 ", 1000))
+	firstCall, secondCall := makeCall("earlier"), makeCall("later")
+	firstResult := schema.ToolResultMessage("same", "第一条工具回执")
+	lateResult := schema.ToolResultMessage("same", "迟到的第二条回执")
+	first := pendingUser(strings.Repeat("待答补充细节 ", 500), agent_v2.InterjectionAnnotation)
+	second := pendingUser("第二个追加条件", agent_v2.TurnGateFeedbackAnnotation)
+	in := []*schema.Message{old, withRunID(schema.AssistantMessage("旧任务完成"), "old"),
+		schema.UserMessage("本次任务"), firstCall, secondCall, firstResult,
+		first, pendingUser("框架提示", agent_v2.RepeatToolReminderAnnotation), lateResult, second,
+	}
+	groups := compose_v2.GroupMessagesByAPIRound(in)
+	if len(groups) != 6 || !slices.Contains(groups[4], lateResult) || !slices.Contains(groups[3], first) {
+		t.Fatal("迟到回执应在两条待答输入之间单独成组")
+	}
+	for _, mode := range []string{"auto", "reactive"} {
+		t.Run(mode, func(t *testing.T) {
+			var out []*schema.Message
+			var err error
+			if mode == "auto" {
+				out, err = agent_v2.AutoCompactRun(t.Context(), &agent_v2.AutoCompactConfig{
+					Enabled: true, Model: &countingSummarizer{}, ModelContextWindow: 500, SummaryMaxTokens: 100,
+					SummaryBufferTokens: 80, MinCompactableTokens: 1,
+				}, in)
+			} else {
+				out, err = agent_v2.ReactiveCompactRun(t.Context(), &agent_v2.ReactiveCompactConfig{Enabled: true},
+					in, errors.New("Input is too long: 20000 input tokens (max 500)"))
+			}
+			if err != nil || slices.Contains(out, old) {
+				t.Fatalf("应裁掉无关旧任务，输出 %d 条，错误 %v", len(out), err)
+			}
+			for _, m := range []*schema.Message{firstCall, secondCall, firstResult, lateResult, first, second} {
+				if !slices.Contains(out, m) {
+					t.Fatalf("丢失当前配对或待答输入，角色 %s，输出 %d 条", m.Role, len(out))
+				}
+			}
+		})
 	}
 }

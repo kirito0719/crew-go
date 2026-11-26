@@ -176,12 +176,7 @@ func emergencyDropOldestGroups(messages []*schema.Message, dropPercent int, gap 
 	}
 
 	// 最后一条业务消息定近期边界。附在后面的插话、闸门反馈和框架提示仍可使用该轮的回复与工具结果。
-	tail := len(groups) - 1
-	for tail > 0 && !slices.ContainsFunc(groups[tail], func(m *schema.Message) bool {
-		return m.Role != schema.RoleSystem && !IsFrameworkNote(m) && !isPendingUserInput(m)
-	}) {
-		tail--
-	}
+	tail := min(lastConversationGroup(groups), pendingUserTailStart(groups, 0))
 	request := lastUserGroupIndex(groups, false)
 	var droppableIdx []int
 	for i, group := range groups[:tail] {
