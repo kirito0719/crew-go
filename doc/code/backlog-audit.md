@@ -6,6 +6,10 @@
 
 **证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，剩余目标 CI、真实 provider 和业务数据验收见 A02、A03、A05–A07。
 
+## 2026-11-26 Plan Web 成功终态的故障恢复
+
+以 `9f5bae9` 为基线。使用实际 Plan Web 入口、Redis 桩及带工具调用的模型替身，在清档完成后拒绝写入会话状态。旧版的另一个实例只看到 `running`，根档已经删除。修复后宿主在租约内先持久化成功凭据与会话终态，再清理存档并确认。回归覆盖 Run 与 HITL Resume 的终态拒写、已提交后的确认丢失及清档完成后的确认拒绝。另一个实例可确认成功状态和历史计数，完成补清后开始终态保留期。各场景实际工具调用一次。 [故障恢复回归](../../example/orchestration/plan_chat_web/completion_recovery_test.go)
+
 ## 2026-11-26 Plan Web 与 thinking 本地验收
 
 **A09。** 以 `c417934` 为基线。在 Plan Web 的生产 Agent 入口用流式模型桩发送 512 个增量，writer 开始消费前队列已满。旧版在成功及挂起时都丢了结果和 `done`。修复后先发送已排队的进度，再发送完整答复或带待答 ID 的挂起事件及 `done`。HTTPS 反代试验也复现了错误 Cookie 查询的 404 缺少缓存控制。会话错误响应补上 `no-store`。两个 CookieJar 验证隔离，推进 Redis 桩时钟验证挂起后跨 TTL 续跑及终态过期。 [SSE 回归](../../example/orchestration/plan_chat_web/sse_internal_test.go) · [反代回归](../../example/orchestration/plan_chat_web/server_test.go)
@@ -355,7 +359,7 @@ OpenAI 真实服务端冒烟四项通过，A04 已完成。GitLab PostgreSQL/MyS
 | 70 · SaveBatch | D10 已关闭 | 内存、Redis、SQL 按 namespace 字节序落档，遇错停止且保留此前写入。旧文的批量原子承诺由现行接口和中项失败回归替代。 [接口](../../compose_v2/checkpointer.go) |
 | 73 · issue-73-v2-doc-audit-tracking.md:111–118、:216–279 | 文档欠账与可选续审 | 核心 P0/P1 文档、速查项与旧缺失的 Store/Graph/TypedGraph 示例已有入口。专题仍列“未写”“剩余 P1”、以及 R7/R4 审计版次与前面状态矛盾。清正文漂移。可选的决策合集、审计方法独立文档和新一轮边际审计仍是编辑决策。现有规则入口为 `AGENTS.md`、`CLAUDE.md` 及 `doc/description/three-way-comparison`，quickstart 和 SDK guide 已有文件。 |
 | 88、92 · issue-88-skill-schema-dead-code.md:4、issue-92-skill-source-layering.md:73–133 | 已实现与明确边界 | 参考层正式功能、Go action 和 Skill 覆盖门禁已经上线。旧 `RunSkillScript/ErrActionNotImplemented` 被删除，仓库没有通用脚本执行承诺。92 中动态按模型空窗算预算、Vercel 数字作为触发点、每 ref 样式与可观测建议均属于原提案。当前 `config.go:1042–1043` 固定可配置两级预算和强制读取规则。真实触发率的定量验收可作为能力评估，未见当前覆盖声称达成旧论文数字。 |
-| 90 · issue-90-plan-chat-web-lifecycle-prod.md:27–34 | 部署验收与明确限制 | 共享 Redis、同步存档已实现。文档公开了图端成功清档与会话元数据更新之间的进程故障窗口，过期前 running 索引可能恢复成 error。上线如需更强一致性，应单列终态 reconciliation 方案与跨副本重启验收。演示应用仍以 Cookie 和反向代理作为边界。 |
+| 90 · issue-90-plan-chat-web-lifecycle-prod.md | 本地恢复已修，目标部署验收 | 共享 Redis、同步存档已实现。成功终态在根档删除前持久化，重建实例可补清未确认的记录。旧版无终态证据且存档已丢失的记录按缺档处理。实际部署仍需核对入口与故障切换。 [本地恢复](#2026-11-26-plan-web-成功终态的故障恢复) |
 | 93① · issue-93-handoff-modelb-audit-low.md 的 ① | D08 已关闭 | Handoff 共享视图绑定到对应的候选调用。两跳和三跳的真实编排回归区分直接接手与内层成员，并核对事件回退及 HistoryStore 的投影。 [回归](../../agent_v2/handoff_modelb_test.go) |
 | 93② · issue-93-handoff-modelb-audit-low.md 的 ② | 已由持久压缩边界替代 | `agent_v2/session.go:744,779–826` 的 `SelfHistoryCompacted` 只读业务显式写入的 summary marker，默认框架 AutoCompact 走 `compaction_boundary.go`、`basic_builder.go:1253–1260` 和按视图查找。旧的“系统根本不产持久摘要”现已过时。 |
 | 93③、Raw 候选 · issue-93-handoff-modelb-audit-low.md 的 ③、:69–74 | 已闭合 | `agent_v2/handoff_agent.go:650–660` 只消费已提交 typed signal，`handoff_grant.go:314` 验证程序化来源，`tool_memo_framework_test.go:34`、`conflict_abort_test.go:154` 覆盖 Commit/Resume。Raw 中悬空 tool call 经 `basic_agent.go:1118–1127` 与会话投影的标准配对修复。原先结论的“稳定 400”不代表当前路径。 |

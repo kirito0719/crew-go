@@ -384,7 +384,7 @@ func (p *exitPurge) failure() error {
 
 // purgeExitSlot 核对当前分区及存档世代后条件清档。可选的陈旧探测用尽预算时，
 // 后端仍需在删除前核对完整子树。ownEpoch 指本次出口结果未确认的写档世代。
-func purgeExitSlot(ctx context.Context, cfg *runOptions, cm *ChannelManager, reason, staleOp, ownEpoch string) *exitPurge {
+func purgeExitSlot(ctx context.Context, cfg *runOptions, cm *ChannelManager, reason, staleOp, ownEpoch string, verifyOnly bool) *exitPurge {
 	p := &exitPurge{reason: reason}
 	staleErr, notDone := exitStaleCheck(ctx, cfg, cm, staleOp, ownEpoch, &p.notes)
 	if staleErr != nil {
@@ -394,9 +394,19 @@ func purgeExitSlot(ctx context.Context, cfg *runOptions, cm *ChannelManager, rea
 	if notDone != nil {
 		// 检查没做成：继续做条件删除，记一条告警
 		p.notes.add(func(c context.Context) {
-			slog.WarnContext(c, "compose_v2: 出口的陈旧探测未完成，继续做条件清档",
+			slog.WarnContext(c, "compose_v2: 出口的陈旧探测未完成，继续核对子树归属",
 				"sid", cfg.sessionID, "ns", cfg.graphNS, "reason", reason, "err", notDone)
 		})
+	}
+	if verifyOnly {
+		p.staleErr = exitStorageOp(ctx, exitOpRead, "verify deferred checkpoint cleanup", func(c context.Context) error {
+			_, err := checkpointCleanupScope(c, cfg, cm, ownEpoch)
+			return err
+		})
+		if p.staleErr != nil && !errors.Is(p.staleErr, ErrCheckpointStale) && !errors.Is(p.staleErr, ErrTaskLeaseLost) {
+			p.staleErr = fmt.Errorf("%w: verify deferred cleanup: %w", ErrCheckpointStale, p.staleErr)
+		}
+		return p
 	}
 	p.deleted = true
 	p.delErr = exitStorageOp(ctx, exitOpDelete, "checkpoint purge", func(c context.Context) error {

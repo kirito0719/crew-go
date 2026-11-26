@@ -1109,7 +1109,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				// **陈旧执行者不许删别人的子树**：我基于过时状态跑出的终局失败，
 				// 不构成删掉别人成果的理由。保留 ErrRunAborted 不换成 stale——
 				// "终局失败别重试"对 caller 更要紧，陈旧只是附注。
-				purge := purgeExitSlot(ctx, cfg, cm, "abort", "purge-abort", "")
+				purge := purgeExitSlot(ctx, cfg, cm, "abort", "purge-abort", "", false)
 				switch {
 				case purge.staleErr != nil:
 					// 双 %w：ErrRunAborted（"别重试"）和 ErrCheckpointStale（"你的账没记上"）
@@ -1142,7 +1142,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				}
 				runErr = np
 				if np.aborted {
-					purge := purgeExitSlot(ctx, cfg, cm, "abort", "purge-not-persisted", "")
+					purge := purgeExitSlot(ctx, cfg, cm, "abort", "purge-not-persisted", "", false)
 					np.recordPurge(purge)
 					purge.report(ctx, cfg)
 				}
@@ -1242,7 +1242,7 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			if np.aborted {
 				// 写档结果不明（宽限到点）时槽里可能就是这次写的那一代——snapshot.Epoch 在写之前铸好，清档前的检查认它
 				// 作自己的；没走到写（被检查拦下、预算用完没发）时它是空的。
-				purge = purgeExitSlot(ctx, cfg, cm, "abort", "purge-not-persisted", snapshot.Epoch)
+				purge = purgeExitSlot(ctx, cfg, cm, "abort", "purge-not-persisted", snapshot.Epoch, false)
 				np.recordPurge(purge)
 			}
 			notes.flush(ctx)
@@ -1274,7 +1274,8 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 		//
 		// 删除失败（含后端 panic，exitStorageOp 已记带栈的日志）只记日志，不改成功的结局（见上）；清档前的检查没做成
 		// 照常清（见不变量 2）。
-		purge := purgeExitSlot(ctx, cfg, cm, "success", "purge-success", "")
+		deferred := commitRoot && cfg.graphNS == "" && defersRootCheckpointCleanup(ctx, cfg.sessionID, cfg.checkpointer)
+		purge := purgeExitSlot(ctx, cfg, cm, "success", "purge-success", "", deferred)
 		if purge.staleErr != nil {
 			runErr = purge.staleErr
 		} else if errors.Is(purge.delErr, ErrTaskLeaseLost) {

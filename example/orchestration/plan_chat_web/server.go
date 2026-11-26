@@ -21,6 +21,7 @@ import (
 )
 
 const ownerCookie = "crew_plan_owner"
+const sessionFinishTimeout = 5 * time.Second
 
 var errSessionMissing = errors.New("session not found")
 
@@ -144,6 +145,12 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	ctx = compose_v2.WithSessionIDCtx(ctx, sess.RunID)
+	ctx, err = compose_v2.WithDeferredRootCheckpointCleanup(ctx, sess.RunID)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
 	var record sessionRecord
 	var verifyResume bool
 	err = s.sessions.update(ctx, key, func(current *sessionRecord) (*sessionRecord, error) {
@@ -153,10 +160,11 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 				return nil, errSessionMissing
 			}
 			if current.terminal() {
+				record = *current
 				return nil, finishedSession{current.Status}
 			}
 			// 已取得独占许可，遗留 running 表示前一次未提交终态。核对期间先保留旧记录。
-			verifyResume = current.Status == statusResumeUnconfirmed || current.Status == statusRunning
+			verifyResume = current.needsRecoveryCheck()
 			if verifyResume {
 				record = *current
 				return current, nil
@@ -175,8 +183,32 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 		return current, nil
 	})
 	if err != nil {
+		if record.CleanupPending {
+			cleanupCtx, cancel := context.WithTimeout(ctx, sessionFinishTimeout)
+			defer cancel()
+			if _, cleanupErr := s.finishSuccessCleanup(cleanupCtx, key); cleanupErr != nil {
+				log.Printf("[plan_chat_web] 补清已完成会话存档: %v", cleanupErr)
+			}
+		}
 		writeSessionError(w, err)
 		return
+	}
+	if verifyResume {
+		verifyCtx, cancel := context.WithTimeout(ctx, sessionFinishTimeout)
+		defer cancel()
+		size, complete, err := loadSessionSuccess(verifyCtx, s.cp, key.id)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		if complete {
+			_, err = s.commitSuccess(verifyCtx, key, size)
+			if err == nil {
+				err = finishedSession{statusSuccess}
+			}
+			writeSessionError(w, err)
+			return
+		}
 	}
 
 	slot := &runSlot{sess: sess, cp: s.cp, mode: record.Mode, resumeAction: action,
@@ -189,7 +221,6 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 	}}
 	hooks := s.obs.AgentHooks(&hookAdapter{sink: sink}, intHook)
 	orch := s.obs.OrchHooks(&orchAdapter{sink: sink})
-	ctx = compose_v2.WithSessionIDCtx(ctx, sess.RunID)
 	ctx, span := s.obs.Tracer().Start(ctx, "plan_chat_web "+r.URL.Path)
 	defer span.End()
 	if traceID := observability.TraceIDFromContext(ctx); traceID != "" {
@@ -199,9 +230,9 @@ func (s *chatServer) chat(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer close(done)
 		defer sink.close()
+		defer release()
 		runOrResume(ctx, s.model, slot, input, resuming, sink, orch, hooks, func(status, pendingID string, historySize int) error {
-			defer release()
-			finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionFinishTimeout)
 			defer cancel()
 			return s.finish(finishCtx, key, status, pendingID, historySize)
 		})
@@ -214,22 +245,105 @@ func (s *chatServer) finish(ctx context.Context, key sessionKey, status, pending
 	if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
 		return err
 	}
+	if status == statusSuccess {
+		if err := saveSessionSuccess(ctx, s.cp, key.id, historySize); err != nil {
+			return fmt.Errorf("save session success: %w", err)
+		}
+		_, err := s.commitSuccess(ctx, key, historySize)
+		return err
+	}
 	if (sessionRecord{Status: status}).terminal() {
 		if err := s.cleanupCheckpoint(ctx, key.id); err != nil {
 			return err
 		}
 	}
-	return s.sessions.update(ctx, key, func(current *sessionRecord) (*sessionRecord, error) {
+	_, err := s.recordFinish(ctx, key, status, pendingID, historySize)
+	return err
+}
+
+func (s *chatServer) recordFinish(ctx context.Context, key sessionKey, status, pendingID string, historySize int) (*sessionRecord, error) {
+	var recorded *sessionRecord
+	err := s.sessions.update(ctx, key, func(current *sessionRecord) (*sessionRecord, error) {
 		if current == nil {
 			return nil, errSessionMissing
 		}
+		if current.terminal() {
+			return nil, finishedSession{current.Status}
+		}
 		current.Status, current.LastActivity = status, time.Now().UTC()
 		current.InterruptID, current.HistorySize, current.PauseRequested = pendingID, historySize, false
-		if current.terminal() && current.Ephemeral {
+		current.CleanupPending = status == statusSuccess
+		if current.mayExpire() && current.Ephemeral {
 			return nil, nil
 		}
+		recorded = current
 		return current, nil
 	})
+	return recorded, err
+}
+
+// commitSuccess 先提交可查询的终态，再尝试清理进度和完成凭据。
+func (s *chatServer) commitSuccess(ctx context.Context, key sessionKey, historySize int) (*sessionRecord, error) {
+	recorded, err := s.recordFinish(ctx, key, statusSuccess, "", historySize)
+	if err != nil {
+		return nil, err
+	}
+	settled, err := s.finishSuccessCleanup(ctx, key)
+	if err != nil {
+		log.Printf("[plan_chat_web] 成功会话的清档待补: %v", err)
+		return recorded, nil
+	}
+	return settled, nil
+}
+
+// finishSuccessCleanup 补做已提交成功会话的清档。调用方持有任务许可。
+func (s *chatServer) finishSuccessCleanup(ctx context.Context, key sessionKey) (*sessionRecord, error) {
+	if err := compose_v2.CheckCheckpointTaskLease(ctx); err != nil {
+		return nil, err
+	}
+	if err := s.cleanupCheckpoint(ctx, key.id); err != nil {
+		return nil, err
+	}
+	var settled *sessionRecord
+	err := s.sessions.update(ctx, key, func(current *sessionRecord) (*sessionRecord, error) {
+		if current == nil {
+			return nil, errSessionMissing
+		}
+		if current.Ephemeral {
+			return nil, nil
+		}
+		current.CleanupPending = false
+		current.LastActivity = time.Now().UTC()
+		settled = current
+		return current, nil
+	})
+	return settled, err
+}
+
+// reconcileSuccessCleanup 处理进程重启或清档暂时失败留下的记录。
+func (s *chatServer) reconcileSuccessCleanup(ctx context.Context, key sessionKey) (*sessionRecord, error) {
+	ctx, cancel := context.WithTimeout(ctx, sessionFinishTimeout)
+	defer cancel()
+	ctx, release, err := s.acquire(s.taskContext(ctx, key.owner), key.id, true)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	record, err := s.load(ctx, key)
+	if err != nil {
+		return record, err
+	}
+	if record.CleanupPending {
+		return s.finishSuccessCleanup(ctx, key)
+	}
+	if record.needsRecoveryCheck() {
+		size, complete, err := loadSessionSuccess(ctx, s.cp, key.id)
+		if err != nil || !complete {
+			return record, err
+		}
+		return s.commitSuccess(ctx, key, size)
+	}
+	return record, nil
 }
 
 func (s *chatServer) interrupt(w http.ResponseWriter, r *http.Request) {
@@ -307,10 +421,31 @@ func (s *chatServer) listSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *chatServer) getSession(w http.ResponseWriter, r *http.Request) {
-	record, err := s.load(r.Context(), sessionKey{owner: s.owner(w, r, false), id: r.PathValue("id")})
+	key := sessionKey{owner: s.owner(w, r, false), id: r.PathValue("id")}
+	record, err := s.load(r.Context(), key)
 	if err != nil {
 		writeSessionError(w, err)
 		return
+	}
+	needsCleanup := record.CleanupPending
+	if record.needsRecoveryCheck() {
+		hasSuccess, err := s.cp.ExistsNS(r.Context(), key.id, successCheckpointNS)
+		if err != nil {
+			log.Printf("[plan_chat_web] 查询会话的成功凭据: %v", err)
+		}
+		needsCleanup = hasSuccess
+	}
+	if needsCleanup {
+		settled, err := s.reconcileSuccessCleanup(r.Context(), key)
+		switch {
+		case errors.Is(err, errSessionMissing) || err == nil && settled == nil:
+			writeSessionError(w, errSessionMissing)
+			return
+		case err == nil:
+			record = settled
+		case !errors.Is(err, compose_v2.ErrTaskBusy):
+			log.Printf("[plan_chat_web] 查询时补清会话存档: %v", err)
+		}
 	}
 	writeSessionJSON(w, record)
 }

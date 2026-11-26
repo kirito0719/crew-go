@@ -32,10 +32,19 @@ type sessionRecord struct {
 	PauseRequested bool      `json:"pause_requested,omitempty"`
 	Ephemeral      bool      `json:"ephemeral,omitempty"`
 	HistorySize    int       `json:"history_size"`
+	CleanupPending bool      `json:"cleanup_pending,omitempty"`
 }
 
 func (s sessionRecord) terminal() bool {
 	return s.Status == statusSuccess || s.Status == statusError || s.Status == statusCancelled
+}
+
+func (s sessionRecord) mayExpire() bool {
+	return s.terminal() && !s.CleanupPending
+}
+
+func (s sessionRecord) needsRecoveryCheck() bool {
+	return s.Status == statusResumeUnconfirmed || s.Status == statusRunning
 }
 
 type sessionKey struct{ owner, id string }
@@ -58,7 +67,7 @@ func newMemorySessions(ttl time.Duration) *memorySessions {
 }
 
 func (s *memorySessions) expired(record sessionRecord, now time.Time) bool {
-	return s.ttl > 0 && record.terminal() && !now.Before(record.LastActivity.Add(s.ttl))
+	return s.ttl > 0 && record.mayExpire() && !now.Before(record.LastActivity.Add(s.ttl))
 }
 
 func (s *memorySessions) getLocked(key sessionKey) *sessionRecord {
@@ -192,7 +201,7 @@ func (s *redisSessions) update(ctx context.Context, key sessionKey, edit func(*s
 					return err
 				}
 				var ttl time.Duration
-				if next.terminal() {
+				if next.mayExpire() {
 					ttl = s.ttl
 				}
 				p.Set(ctx, name, data, ttl)

@@ -750,11 +750,36 @@ var _ Checkpointer = (*InMemoryCheckpointer)(nil)
 type checkpointerKey struct{}
 type boundCheckpointerKey struct{}
 type checkpointingDisabledKey struct{}
+type deferredRootCleanupKey struct{}
 
 func (boundCheckpointerKey) ExecutionState()     {}
 func (checkpointingDisabledKey) ExecutionState() {}
+func (deferredRootCleanupKey) ExecutionState()   {}
 
 type boundCheckpointer struct{ cp Checkpointer }
+
+type deferredRootCleanup struct {
+	sid string
+	cp  Checkpointer
+}
+
+// WithDeferredRootCheckpointCleanup 将指定任务的成功清档交给宿主。
+// 宿主持有任务执行许可，在相同后端先持久化终态，再负责清理整棵任务存档。
+// 调用时解析并记录实际分区。匹配任务、分区和根 namespace 的图在退出时先核对子树归属。
+// 嵌套图与独立任务照常收尾。
+func WithDeferredRootCheckpointCleanup(ctx context.Context, sid string) (context.Context, error) {
+	rootCtx := WithGraphNS(withSessionID(ctx, sid), "")
+	cp, err := ResolveCheckpointPartition(rootCtx, GetCheckpointer(rootCtx))
+	if err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, deferredRootCleanupKey{}, deferredRootCleanup{sid: sid, cp: cp}), nil
+}
+
+func defersRootCheckpointCleanup(ctx context.Context, sid string, cp Checkpointer) bool {
+	cleanup, ok := ctx.Value(deferredRootCleanupKey{}).(deferredRootCleanup)
+	return ok && cleanup.sid == sid && SameCheckpointPartition(cleanup.cp, cp)
+}
 
 // WithoutCheckpointing 关闭当前执行范围内图的存档。显式放弃操作仍使用原后端，独立任务可照常存档。
 func WithoutCheckpointing(ctx context.Context) context.Context {

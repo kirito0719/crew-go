@@ -1093,3 +1093,7 @@ ns LIKE 'prefix<sep>%'`。而段里可以合法出现 LIKE 的 `_` / `%`（校�
 crew-go 仍在图边界写存档，采用独立记录的粒度，每个工具调用通过 `compose_v2.SaveNodeState` 保存审批、结果和信号。
 这样既能在中断后重放单项，也省去其他已完成结果的重复编码。v20 批次账在恢复入口迁移，v21 写逐调用账项。
 实测对比见[审计复核](../../review/agent-orchestration-audit-2026-11-12.md#2026-11-13-优化复审)。
+
+### 2026-11-26 · 宿主提交成功状态后清理根档
+
+本地 LangGraph saver 将 checkpoint 保存和按线程删除定义为独立操作。Plan Web 同样需要先取得可核验的终态证据，再回收任务存档。crew-go 的默认图出口仍负责清理。持有任务许可的宿主可按任务和实际分区接管根图成功清档，将收尾进度和对外状态写在会话层。Plan Web 在故障注入回归中用这条路径验证了另一实例补清和终态保留期。 [ISSUE-90](../../issue/issue-90-plan-chat-web-lifecycle-prod.md#恢复边界) · [故障回归](../../../example/orchestration/plan_chat_web/completion_recovery_test.go)

@@ -314,13 +314,17 @@ func runOrResume(
 			sendInterrupted(ie.Reason, ie.Data, summarizeCheckpoint(ctx, slot.cp, slot.sess.RunID), ie.Query)
 			return
 		}
+		if errors.Is(err, compose_v2.ErrCheckpointStale) || errors.Is(err, compose_v2.ErrTaskLeaseLost) {
+			log.Printf("[plan_chat_web] 执行未持有可清理的存档: %v", err)
+			sendError("session state unavailable")
+			return
+		}
 		if isResume && errors.Is(err, compose_v2.ErrCheckpointResumeUnconfirmed) {
 			sendUnconfirmed()
 			return
 		}
 		if isResume && ctx.Err() != nil && errors.Is(err, ctx.Err()) &&
-			!errors.Is(err, compose_v2.ErrRunAborted) && !errors.Is(err, compose_v2.ErrTaskLeaseLost) &&
-			!errors.Is(err, compose_v2.ErrCheckpointStale) && !errors.Is(err, compose_v2.ErrCheckpointNotPersisted) {
+			!errors.Is(err, compose_v2.ErrRunAborted) && !errors.Is(err, compose_v2.ErrCheckpointNotPersisted) {
 			// HTTP 请求退出后用仍持有的会话许可核对实际存档。
 			recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			saved, readErr := slot.cp.LoadNS(recoveryCtx, slot.sess.RunID, "")
@@ -357,7 +361,7 @@ func runOrResume(
 		return
 	}
 
-	// 跑完了——终态 success (slot 留 runs 让前端查 history; sweeper TTL 到清)
+	// 完成态可由会话接口查询，清档确认后进入终态保留期。
 	if !finish(statusSuccess, "") {
 		return
 	}

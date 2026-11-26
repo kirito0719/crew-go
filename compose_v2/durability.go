@@ -213,9 +213,19 @@ func emitCpCleanupRejected(ctx context.Context, cfg *runOptions, reason string, 
 // deleteCpSubtree 先确认子树归属，再交给已绑定的后端原子核对整棵子树。
 func deleteCpSubtree(ctx context.Context, cfg *runOptions, cm *ChannelManager, ownEpoch string) (int32, time.Duration, error) {
 	start := time.Now()
-	expected, err := loadCheckpointSubtree(ctx, cfg.checkpointer, cfg.sessionID, cfg.graphNS)
+	scope, err := checkpointCleanupScope(ctx, cfg, cm, ownEpoch)
 	if err != nil {
 		return 0, time.Since(start), err
+	}
+	deleted, err := cfg.checkpointer.DeleteSubtree(ctx, cfg.sessionID, cfg.graphNS, CheckpointDeleteCondition{Expected: scope})
+	return deleted, time.Since(start), err
+}
+
+// checkpointCleanupScope 核对出口所见的子树是否属于已经取得存档槽的执行。
+func checkpointCleanupScope(ctx context.Context, cfg *runOptions, cm *ChannelManager, ownEpoch string) ([]NSCheckpoint, error) {
+	expected, err := loadCheckpointSubtree(ctx, cfg.checkpointer, cfg.sessionID, cfg.graphNS)
+	if err != nil {
+		return nil, err
 	}
 	taskID := getRunTaskID(ctx)
 	if taskID == "" && cfg.checkpointStart != nil {
@@ -241,16 +251,15 @@ func deleteCpSubtree(ctx context.Context, cfg *runOptions, cm *ChannelManager, o
 			}
 			owned, err := restartOwnsCheckpoint(ctx, cfg.checkpointer, cfg.sessionID, slot)
 			if err != nil {
-				return 0, time.Since(start), err
+				return nil, err
 			}
 			if owned {
 				continue
 			}
 		}
-		return 0, time.Since(start), fmt.Errorf("%w: cannot confirm cleanup ownership of checkpoint %q", ErrCheckpointStale, slot.NS)
+		return nil, fmt.Errorf("%w: cannot confirm cleanup ownership of checkpoint %q", ErrCheckpointStale, slot.NS)
 	}
-	deleted, err := cfg.checkpointer.DeleteSubtree(ctx, cfg.sessionID, cfg.graphNS, CheckpointDeleteCondition{Expected: expected})
-	return deleted, time.Since(start), err
+	return expected, nil
 }
 
 // reportCpPurge 发一次出口清档的 cp.cleanup 事件（opt-in）并记日志。reason 是 "success" / "abort"。

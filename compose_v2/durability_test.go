@@ -173,6 +173,114 @@ func TestDurability_Sync_CleansOnSuccess(t *testing.T) {
 	}
 }
 
+type cleanupPartitionResolver struct {
+	compose_v2.Checkpointer
+	fallback compose_v2.Checkpointer
+}
+
+func (r cleanupPartitionResolver) ResolveCheckpointPartition(ctx context.Context) (compose_v2.Checkpointer, error) {
+	if compose_v2.GetSessionID(ctx) == "owned" && compose_v2.GetGraphNS(ctx) == "" {
+		return r.Checkpointer, nil
+	}
+	return r.fallback, nil
+}
+
+func TestDeferredRootCheckpointCleanupIsScoped(t *testing.T) {
+	for _, tc := range []struct {
+		name, sid, ns string
+		otherStore    bool
+		resolve       bool
+		detached      bool
+		retain        bool
+	}{
+		{name: "owned-root", sid: "owned", retain: true},
+		{name: "resolved-root", sid: "owned", resolve: true, retain: true},
+		{name: "different-task", sid: "other"},
+		{name: "different-namespace", sid: "owned", ns: "child"},
+		{name: "different-store", sid: "owned", otherStore: true},
+		{name: "detached", sid: "owned", detached: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g, counter, maxCh := loopGraph(t, 3)
+			cm := compose_v2.NewChannelManager()
+			owned := newRecordingCp()
+			actual := owned
+			if tc.otherStore {
+				actual = newRecordingCp()
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			ctx = compose_v2.WithCheckpointerCtx(ctx, owned)
+			ctx, activity, err := compose_v2.BeginTaskActivity(ctx, "owned", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := sync.OnceFunc(activity.Release)
+			defer release()
+			if tc.resolve {
+				ctx = compose_v2.WithCheckpointerCtx(ctx, cleanupPartitionResolver{
+					Checkpointer: owned, fallback: newRecordingCp(),
+				})
+			}
+			ctx, err = compose_v2.WithDeferredRootCheckpointCleanup(ctx, "owned")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.detached {
+				release()
+				ctx = compose_v2.DetachExecution(ctx)
+			}
+			if err := compose_v2.Run(ctx, g, cm, compose_v2.WithCheckpointer(actual),
+				compose_v2.WithSessionID(tc.sid), compose_v2.WithRunNS(tc.ns), compose_v2.WithDurability(compose_v2.DurabilitySync),
+				compose_v2.WithInitialWrites(compose_v2.Write(maxCh, 3))); err != nil {
+				t.Fatal(err)
+			}
+			count, _ := compose_v2.Get(cm.Channels(), counter)
+			saved, err := actual.LoadNS(ctx, tc.sid, tc.ns)
+			if count != 3 || actual.count() == 0 || err != nil || (saved != nil) != tc.retain {
+				t.Fatalf("执行或清档结果有误: 次数=%d 写档=%d 保留=%v 错误=%v", count, actual.count(), saved != nil, err)
+			}
+		})
+	}
+}
+
+func TestDeferredCleanupRejectsForeignCheckpoint(t *testing.T) {
+	const sid = "owned"
+	cp := compose_v2.NewInMemoryCheckpointer()
+	g, err := compose_v2.NewBuilder().
+		AddNode("store-foreign", func(ctx context.Context, _ compose_v2.Channels) ([]compose_v2.ChannelWrite, error) {
+			return nil, cp.SaveNS(ctx, sid, "foreign", &compose_v2.Checkpoint{
+				GraphID: "foreign-graph", TaskID: "different-task", Status: compose_v2.CPStatusPending,
+			})
+		}).
+		AddEdge(compose_v2.StartNode, "store-foreign").
+		AddEdge("store-foreign", compose_v2.EndNode).
+		Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	ctx = compose_v2.WithCheckpointerCtx(ctx, cp)
+	ctx, activity, err := compose_v2.BeginTaskActivity(ctx, sid, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer activity.Release()
+	ctx, err = compose_v2.WithDeferredRootCheckpointCleanup(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compose_v2.Run(ctx, g, compose_v2.NewChannelManager(),
+		compose_v2.WithCheckpointer(cp), compose_v2.WithSessionID(sid)); !errors.Is(err, compose_v2.ErrCheckpointStale) {
+		t.Fatalf("根图应拒绝提交包含未归属子档的结果: %v", err)
+	}
+	saved, err := cp.LoadNS(ctx, sid, "foreign")
+	if err != nil || saved == nil || saved.TaskID != "different-task" {
+		t.Fatalf("未归属的存档应保留: %+v, %v", saved, err)
+	}
+}
+
 // TestDurability_RunOptionAndCtxPrecedence：resolveDurability 优先级——ctx 继承生效 +
 // RunOption 显式覆盖 ctx（经"是否每超步写"间接验证）。
 func TestDurability_RunOptionAndCtxPrecedence(t *testing.T) {
