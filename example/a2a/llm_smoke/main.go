@@ -7,8 +7,8 @@
 //  3. server 侧 HITL：served 真 qwen BasicAgent + ask_user 抛中断 → A2A input-required →
 //     客户端 RemoteAgent(WithHumanGate) 中断 → Resume 答复 → 服务端按 taskID Resume → 终答。
 //
-// 这是 CLAUDE.md "build 通过≠能用 / 真 LLM 用例" 要求的真实 LLM 冒烟——单测用 mock model
-// 验证机制，本 smoke 用真 qwen 验证真实链路。
+// 同目录的本地回归使用 Qwen 客户端与 HTTP 桩，验证工具分片、A2A 补答与续跑 artifact。
+// 本程序用于验证实际 Qwen 服务及模型行为。
 //
 // 跑（需项目根 .env 的 QWEN_API_KEY，envloader 自动加载）：
 //

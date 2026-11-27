@@ -27,7 +27,7 @@
 | --- | --- | --- | --- |
 | A02 | 验收 | 发版候选 CI 与存档升级 | 收集发布 SHA 对应的 PostgreSQL/MySQL CI 结果。在实际启用的后端验证旧挂起档、迁移与回退。共用存档的互斥和跨副本恢复验收暂缓。 [CI](../../.gitlab-ci.yml) · [升级说明](../release/next.md) |
 | A03 | 验收 | 路由模型接管门槛 | 仓内已有真服务报告与按输入、配置指纹做的离线回放。用当前业务的脱敏样本、人工标签及候选模型结果确定错路由率、承接率和端到端 P95 门槛。 [历史实测](../../example/decision/routing_eval/REPORT.md) · [接入和评测](../v2/route-decider.md) · [回放测试](../../example/decision/routing_eval/replay_test.go) |
-| A05 | 验收 | Qwen 真模型链路和 A2A | 用现有 `llm_smoke` 验流式 artifact、服务端 HITL 和 Resume。按发布范围覆盖编排矩阵、Skill Action、工具审批与存档 durability。依赖 `QWEN_API_KEY`。 [冒烟命令](../description/smoke-test-recipes.md) |
+| A05 | 验收 | Qwen 真模型链路和 A2A | 本地 HTTP 桩已覆盖真实 Qwen 客户端的工具分片、A2A 挂起补答及续跑 artifact。发布时用现有 `llm_smoke` 验实际模型，并按发布范围覆盖编排矩阵、Skill Action、工具审批与存档 durability。依赖 `QWEN_API_KEY`。 [本地回归](../../example/a2a/llm_smoke/main_test.go) · [冒烟命令](../description/smoke-test-recipes.md) |
 
 ## P3 · 窄路径、扩展与设计决策
 
