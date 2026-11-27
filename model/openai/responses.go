@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"crew-go/internal/modelreplay"
 	"crew-go/model"
 	"crew-go/schema"
 )
@@ -282,7 +283,7 @@ func responsesUserContent(m *schema.Message, provider string) (any, error) {
 	return content, nil
 }
 
-const responsesReplayKey = "openai_responses_items"
+const responsesReplayKey = modelreplay.OpenAIResponsesItems
 
 type responsesEnvelope struct {
 	Source string            `json:"source"`

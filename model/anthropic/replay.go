@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"crew-go/internal/modelreplay"
 	"crew-go/schema"
 )
 
@@ -19,7 +20,7 @@ const (
 	//
 	// 值是字符串而不是结构体：标注要经过存档的 JSON 往返，字符串往返前后一字不差。业务不需要读它；
 	// 删掉它的话这条消息按领域字段重建，thinking 块随之丢失、后面的 thinking 跟着作废。
-	AssistantContentAnnotation = "anthropic.assistant_content"
+	AssistantContentAnnotation = modelreplay.AnthropicAssistantContent
 	// InputTransformationsAnnotation 记 API 对这次请求的输入做过的改动（响应的 input_transformations，
 	// 典型是丢掉了对不上前缀的 thinking 块），按（种类, 原因）归并，每组 {"type", "reason", "count",
 	// "first_path"}；没有改动时不打。用 [InputTransformations] 读。

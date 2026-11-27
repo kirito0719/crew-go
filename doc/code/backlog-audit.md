@@ -6,6 +6,10 @@
 
 **证据口径**。以可达提交、当前生产路径和现存回归确认现行契约。只有历史结论或旧符号的记录保留为档案。导入文档中的部分短 SHA 在本地现有历史中无法解析，不能单独证明关闭。源码推导与本次实跑分别注明。本轮在基线复跑 `make test`，根模块、Redis、SQL 和 ZooKeeper 四组全部通过，另实测 ISSUE-24 的双槽存档问题。已有发布和凭据依赖用例的通过记录另列，剩余目标 CI、真实 provider 和业务数据验收见 A02、A03、A05–A07。
 
+## 2026-11-27 压缩备忘与模型回放
+
+Q08 本地子项以 `be1ea7a` 为基线。用 Claude HTTP 桩生成带签名的历史工具调用和配对结果。BasicAgent 保留该工具组并折叠独立旧轮时，钩子第二轮删去回放标注，旧备忘仍把签名带进实际请求。修复后备忘按当前 Claude 内容快照和 OpenAI Responses 回放项校验。删除或替换回放数据时重新计算。只变化测试标注的对照组继续复用备忘，归档只写一次。历史工具配对及当前工具结果都留在请求里，实际工具执行一次。新版回放指纹在原 `Anchor` 字段编码，存档沿用原 channel 类型。回归覆盖序列化后旧快照、旧摘要的复用判定，以及 AG-UI 从实际旧存档续跑的工具配对。 [Claude 请求回归](../../model/anthropic/compaction_memo_test.go) · [备忘回归](../../agent_v2/compaction_memo_replay_internal_test.go) · [AG-UI 旧档回归](../../agui/soft_landing_recovery_internal_test.go)
+
 ## 2026-11-26 Plan Web 成功终态的故障恢复
 
 以 `9f5bae9` 为基线。使用实际 Plan Web 入口、Redis 桩及带工具调用的模型替身，在清档完成后拒绝写入会话状态。旧版的另一个实例只看到 `running`，根档已经删除。修复后宿主在租约内先持久化成功凭据与会话终态，再清理存档并确认。回归覆盖 Run 与 HITL Resume 的终态拒写、已提交后的确认丢失及清档完成后的确认拒绝。另一个实例可确认成功状态和历史计数，完成补清后开始终态保留期。各场景实际工具调用一次。 [故障恢复回归](../../example/orchestration/plan_chat_web/completion_recovery_test.go)

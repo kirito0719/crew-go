@@ -156,6 +156,8 @@ thinking 块带签名，签名绑定它产生时的前缀（`system`、`tools`�
 
 服务端压缩的回放前缀从有效 compaction 块开始，后续 thinking 随块原样回放。HTTP 或 SSE 返回超窗错误时，ReactiveCompact 从失败请求实际使用的摘要开始裁剪。它保留摘要所在轮及其工具配对，生成的转存索引放在摘要轮后。通过 `ExtraBody` 覆盖 `messages` 或通过 `WithRequestOptions` 透传 SDK 选项时，请求体可由调用方改写。ReactiveCompact 使用模型接口收到的常规输入视图。服务端流式压缩以一次 `compaction_delta` 交付完整摘要。 [Anthropic compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold#streaming)
 
+AutoCompact 和可取回折叠复用备忘前会核对 `OnModelStart` 处理后的回放快照。保留的工具组在钩子移除或替换快照后按当前消息重建。 [本地请求回归](../../model/anthropic/compaction_memo_test.go)
+
 `WithContextEditing` 在服务端按策略编辑请求视图。对支持 preserved thinking 的模型，Anthropic 在服务端清理时维护 thinking 签名有效性。清理会使编辑位置起的 prompt cache 失效，后续请求可复用新的缓存前缀。工具结果清理可用 `ClearAtLeastTokens` 设每次清理的最低收益。 [Anthropic 缓存与清理约定](https://platform.claude.com/docs/en/build-with-claude/context-editing#context-editing-and-prompt-caching)
 
 `agent_v2.NewLLMPlanner` 读取 `StructuredCapability`。Claude 由提示词引导自动选择本轮绑定的 `plan` 或 `respond`，模型没有返回工具调用时可用 `errors.Is` 判断 `ErrPlannerNoToolCall`。

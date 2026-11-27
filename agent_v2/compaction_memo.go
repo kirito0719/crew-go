@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"crew-go/compose_v2"
+	"crew-go/internal/modelreplay"
 	"crew-go/schema"
 )
 
@@ -50,7 +51,10 @@ type compactionMemo struct {
 	Transient bool `json:"transient,omitempty"`
 }
 
-// prefixAnchor 是一段消息的指纹，包含模型接收的消息内容和影响压缩的框架标注。跨存档往返保持稳定。
+// 回放指纹继续使用原有 Anchor 字段，保持存量 checkpoint 的 channel 类型身份。
+const replayAnchorPrefix = "replay-v1:"
+
+// prefixAnchor 是一段消息的指纹，包含消息内容、模型回放快照和影响压缩的框架标注。跨存档往返保持稳定。
 //
 // 送给模型的内容逐字都要进指纹，不能只看长度或配对 ID：钩子每轮往前缀里插一条「第 N 轮」这类长度不变的消息、
 // 改历史里某次工具调用的参数（脱敏）、改推理文本时，只比长度会把上一轮的结果套到这一轮上，钩子这一轮的改写
@@ -58,6 +62,7 @@ type compactionMemo struct {
 func prefixAnchor(msgs []*schema.Message) string {
 	h := fnv.New64a()
 	var b strings.Builder
+	hasReplay := false
 	for _, m := range msgs {
 		b.Reset()
 		if m != nil {
@@ -93,9 +98,30 @@ func prefixAnchor(msgs []*schema.Message) string {
 				}
 				writeAnchorField(h, string(blocks))
 			}
+			for _, key := range requestReplayKeys {
+				if replay := modelReplaySnapshot(m, key); replay != "" {
+					hasReplay = true
+					writeAnchorField(h, key)
+					writeAnchorField(h, replay)
+				}
+			}
 		}
 	}
-	return strconv.Itoa(len(msgs)) + ":" + strconv.FormatUint(h.Sum64(), 16)
+	anchor := strconv.Itoa(len(msgs)) + ":" + strconv.FormatUint(h.Sum64(), 16)
+	if hasReplay {
+		return replayAnchorPrefix + anchor
+	}
+	return anchor
+}
+
+var requestReplayKeys = [...]string{modelreplay.AnthropicAssistantContent, modelreplay.OpenAIResponsesItems}
+
+func modelReplaySnapshot(m *schema.Message, key string) string {
+	if m == nil || m.Role != schema.RoleAssistant {
+		return ""
+	}
+	snapshot, _ := m.Annotations[key].(string)
+	return snapshot
 }
 
 // writeCompactionAnnotations 只接收压缩链路使用的分组、保护和取回标注。
@@ -139,6 +165,16 @@ func writeAnchorField(h hash.Hash64, v string) {
 func (m *compactionMemo) apply(msgs []*schema.Message) (reduced []*schema.Message, upto, headLen int) {
 	if m == nil || m.Upto <= 0 || m.Upto > len(msgs) || prefixAnchor(msgs[:m.Upto]) != m.Anchor {
 		return msgs, 0, 0
+	}
+	if !strings.HasPrefix(m.Anchor, replayAnchorPrefix) {
+		// 旧指纹和已经删除全部回放标注的输入仍可能匹配。旧 Head 中的快照需要重算。
+		for _, msg := range m.Head {
+			for _, key := range requestReplayKeys {
+				if modelReplaySnapshot(msg, key) != "" {
+					return msgs, 0, 0
+				}
+			}
+		}
 	}
 	reduced = make([]*schema.Message, 0, len(m.Head)+len(msgs)-m.Upto)
 	reduced = append(reduced, m.Head...)
