@@ -147,7 +147,7 @@ func (h *handler) serveHistory(w http.ResponseWriter, r *http.Request, op string
 			return
 		}
 	}
-	messages, err := agent_v2.LoadAllHistory(ctx, h.historyStore, agent_v2.HistoryKey{Owner: key.owner, ConvID: thread})
+	messages, err := agent_v2.LoadCommittedHistory(ctx, h.historyStore, agent_v2.HistoryKey{Owner: key.owner, ConvID: thread})
 	if err != nil {
 		slog.WarnContext(ctx, "agui: 对话历史读取失败", "err", err)
 		_ = writeReject(w, http.StatusServiceUnavailable, "history_read_failed", "the server could not load conversation history")

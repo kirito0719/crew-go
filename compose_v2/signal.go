@@ -118,8 +118,9 @@ import (
 // 信号。它不是防伪造的那道防线——[Signals] 的 JSON 形态里种类只是一个名字；防伪造靠收件人
 // （见 [SignalRecipient]）。
 type SignalKind struct {
-	name   string
-	commit func(context.Context, Signal) error
+	name           string
+	commit         func(context.Context, Signal) error
+	rootNodeCommit bool
 }
 
 type signalKindRegistration struct {
@@ -136,10 +137,10 @@ var (
 // NewSignalKind 铸造一类上行信号。名字用于持久化（存档与记录里按名字存），在进程内必须唯一：
 // 重复铸造会 panic——两个包用同一个名字，彼此的信号就会被对方当成自己的。在包级变量里铸。
 func NewSignalKind(name string) *SignalKind {
-	return registerSignalKind(name, nil)
+	return registerSignalKind(name, nil, false)
 }
 
-func registerSignalKind(name string, commit func(context.Context, Signal) error) *SignalKind {
+func registerSignalKind(name string, commit func(context.Context, Signal) error, rootNodeCommit bool) *SignalKind {
 	if name == "" {
 		panic("compose_v2: NewSignalKind 的名字不能为空")
 	}
@@ -152,7 +153,7 @@ func registerSignalKind(name string, commit func(context.Context, Signal) error)
 	if first, dup := signalKinds[name]; dup {
 		panic(fmt.Sprintf("compose_v2: 信号种类 %q 已经在 %s 铸过（这次在 %s）——同名只能铸一次", name, first.where, where))
 	}
-	kind := &SignalKind{name: name, commit: commit}
+	kind := &SignalKind{name: name, commit: commit, rootNodeCommit: rootNodeCommit}
 	signalKinds[name] = signalKindRegistration{kind: kind, where: where}
 	return kind
 }
@@ -208,6 +209,20 @@ func (s Signals) Len() int { return len(s.items) }
 
 // IsZero 报这组信号是不是空的（给 `json:",omitzero"` 用）。
 func (s Signals) IsZero() bool { return len(s.items) == 0 }
+
+// OfKind 返回指定种类的信号，保留原顺序。
+func (s Signals) OfKind(kind *SignalKind) []Signal {
+	if kind == nil {
+		return nil
+	}
+	var selected []Signal
+	for _, record := range s.items {
+		if record.Kind == kind.name {
+			selected = append(selected, Signal{Dest: record.Dest, Value: record.Value, Origin: record.Origin})
+		}
+	}
+	return selected
+}
 
 // MarshalJSON 实现 [json.Marshaler]。
 func (s Signals) MarshalJSON() ([]byte, error) {
@@ -686,6 +701,19 @@ func (cm *ChannelManager) completedSignalsSnapshot() []SignalRecord {
 		return nil
 	}
 	return append([]SignalRecord(nil), cm.completedSignals...)
+}
+
+func (cm *ChannelManager) committedSignal(kind, dest string) (SignalRecord, bool) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	for _, records := range [][]SignalRecord{cm.completedSignals, cm.signals} {
+		for _, record := range records {
+			if record.Kind == kind && record.Dest == dest {
+				return record, true
+			}
+		}
+	}
+	return SignalRecord{}, false
 }
 
 // bubbleSignalsTo 把本图已提交的全部信号交给调用这张图的那段执行——图**成功出口**调用。caller 是

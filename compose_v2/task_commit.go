@@ -17,21 +17,79 @@ func NewTaskCommitSignalKind(name string, apply func(context.Context, Signal) er
 	if apply == nil {
 		panic("compose_v2: task commit signal requires an apply function")
 	}
-	return registerSignalKind(name, apply)
+	return registerSignalKind(name, apply, false)
+}
+
+// NewRootNodeCommitSignalKind 注册由根图成员提交后处理的信号。
+// 信号仍可随子调用和存档传递。根图恢复时重放已提交信号，apply 必须幂等。
+func NewRootNodeCommitSignalKind(name string, apply func(context.Context, Signal) error) *SignalKind {
+	if apply == nil {
+		panic("compose_v2: root node commit signal requires an apply function")
+	}
+	return registerSignalKind(name, apply, true)
 }
 
 type taskCommitContextKey struct{}
 
 func (taskCommitContextKey) ExecutionState() {}
 
+type committedSignalGraphKey struct{}
+
+func (committedSignalGraphKey) ExecutionState() {}
+
+type committedSignalGraph struct {
+	cm     *ChannelManager
+	parent *committedSignalGraph
+}
+
+func withCommittedSignalGraph(ctx context.Context, cm *ChannelManager) context.Context {
+	parent, _ := ctx.Value(committedSignalGraphKey{}).(*committedSignalGraph)
+	return context.WithValue(ctx, committedSignalGraphKey{}, &committedSignalGraph{cm: cm, parent: parent})
+}
+
+// CommittedRootNodeSignal 读取当前执行链上某层图已提交的信号。它证明该层节点已经接受该信号，
+// 调用方仍须核对外层尚未提交的范围。
+func CommittedRootNodeSignal(ctx context.Context, kind *SignalKind, dest string) (Signal, bool) {
+	scope := taskCommitBase(ctx)
+	key := taskRecipientKeyFrom(ctx)
+	if kind == nil || !kind.rootNodeCommit || len(key) == 0 || scope == nil {
+		return Signal{}, false
+	}
+	for graph, _ := ctx.Value(committedSignalGraphKey{}).(*committedSignalGraph); graph != nil; graph = graph.parent {
+		r, ok := graph.cm.committedSignal(kind.name, dest)
+		if ok && r.Seal != "" && hmac.Equal([]byte(r.Seal), []byte(sealCommitSignal(key, scope, r))) {
+			return Signal{Dest: r.Dest, Value: r.Value, Origin: r.Origin}, true
+		}
+	}
+	return Signal{}, false
+}
+
 type taskCommitScope struct {
 	base    context.Context
 	graphID string
+	locals  sync.Map
 }
 
 func taskCommitBase(ctx context.Context) *taskCommitScope {
 	base, _ := ctx.Value(taskCommitContextKey{}).(*taskCommitScope)
 	return base
+}
+
+// TaskCommitLocal 返回当前任务图和根节点提交处理器共享的进程内状态。
+// key 使用调用包的私有可比较类型。create 无副作用，可被并发调用。图外返回 nil，状态不随存档保存。
+func TaskCommitLocal(ctx context.Context, key any, create func() any) any {
+	scope := taskCommitBase(ctx)
+	if scope == nil {
+		return nil
+	}
+	if value, ok := scope.locals.Load(key); ok {
+		return value
+	}
+	if create == nil {
+		return nil
+	}
+	value, _ := scope.locals.LoadOrStore(key, create())
+	return value
 }
 
 // TaskCommitContext 返回任务最外层图进入时的 ctx，供提交信号的写入者核对外层持有的配置。
@@ -95,20 +153,27 @@ func applyTaskCommitSignals(ctx context.Context, cm *ChannelManager) {
 	if cm == nil {
 		return
 	}
+	applyCommitSignals(ctx, cm.signalsSnapshot(), false)
+}
+
+func applyCommitSignals(ctx context.Context, records []SignalRecord, rootNode bool) {
 	key := taskRecipientKeyFrom(ctx)
 	scope := taskCommitBase(ctx)
 	if len(key) == 0 || scope == nil {
 		return
 	}
 	base := scope.base
-	for _, record := range cm.signalsSnapshot() {
+	if rootNode {
+		base = context.WithValue(base, taskCommitContextKey{}, scope)
+	}
+	for _, record := range records {
 		if record.Seal == "" || !hmac.Equal([]byte(record.Seal), []byte(sealCommitSignal(key, scope, record))) {
 			continue
 		}
 		signalKindsMu.Lock()
 		reg, ok := signalKinds[record.Kind]
 		signalKindsMu.Unlock()
-		if !ok || reg.kind.commit == nil {
+		if !ok || reg.kind.commit == nil || reg.kind.rootNodeCommit != rootNode {
 			continue
 		}
 		signal := Signal{Dest: record.Dest, Value: record.Value, Origin: record.Origin}

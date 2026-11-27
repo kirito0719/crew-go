@@ -102,7 +102,9 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 	// 每次尝试写进会话的事件先落在暂存 lane 上：被下一次从头再跑的尝试取代时作废，其余照常提交（见 attemptLanes）
 	lanes := newAttemptLanes(subCtx, m.sess, m.agent.Name())
 	defer lanes.finish()
+	call := nestedCall{ns: compose_v2.GetGraphNS(subCtx), identity: identityString("member", m.nsSuffix)}
 	return compose_v2.RunWithRetry(subCtx, m.retryCfg, func(ctx context.Context) (*schema.Message, error) {
+		ctx, attempt := markHistoryAttempt(ctx, ctx, call)
 		var events []*AgentEvent
 		err := lanes.run(ctx, func(c context.Context, s *RunSession) error {
 			var runErr error
@@ -111,6 +113,7 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 			return runErr
 		})
 		if err != nil {
+			saveHistoryAttemptOnPause(ctx, ctx, call, attempt, err)
 			// 可 Resume 的退出先落输入——输入的持久点在跨进边界那一刻，不等成功
 			// （见 settleHistoryOnPause）。随后 propagate 让框架 SaveNS 存档。
 			settleHistoryOnPause(ctx, m.agent.Name(), m.input, err)
@@ -131,6 +134,7 @@ func runMember(ctx context.Context, grants memberGrants, m memberSpec) (*schema.
 		// 成员可能不是 BasicAgent（远程 / 自研 / 别的框架的壳），那样它自己什么也不留。
 		// 边界补上这一次的输入与产出——只补它没记的，见 settleHistorySlot。
 		settleHistorySlot(ctx, m.agent.Name(), m.input, final)
+		stageHistoryCommit(ctx, attempt)
 		return final, nil
 	})
 }

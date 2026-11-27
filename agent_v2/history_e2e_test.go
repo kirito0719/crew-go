@@ -438,18 +438,8 @@ func (s *flakyLoadStore) Load(ctx context.Context, key agent_v2.HistoryKey, q ag
 	return s.inner.Load(ctx, key, q)
 }
 
-// TestHistory_E2E_LoadFailure_FallsBackToEvents：后端读失败时必须真的回落到 events。
-//
-// # 为什么这条最容易写错
-//
-// 「读成功但没内容」和「读失败」都返回空列表——不带信号地混在一起，调用方就只能一律
-// 当「历史本来就是空的」处理。于是后端一次超时，模型看到的不是「残缺的历史」而是
-// **完全没有历史**：多轮对话中途突然失忆，而日志里那条 warn 还在说「本轮回落到
-// session events」——承诺了一件没发生的事。
-//
-// 回落拿到的 events 确实残缺（只有首尾，没有工具往返），但那正是不开历史时的常态，
-// 远好过一片空白。
-func TestHistory_E2E_LoadFailure_FallsBackToEvents(t *testing.T) {
+// TestHistory_E2E_LoadFailure_OnlySendsCurrentInput 验证持久历史读取失败时的送模视图。
+func TestHistory_E2E_LoadFailure_OnlySendsCurrentInput(t *testing.T) {
 	store := &flakyLoadStore{inner: agent_v2.NewInMemoryHistoryStore()}
 	m := &histCaptureModel{}
 	ag := agent_v2.NewBasicAgent(
@@ -486,10 +476,8 @@ func TestHistory_E2E_LoadFailure_FallsBackToEvents(t *testing.T) {
 			sawPrevAnswer = true
 		}
 	}
-	if !sawPrevQuestion || !sawPrevAnswer {
-		t.Errorf("后端读失败后模型看不到上一轮（问题=%v 答复=%v）—— "+
-			"应回落到 session events 拿残缺历史，而不是给一片空白让模型失忆\n%s",
-			sawPrevQuestion, sawPrevAnswer, dumpHist(round2))
+	if sawPrevQuestion || sawPrevAnswer || !strings.Contains(dumpHist(round2), "第二个问题") {
+		t.Errorf("历史不可读时应送入当前新输入，实际 %s", dumpHist(round2))
 	}
 }
 

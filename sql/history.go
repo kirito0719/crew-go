@@ -71,7 +71,7 @@ func NewHistoryStore(db *dbsql.DB, dialect Dialect, opts ...HistoryOption) *Hist
 // Append 把 msgs 追加到会话末尾，整批一个事务。先把整批编码完再开事务：有一条编不出来（比如
 // Annotations 里有 NaN）就整批不写。
 func (h *HistoryStore) Append(ctx context.Context, key agent_v2.HistoryKey, msgs []*schema.Message) error {
-	_, _, err := h.appendBatch(ctx, key, nil, msgs, -1)
+	_, _, err := h.appendBatch(ctx, key, nil, msgs, -1, false)
 	return err
 }
 
@@ -80,8 +80,16 @@ func (h *HistoryStore) HistoryAppendOwner() agent_v2.HistoryStore { return h }
 
 // AppendAfter 在同会话的写事务中核对尾游标，并保存本次追加中经过确认的边界位置。
 func (h *HistoryStore) AppendAfter(ctx context.Context, key agent_v2.HistoryKey, after agent_v2.HistoryCursor, msgs []*schema.Message, boundary int) (agent_v2.HistoryCursor, bool, error) {
-	return h.appendBatch(ctx, key, &after, msgs, boundary)
+	return h.appendBatch(ctx, key, &after, msgs, boundary, true)
 }
+
+// AppendUnverifiedAfter 为可恢复的普通追加比对尾游标，允许普通写入的触发器产生附加行。
+func (h *HistoryStore) AppendUnverifiedAfter(ctx context.Context, key agent_v2.HistoryKey, after agent_v2.HistoryCursor, msgs []*schema.Message) (agent_v2.HistoryCursor, bool, error) {
+	return h.appendBatch(ctx, key, &after, msgs, -1, false)
+}
+
+// HistoryUnverifiedAppendOwner 返回实际接管普通条件追加的 SQL 存储。
+func (h *HistoryStore) HistoryUnverifiedAppendOwner() agent_v2.HistoryStore { return h }
 
 // historyPayload 把证明绑定到数据库分配的行游标。复制消息或原始 payload 时，新行无法沿用该证明。
 type historyPayload struct {
@@ -128,7 +136,7 @@ func (Postgres) historyInsertSQL(table string) string {
 SELECT $1,$2,$3,$4,$5,$6,id FROM candidate WHERE id > $7 RETURNING id`, table)
 }
 
-func (h *HistoryStore) appendBatch(ctx context.Context, key agent_v2.HistoryKey, after *agent_v2.HistoryCursor, msgs []*schema.Message, boundary int) (agent_v2.HistoryCursor, bool, error) {
+func (h *HistoryStore) appendBatch(ctx context.Context, key agent_v2.HistoryKey, after *agent_v2.HistoryCursor, msgs []*schema.Message, boundary int, verify bool) (agent_v2.HistoryCursor, bool, error) {
 	if key.Owner == "" || key.ConvID == "" {
 		return "", false, fmt.Errorf("sql history append: key 不完整 (owner=%q conv=%q)", key.Owner, key.ConvID)
 	}
@@ -193,7 +201,7 @@ func (h *HistoryStore) appendBatch(ctx context.Context, key agent_v2.HistoryKey,
 			}
 		}
 	}
-	if after != nil && len(msgs) > 0 {
+	if verify && len(msgs) > 0 {
 		// 同表触发器还可能追加调用方未见的行。只核对本批新增区间；有额外行时回滚，写入器再走普通追加。
 		q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE owner = %s AND conv_id = %s AND id > %s", h.table, ph(1), ph(2), ph(3))
 		var count int

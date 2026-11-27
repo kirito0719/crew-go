@@ -58,6 +58,14 @@ type historyWrite struct {
 func (b historyWrite) append(ctx context.Context, store HistoryStore, key HistoryKey) error {
 	c := b.coverage
 	if c != nil && c.valid {
+		if recoverable, ok := c.store.(*RecoverableHistoryStore); ok {
+			tail, matched, err := recoverable.write(ctx, key, b.msgs, &c.tail, b.boundary, true)
+			c.valid = err == nil && matched && tail != "" && tail != c.tail
+			if c.valid {
+				c.tail = tail
+			}
+			return err
+		}
 		tail, ok, err := c.store.AppendAfter(ctx, key, c.tail, b.msgs, b.boundary)
 		if err == nil && ok {
 			c.valid = tail != "" && tail != c.tail // 非空批次必须推进到一个新位置。

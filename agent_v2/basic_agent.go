@@ -952,11 +952,17 @@ func (a *BasicAgent) buildInitialMessages(ctx context.Context, session *RunSessi
 		need = a.config.MaxHistoryPairs * 2
 	}
 	prior, fromHistory := historyPrior(ctx, a.historyCfgFor(ctx), historyOwner(ctx, a.config.Name), mode, need)
+	w := historyWriterFrom(ctx)
+	if coverage != nil && w != nil && w.sawUncommittedHistory.Load() {
+		coverage.valid = false
+	}
 	if !fromHistory {
 		if coverage != nil {
 			coverage.valid = false
 		}
-		prior = session.modelHistory(a.config.Name, HistorySlot(ctx), mode)
+		if w == nil {
+			prior = session.modelHistory(a.config.Name, HistorySlot(ctx), mode)
+		}
 		// 调用方提供的前文排在最前：events 只有这个进程里发生的，更早的轮次在调用方手里（见 caller_history.go）
 		if turns := callerHistory(ctx); len(turns) > 0 {
 			prior = append(turns, prior...)

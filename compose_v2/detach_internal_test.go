@@ -22,7 +22,7 @@ var executionCtxKeys = []any{
 	sessionIDKey{}, runTaskIDKey{}, currentTaskIDKey{}, freshRunCtxKey{}, resumeCtxKey{}, answerLedgerKey{},
 	graphNSKey{}, nodeIDKey{}, nodeVisitKey{}, nodeInstanceIDKey{}, nodeInterruptCounterKey{},
 	boundCheckpointerKey{}, checkpointingDisabledKey{}, checkpointRestartKey{}, deferredRootCleanupKey{},
-	taskCommitBarrierKey{}, taskCommitContextKey{}, replayedResumeAnswersKey{},
+	taskCommitBarrierKey{}, taskCommitContextKey{}, committedSignalGraphKey{}, replayedResumeAnswersKey{},
 	toolCallIdxKey{}, currentToolCallIDKey{}, toolCallInstanceKey{}, inToolCallKey{}, withinNodeScopeKey{},
 	nodeStateAccessorKey{}, subCallCounterKey{}, subCallScopeKey{}, abnormalNodeExitKey{}, nodeProgressKey{},
 	componentKindKey{}, eventSinkKey{}, sendSinkKey{}, nestedCallKey{}, outerRerunGensKey{}, outerRegensKey{},

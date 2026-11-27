@@ -183,6 +183,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	// 归属位置：name（业务在自己的图里保证唯一）。**不用子 ns**——子 ns 带身份哈希、每次调用
 	// 都不同，拿它当归属会让同一个 sub-agent 每次归属不同、跨轮读不回自己的历史。
 	subCtx = WithHistorySlot(subCtx, name)
+	subCtx, historyAttempt := markHistoryAttempt(subCtx, ctx, call)
 	// 被当成工具 / 嵌套调用的子 agent 不取用户的运行中插话：用户是在跟调用它的那个 agent 说话（见 Inbox）
 	subCtx = withoutInbox(subCtx)
 	if inStart, _ := ctx.Value(topLevelAgentStartKey{}).(bool); inStart && !compose_v2.WithinNodeScope(ctx) {
@@ -225,7 +226,7 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	settledInput := mode.settle && restoreNestedHistoryInput(ctx, subCtx, call)
 	// 已完成的调用重放结果，集成可从同一交接相位恢复结果引用的会话状态。
 	if mode.remember {
-		if events, ok := recallNestedCall(ctx, call); ok {
+		if events, ok := recallNestedCall(ctx, subCtx, sub, call); ok {
 			if mode.settle {
 				noteReplayedHistoryOutput(ctx, FinalMessage(events))
 			}
@@ -253,11 +254,15 @@ func runNestedCall(ctx context.Context, name string, sub Agent, input *schema.Me
 	sigs, err := compose_v2.CaptureSignals(shadowNodeGrants(subCtx), func(c context.Context) error {
 		var runErr error
 		events, runErr = sub.Run(c, childSess, cloneCalleeInput(input), opts...)
+		if runErr == nil {
+			stageHistoryCommit(c, historyAttempt)
+		}
 		return runErr
 	})
 	streamIDs := streams.Take()
 	compose_v2.RecordStreams(ctx, streamIDs...)
 	if err != nil {
+		saveHistoryAttemptOnPause(ctx, subCtx, call, historyAttempt, err)
 		// 可 Resume 的退出先落输入（见 settleHistoryOnPause）。开关同下面的成功补记。
 		if mode.settle && !settledInput && compose_v2.LeavesResumableCheckpoint(err) {
 			if writer := historyWriterFrom(subCtx); writer != nil {
@@ -346,7 +351,7 @@ func enterNestedCall(ctx context.Context, name, key string, input *schema.Messag
 
 // recallNestedCall 在父节点这次执行的记录里找这次调用：完成过就交出它当时做出的上行信号，返回
 // 记下的 Events。
-func recallNestedCall(ctx context.Context, call nestedCall) ([]*AgentEvent, bool) {
+func recallNestedCall(ctx, subCtx context.Context, sub Agent, call nestedCall) ([]*AgentEvent, bool) {
 	rec, ok := compose_v2.GetStepResult[*nestedCallRecord](ctx, call.stepKey)
 	if !ok || rec == nil {
 		return nil, false
@@ -356,6 +361,7 @@ func recallNestedCall(ctx context.Context, call nestedCall) ([]*AgentEvent, bool
 			"ns", call.ns, "saved_digest", rec.Digest, "input_digest", call.digest,
 			"hint", "key 相同即认作同一次调用；真是另一件事的话换一个 key")
 	}
+	rebindHistoryCommit(subCtx, sub, rec.Signals)
 	compose_v2.EmitSignals(ctx, rec.Signals)
 	return rec.Events, true
 }

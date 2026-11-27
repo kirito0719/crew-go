@@ -510,7 +510,7 @@ ag.Run(ctx, sess, schema.UserMessage("那给我留一件"))  // 第二轮看得�
 |---|---|
 | **`Owner` 必填** | `ConvID` 通常来自 wire（HTTP `threadId` / A2A `ContextID`），是**续接标识符不是授权令牌**——猜中别人的就能拉到别人的完整对话。单租户填固定值即可，多租户用 `WithHistoryOwnerFunc(fn)` 按请求解析。构造期 fail-fast。 |
 | **没声明会话身份就不写** | 没 `WithThreadIDCtx` 就没有「这是哪个会话」，写下去也无从取回。框架每次调用 warn 一次并跳过，`prior` 回落到 events。`a2a/server`（ContextID）和 `agui`（threadId）会自动注入。 |
-| **旁路，不影响跑对** | 写失败 / 后端 panic 一律吞 + warn。工具重不重跑、Resume 从哪继续全由 cp 的 frontier 决定，跟历史一条不沾。 |
+| **历史与执行状态** | 普通历史写失败记录告警。执行从 checkpoint 继续，已执行的工具由工具账保护。需要恢复历史写入时可配置待写库。 |
 
 **归属**：一场会话里所有 agent 的消息在同一条流上，每条盖 `HistoryAgentAnnotation`
 （值 = 该 agent 在编排树里的**位置**——分支名 / 步骤名 / 转交目标名，顶层回落 agent 名；另有 `HistoryAgentDisplayAnnotation` 存 agent 名供展示）。嵌套子 agent 沿用父的写入器——一场会话只该有一条流。**内部决策 LLM
@@ -520,6 +520,21 @@ routing 分类器、reflect 评估器与反馈教练、`NewPlanAgent` 的 planne
 `WithTurnGate` 的闸门——它们里面再起的子 agent 继承这条禁止。框架不认识的决策点（GraphAgent 节点里自己
 写的判断、Parallel 的 Merger / Aggregator 里拿 agent 当裁判）要自己在子 ctx 上调一次
 `agent_v2.WithoutHistoryCtx(ctx)`。
+
+### 恢复关键历史写入
+
+为需要建表的后端执行各自的 `Setup`，再将包装器交给 `WithHistory`、`WithHistoryCtx` 或宿主的历史配置。
+
+```go
+hs := agent_v2.NewRecoverableHistoryStore(historyBackend, journalStore, "conversation-prod")
+ctx = agent_v2.WithHistoryCtx(ctx, hs, "tenant-a")
+```
+
+历史后端要实现 `agent_v2.HistoryTailAppender`，例如 SQL `HistoryStore`。生产使用可跨进程读取的 Store，分区名标识实际历史库。续跑和接手进程使用同一个逻辑历史库、待写库和分区名。历史写入先在待写库保存完整批次。历史库拒写、提交确认丢失或待写记录删除失败时，下次读写该会话会继续处理。批次回执处理同一批的重复投递，不合并不同调用产生的相同消息。应用也可调用 `hs.Recover(ctx, key)` 主动补写。
+
+已绑定 `HistoryStore` 的模型历史只使用能确认提交的记录。可重做子调用的原始产出留在审计历史，父图节点接纳后才进入送模视图。在嵌套图内，已提交的前驱可供同一执行范围内的后续节点使用。跨任务使用时须确认外层调用也已接纳。历史读取失败时仍使用当前输入及调用方明确提供的前文。
+
+需要在冷续跑后使用动态子图后代的已提交历史时，应在外层用 `WithHistoryCtx` 固定实际历史库。冷续跑可能直接重放外层的完成记录，固定配置让提交处理器可以在原分区确认后代历史。
 
 **调用方手里的前文**（`WithCallerHistoryCtx`）。AG-UI 默认处理请求中的前文，应用也可以把这一轮之前的轮次放进 ctx。
 

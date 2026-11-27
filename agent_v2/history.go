@@ -487,7 +487,8 @@ type historyWriter struct {
 	// 来源章，见 encodeHistoryOrigin）：经 DetachTask 开的独立任务写下的记录盖上它（historyOriginAnnotation），
 	// 「这条产出是不是已经在别的归属下记过」据此认得出独立任务写的那份（见 historyOutputRecorded）。不是脱离
 	// 出来的写入器为空。
-	origin string
+	origin                string
+	sawUncommittedHistory atomic.Bool
 
 	// clientPrior 报调用方提供了前文、这次运行的读却要以它为准、不读历史层（见 caller_history.go）：写入器是嵌套的
 	// （建它时已经在一个正在执行的任务里，它只记自己那段子对话），或者建它时读历史层失败、前文没写进去。在写入器交
@@ -708,6 +709,11 @@ func (w *historyWriter) writeOne(batch historyWrite) {
 		}
 	}()
 	if err := batch.append(w.ctx, w.store, w.key); err != nil {
+		if errors.Is(err, ErrHistoryWritePending) {
+			slog.WarnContext(w.ctx, "agent_v2: 会话历史暂未确认，保留待写批次",
+				"key", w.key.String(), "count", len(msgs), "err", err)
+			return
+		}
 		// warn 不是 debug：历史丢失不常见、丢了很难发现（读的时候只是「少了几条」，
 		// 没有任何信号说这是丢的还是本来就没有）。静默 = 业务永远查不出来。
 		slog.WarnContext(w.ctx, "agent_v2: 会话历史写入失败，本批丢弃",
@@ -895,7 +901,7 @@ func WithTaskHistoryBinding(ctx context.Context, task string, destination TaskHi
 // startHistory 在 Run / Resume 入口装配本次调用的历史写入器。
 //
 // 收尾函数必须 defer 调用（drain 完 pending 写 + 等 worker 退出）——"谁启动谁负责退出"。
-// 没开历史或缺少会话身份时返回原 ctx 和空收尾函数。宿主绑定失败时返回 ErrTaskHistoryBinding。
+// 没开历史或缺少会话身份时返回原 ctx 和空收尾函数。宿主绑定或待写恢复失败时返回 ErrTaskHistoryBinding。
 //
 // **身份缺失就整个不启**：没有 ConvID 或 owner 就没有「这是哪个会话的、谁的」，写下去
 // 也无从取回。这里 warn 一次然后不建 writer——后续所有 recordHistory 天然变成 no-op，
@@ -958,6 +964,11 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 			return ctx, noop, fmt.Errorf("agent %q: %w: %w", agentName, ErrTaskHistoryBinding, err)
 		}
 	}
+	if recovery, ok := destination.Store.(*RecoverableHistoryStore); ok {
+		if err := recovery.Recover(ctx, key); err != nil {
+			return ctx, noop, fmt.Errorf("agent %q: %w: recover history: %w", agentName, ErrTaskHistoryBinding, err)
+		}
+	}
 	w := newHistoryWriter(ctx, destination.Store, key)
 	w.hosted = destination.Source == TaskHistoryHost
 	// 调用方提供了前文时定下这次运行以谁为准（见 caller_history.go）。拥有者 = 建写入器时还不在任何正在执行的任务里：
@@ -969,7 +980,9 @@ func startHistory(ctx context.Context, hc *historyConfig, agentName string) (con
 			w.clientPrior = !seedCallerPrior(ctx, w, prior)
 		}
 	}
-	return withHistoryWriter(ctx, w), w.closeAndJoin, nil
+	ctx = withHistoryWriter(ctx, w)
+	rememberHistoryCommitTargets(ctx, w)
+	return ctx, w.closeAndJoin, nil
 }
 
 // markFromAgent 返回一份带 from_agent 标注的浅拷贝（Raw 视图用，保留原 role）。
@@ -1368,6 +1381,9 @@ func stampHistoryAgent(m *schema.Message, owner, display, task string) *schema.M
 	delete(anns, historyScopeAnnotation)
 	delete(anns, historyRecoveredInputAnnotation)
 	delete(anns, historyOriginAnnotation) // 同理：来源章只由写入器盖（recordHistory）
+	delete(anns, historyCommitAnnotation)
+	delete(anns, historyWriteReceipt)
+	delete(anns, historyWriteFallback)
 	// 位置跟名字不同才存显示名——顶层回落时两者相同，没必要多存一份。
 	if display != "" && display != owner {
 		anns[HistoryAgentDisplayAnnotation] = display

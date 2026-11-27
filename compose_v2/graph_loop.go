@@ -1892,6 +1892,11 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 	// 上面 Restore 恢复的、新开时铸；推给本图的节点，它们里面跑的嵌套图沿用这一把。位置在 Restore 之后：
 	// 更早的话，顶层续跑会先铸一把新的推下去、随后被 Restore 盖掉，嵌套图拿到的就跟本图用的不是同一把。
 	ctx = withTaskRecipientKey(ctx, cm.adoptRecipientKey(taskRecipientKeyFrom(ctx)))
+	ctx = withCommittedSignalGraph(ctx, cm)
+	if commitRoot && cfg.resumeFrom != nil {
+		applyCommitSignals(ctx, cm.signalsSnapshot(), true)
+		applyCommitSignals(ctx, cm.completedSignalsSnapshot(), true)
+	}
 
 	// durability=async：进超步循环前启单 worker 后台 cp writer。出口 join defer 必须在
 	// cleanup defer（成功 DeleteSubtree / 失败兜底 SaveNS，line ~325）**之前**跑——靠 Go
@@ -2168,6 +2173,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 				if errors.As(commitErr, &sendErr) {
 					Heartbeat(ctx)
 					notifyNodeCommits(ctx, res.afterCommit)
+					if commitRoot {
+						applyCommitSignals(ctx, res.Signals, true)
+					}
 					return fmt.Errorf("apply send directives: %w", commitErr)
 				}
 				cm.updateFrontier(frontier) // 整 frontier 重跑（含成功分支）
@@ -2199,6 +2207,9 @@ func Run(ctx context.Context, g *Graph, cm *ChannelManager, opts ...RunOption) (
 			Heartbeat(ctx)
 		}
 		notifyNodeCommits(ctx, res.afterCommit)
+		if commitRoot {
+			applyCommitSignals(ctx, res.Signals, true)
+		}
 
 		// 失败/中断 return（已 record 完 interrupts + 更新 frontier + 记完成兄弟）
 		if res.FirstErr != nil {

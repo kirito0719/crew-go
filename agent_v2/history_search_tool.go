@@ -60,9 +60,10 @@ func newHistorySearchTool(requestCtx context.Context, owner, agent string, sourc
 			matches := make([]historySearchMatch, 0, historySearchMatches)
 			first := max(0, len(page.Messages)-historySearchWindow)
 			incomplete := page.More || first > 0
+			commits := historyCommitView{source: source}
 			for i := len(page.Messages) - 1; i >= first; i-- {
 				m := page.Messages[i]
-				if !query.Matches(m) || historyRecordOfTask(m, source.task) || !isSearchableHistory(m) {
+				if !query.Matches(m) || historyRecordOfTask(m, source.task) || !isSearchableHistory(m) || !commits.includes(ctx, m, "", false) {
 					continue
 				}
 				task, _ := m.Annotations[HistoryTaskAnnotation].(string)

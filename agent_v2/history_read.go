@@ -313,7 +313,7 @@ func warnUnfilteredHistoryBackend(ctx context.Context, hs HistoryStore) {
 }
 
 // historyPrior 从历史层取出本 agent 该看到的跨 Run 历史（按写入顺序），投影成三种 handoff 视图之一。
-// 第二个返回值报「历史层是否接管了这次取历史」——false 时调用方回落到 session events。
+// 第二个返回值报历史层是否成功提供视图。调用方按已绑定的历史源选择读失败后的行为。
 //
 // need > 0 时只读**最近一段**：读到第 0 层截断（[truncatePriorPreservingMarkers]）在这一段上的切点
 // 落在段内为止——凑够 need 条不带 skill 正文标记的视图消息，并且切点往前对齐 tool_call 配对之后
@@ -332,7 +332,7 @@ func warnUnfilteredHistoryBackend(ctx context.Context, hs HistoryStore) {
 // 换成了「消息上的归属标注」。
 func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string, mode HandoffHistoryMode, need int) ([]*schema.Message, bool) {
 	// 调用方提供了前文、这次运行却没有能以服务端为准的写入器：以客户端为准，历史层这次不读（见 caller_history.go）。
-	// 报 false 让调用方回落到 session events，前文排在最前
+	// 报 false 让调用方使用明确提供的前文。
 	if _, declared := callerPrior(ctx); declared {
 		if w := historyWriterFrom(ctx); w == nil || w.clientPrior {
 			return nil, false
@@ -343,6 +343,8 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 		return nil, false
 	}
 	var rev []*schema.Message // 新 → 旧
+	commits := historyCommitView{source: src}
+	local := historyScopeTrail(ctx)
 	trustBoundaries := HistoryTailAppenderFor(src.store) != nil
 	var baseCursor HistoryCursor
 	var base []*schema.Message    // 遇到的本 agent、同视图的压缩边界里的替代历史
@@ -365,6 +367,9 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 		seenInputs = make(map[string]struct{})
 	}
 	err := src.scanBackward(ctx, filter, first, true, func(m *schema.Message, boundaryCursor HistoryCursor) bool {
+		if !commits.includes(ctx, m, local, false) {
+			return false
+		}
 		if isCompactionBoundary(m) {
 			// 位置证明、归属、视图与内容都成立才可停止。所有边界记录都从普通对话中过滤。
 			if owner, _ := m.Annotations[HistoryAgentAnnotation].(string); trustBoundaries && boundaryCursor != "" && owner == ownerAgentName {
@@ -437,11 +442,13 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 		satisfied = len(inputAnchors) == 0
 		return satisfied
 	})
+	if commits.hasDraft {
+		if w := historyWriterFrom(ctx); w != nil {
+			w.sawUncommittedHistory.Store(true)
+		}
+	}
 	if err != nil {
-		// 读失败跟写失败同档：吞 + warn 不打断 Run（让一次后端抖动把整个 Run 打挂，比让模型少看
-		// 几条历史严重得多），但**必须**报 false 让调用方真的回落到 events——否则这条 warn 就是在
-		// 承诺一件没发生的事。
-		slog.WarnContext(ctx, "agent_v2: 读会话历史失败，本轮回落到 session events（内容残缺）",
+		slog.WarnContext(ctx, "agent_v2: 读会话历史失败，本轮缺少已提交历史",
 			"key", src.key.String(), "err", err)
 		return nil, false
 	}
@@ -461,7 +468,7 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			return false
 		}, nil)
 		if err != nil {
-			slog.WarnContext(ctx, "agent_v2: 读会话历史失败，本轮回落到 session events（内容残缺）",
+			slog.WarnContext(ctx, "agent_v2: 读会话历史失败，本轮缺少已提交历史",
 				"key", src.key.String(), "err", err)
 			return nil, false
 		}
@@ -471,7 +478,7 @@ func historyPrior(ctx context.Context, hc *historyConfig, ownerAgentName string,
 			// 并发 seed 或导入的前文可能位于边界之后。按原有前文顺序合并，同 ID 留最早一份。
 			fresh, err := src.callersAfterBoundary(ctx, callers, baseCursor)
 			if err != nil {
-				slog.WarnContext(ctx, "agent_v2: 核对边界之后的调用方前文失败，本轮回落到 session events", "key", src.key.String(), "err", err)
+				slog.WarnContext(ctx, "agent_v2: 核对边界之后的调用方前文失败，本轮缺少已提交历史", "key", src.key.String(), "err", err)
 				return nil, false
 			}
 			if len(fresh) > 0 {
@@ -686,8 +693,10 @@ func findHistory(ctx context.Context, hc *historyConfig, q HistoryQuery, own boo
 		q.Task = src.task
 	}
 	hit := false
+	commits := historyCommitView{source: src}
+	local := historyScopeTrail(ctx)
 	if err := src.scanBackward(ctx, q, historyPageMin, true, func(m *schema.Message, _ HistoryCursor) bool {
-		hit = match(m)
+		hit = commits.includes(ctx, m, local, true) && match(m)
 		return hit
 	}, nil); err != nil {
 		slog.WarnContext(ctx, "agent_v2: 读会话历史失败，按「这个任务里没记过」处理",

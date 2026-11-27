@@ -163,7 +163,8 @@ func historyOutputOf(m *schema.Message) historyOutputKey {
 	// 历史层盖章前后的消息具有同样的业务内容，业务自己修改的标注仍属于产出。
 	body.Annotations = maps.Clone(m.Annotations)
 	for _, k := range []string{HistoryAgentAnnotation, HistoryAgentDisplayAnnotation, HistoryTaskAnnotation,
-		historyOriginAnnotation, historyScopeAnnotation, historyRecoveredInputAnnotation, hostedHistoryTaskAnnotation, CallerHistoryAnnotation} {
+		historyOriginAnnotation, historyScopeAnnotation, historyRecoveredInputAnnotation, hostedHistoryTaskAnnotation,
+		CallerHistoryAnnotation, historyWriteReceipt, historyWriteFallback, historyCommitAnnotation} {
 		delete(body.Annotations, k)
 	}
 	key := historyOutputKey{id: m.ID, payload: inputDigest(&body)}

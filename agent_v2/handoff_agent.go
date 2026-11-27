@@ -656,7 +656,9 @@ func (h *HandoffAgent) buildComposeGraph(
 		// 这次执行返回时已经结完账，看得到这一跳的事件。
 		lanes := newAttemptLanes(subCtx, parentSession, ag.Name())
 		defer lanes.finish()
+		call := nestedCall{ns: compose_v2.GetGraphNS(subCtx), identity: identityString("handoff", childNS)}
 		attempt, err := compose_v2.RunWithRetry(subCtx, retryCfg, func(ctx context.Context) (handoffAttempt, error) {
+			ctx, historyAttempt := markHistoryAttempt(ctx, ctx, call)
 			// **一次尝试收一次**：候选这次调用做出的决定只在它成功时交上来；失败 / 中断的这次
 			// 尝试做出的随它作废（compose_v2.CaptureSignals）。停下时候选图里已提交的那些留在
 			// 它的存档里，续跑跑完时一起交上来——做出决定的那一步续跑时不再执行也不丢。
@@ -680,7 +682,7 @@ func (h *HandoffAgent) buildComposeGraph(
 			}
 			var events []*AgentEvent
 			sigs, err := compose_v2.CaptureSignals(ctx, func(c context.Context) error {
-				return lanes.run(c, func(lc context.Context, s *RunSession) error {
+				err := lanes.run(c, func(lc context.Context, s *RunSession) error {
 					var runErr error
 					events, runErr = ag.Run(lc, s, cloneCalleeInput(input),
 						withHandoffGrant(grant),
@@ -688,8 +690,13 @@ func (h *HandoffAgent) buildComposeGraph(
 						withBackgroundCallee(ag))
 					return runErr
 				})
+				if err == nil {
+					stageHistoryCommit(c, historyAttempt)
+				}
+				return err
 			})
 			if err != nil {
+				saveHistoryAttemptOnPause(ctx, ctx, call, historyAttempt, err)
 				if !sharedView || !inputAlreadyInAnyStream(ctx, input) {
 					settleHistoryOnPause(ctx, ag.Name(), input, err)
 				}
