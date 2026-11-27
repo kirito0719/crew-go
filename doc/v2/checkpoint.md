@@ -638,6 +638,8 @@ Redis 和 SQL 内建方言的 Checkpointer 以存储域和任务 ID 为键，在
 
 根据上下文选择存档分区的后端实现 `CheckpointPartitionResolver`，并返回固定在实际分区的 `Checkpointer`。同一分区应返回相等的句柄，或让 `TaskLeaseProvider` 返回相等的租约存储值。续跑预读绑定 owner、实际分区、session ID、namespace 与存档世代。钩子无法把已经绑定的续跑迁到另一分区。尚未绑定续跑时，钩子仍可为新图选定分区，框架会核对该分区的归属。
 
+宿主可以用 `WithBoundCheckpointPartitionCtx` 将已解析分区绑定到本次执行及其嵌套图。`DetachExecution` 恢复绑定前的 Checkpointer 配置，独立任务可按自己的身份选择分区。AG-UI 进程内会话用这条路径固定任务的存档域。 [AG-UI 分区接入](agui.md#共享会话)
+
 引擎自动清档时先确认子树归属，再提交 `CheckpointDeleteCondition`。后端在一次原子操作内核对范围内的键、状态、身份和世代，仅删除核对过的键。缺少世代的旧档会核对快照内容。发现新增、移除或推进的槽时返回 `ErrCheckpointStale`，本次删除零条。父图会保留未结算的子图续跑档。显式放弃仍经任务租约清理指定子树。
 
 持有任务执行许可的宿主可以用 `compose_v2.WithDeferredRootCheckpointCleanup(ctx, sid)` 接管成功清档。该调用解析 ctx 上的实际分区，只作用于匹配任务、分区和空 namespace 的最外层图。图退出时核对子树归属。宿主在同一个许可范围内持久化终态，再清理自己持有的任务存档。Plan Web 保留成功凭据和会话清理进度，重建实例可取得许可后补清。[Plan Web 恢复边界](../issue/issue-90-plan-chat-web-lifecycle-prod.md#恢复边界)

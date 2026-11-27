@@ -756,7 +756,11 @@ func (boundCheckpointerKey) ExecutionState()     {}
 func (checkpointingDisabledKey) ExecutionState() {}
 func (deferredRootCleanupKey) ExecutionState()   {}
 
-type boundCheckpointer struct{ cp Checkpointer }
+type boundCheckpointer struct {
+	cp                   Checkpointer
+	detached             Checkpointer
+	restoreConfiguration bool
+}
 
 type deferredRootCleanup struct {
 	sid string
@@ -833,6 +837,21 @@ func WithBoundCheckpointerCtx(ctx context.Context, cp Checkpointer) context.Cont
 	}
 	ctx = context.WithValue(ctx, checkpointerKey{}, cp)
 	return context.WithValue(ctx, boundCheckpointerKey{}, boundCheckpointer{cp: cp})
+}
+
+// WithBoundCheckpointPartitionCtx 将已解析的分区绑定到当前执行范围。
+// [DetachExecution] 恢复绑定前配置的 Checkpointer，独立任务可重新选择自己的分区。
+func WithBoundCheckpointPartitionCtx(ctx context.Context, partition Checkpointer) context.Context {
+	if isFrameworkNil(partition) {
+		partition = nil
+	}
+	configured := GetCheckpointer(ctx)
+	if binding, ok := boundCheckpointerFrom(ctx); ok && binding.restoreConfiguration {
+		configured = binding.detached
+	}
+	return context.WithValue(ctx, boundCheckpointerKey{}, boundCheckpointer{
+		cp: partition, detached: configured, restoreConfiguration: true,
+	})
 }
 
 func boundCheckpointerFrom(ctx context.Context) (boundCheckpointer, bool) {

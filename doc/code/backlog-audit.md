@@ -400,7 +400,8 @@ OpenAI 真实服务端冒烟四项通过，A04 已完成。GitLab PostgreSQL/MyS
 - **普通进程内 TTL/LRU 回收（2026-11-25）**。回收从进程内挂起入口取得放弃许可，清理已配置的存档后向原历史后端及分区补写缺失结果。清档失败保留挂起入口并跳过补写。补写失败保留进程内收尾入口，后续回收或同线程新 Run 可继续收尾。已配置存档的任务返回 `cleanup_pending` 拒绝答复，仍可重试取消。TestHandler_EvictionCompletesTaskHistory 通过 HTTP 验证跨 owner 触发的 TTL、容量回收、无存档后端的回收，以及删档和补写分别失败的恢复。旧实现已移除挂起入口，工具调用仍缺少结果。
 - **已确认终态的补偿（2026-11-25）**。初次 Run 在审批挂起后异常退出，旧实现删档并移除入口，持久历史留下无结果的工具调用。进程内修复保留原任务及实际历史后端，删档和补写可分别重试。共享修复将终态身份持久化，删档与更新进度原子提交，补写后移除会话记录。SQLite 双连接及后台接手验证原分区只有一条补写，工具执行零次。续跑先绑定原历史后端，避免将真实工具结果写进本次 HTTP 中间件切到的另一库。
 - **终态证据边界**。已标记 Closing 的共享旧档由同身份的请求认领。没有终态标记的共享挂起任务仍可续。进程直接退出且未保存会话映射时，应用凭可核实的原任务身份处理存量。异常 Resume 保留原续跑现场，终态补写不会推断工具是否实际执行。
-- **同线程覆盖已实现同一历史分区的收尾**。WithAbandonedTasks 经 agui/handler.go:569–571、620–650、687 调用 agent_v2/history_slot.go:807–839，TestHandler_OverwrittenPendingClosesDanglingCall 与 TestWithAbandonedTasks_DeleteFailureLeavesTaskResumableAndUnclosed 验证。它按新 Run 的 writer 选择 store/key，故换工作流版本或中间件路由导致历史分区改变时，未接受显式取消的旧任务不会在原分区得到配对结果。这一限定和进程内历史后端故障时的 best-effort 跳过一起属于遗留收尾缺口（agent_v2/resume_helpers.go:215–220 在没有完成回调的普通 Abort 只警告）。源码核对，未新增运行探针。
+- **同线程替换在原历史分区收尾**。AG-UI 为旧任务补齐工具结果，补写失败时保留重试入口。新 Agent 入口通过 `WithSettledAbandonedTask` 核对任务冲突。独立调用 Agent 时，`WithAbandonedTasks` 仍按当前历史写入器尽力收尾。 [进程内跨历史分区回归](../../agui/replacement_history_test.go) · [共享 SQLite 回归](../../sql/agui_replacement_history_test.go)
+- **进程内 AG-UI 的存档分区（2026-11-27）**。首次运行选择的易失分区与任务同寿命。两分区故障注入在原版复现续跑读取错误分区、替换跳过实际删档故障、取消和容量回收清错分区。修复版从原分区续跑并执行工具一次。替换失败保留原档，重试成功后清理原档，另一分区的同名槽始终保留。 [回归](../../agui/checkpoint_partition_test.go) · [分区契约](../v2/agui.md#共享会话)
 - **明确设计**。NextTask 只换 RunID，旧任务可续（agent_v2/session.go:167、195。TestWithAbandonedTasks_NotGivenLeavesPendingTaskResumable）。阶段 3 的整会话写边界扫描已否决，不能在并发可续期间全局合成。当前合成文案不声称工具未执行，精细分档是独立可选方案（doc/code/dangling-toolcall-fix-notes.md:35–37，agent_v2/history_slot.go:769–773）。
 
 ## 历史 TODO 逐条核验

@@ -54,7 +54,7 @@ var knownDeleteSubtreeCallSites = map[string]callSiteNote{
 	"agent_v2/resume_helpers.go:commonResumePrep":                                   {1, "Abort——顶层空前缀；嵌套 Abort 无更外层清理者，残留留着"},
 	"agent_v2/history_slot.go:abandonTasksAtEntry":                                  {1, "WithAbandonedTasks 放弃旧任务，持有放弃许可并以空前缀删整个旧任务"},
 	"agent_v2/background/worker.go:(taskCheckpoint).DeleteSubtree":                  {1, "子图存档由子任务终态事务兜底清理，子任务根档留到该事务"},
-	"agui/handler.go:(*handler).deleteCP":                                           {1, "会话丢弃，持有删档许可并以空前缀删整个任务"},
+	"agui/handler.go:deleteCP":                                                      {1, "会话丢弃，持有原分区的删档许可并以空前缀删整个任务"},
 	"a2a/server/executor.go:(*Executor).discardFailed":                              {1, "终态失败失去续接入口，持有任务的放弃许可后按空前缀清理"},
 	"example/store/redis_smoke/main.go:demoCheckpointer":                            {1, "example 演示，空前缀"},
 	"example/orchestration/plan_chat_web/server.go:(*chatServer).cleanupCheckpoint": {1, "会话终态或删除时持租约，用空前缀清理整个任务"},

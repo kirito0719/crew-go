@@ -183,7 +183,8 @@ type AgentFactory func(hooks hook.Hooks) agent_v2.Agent
 type Option func(*handler)
 
 // WithCheckpointer 为进程内会话配置易失存档。cp 须实现 [compose_v2.VolatileCheckpointer]
-// 并声明进程退出后存档消失。持久化部署使用 [WithSessionStore] 保存会话及存档。
+// 并声明进程退出后存档消失。若 cp 按上下文选分区，该声明涵盖所有分区，同一任务使用首次选定的分区。
+// 持久化部署使用 [WithSessionStore] 保存会话及存档。
 func WithCheckpointer(cp compose_v2.Checkpointer) Option {
 	return func(h *handler) { h.cp = cp }
 }
@@ -357,6 +358,8 @@ type sessionEntry struct {
 	sess       *agent_v2.RunSession // 中断挂起的 sess（待续发 Resume 续用）；busy 壳期间可能 nil
 	busy       bool                 // 有在途 Run/Resume 或正在回收
 	reclaiming bool                 // 正在回收的条目暂不计入淘汰配额
+	// checkpoint 是首次运行固定的物理分区。执行、续跑与清理均由持有 busy 的请求使用。
+	checkpoint compose_v2.Checkpointer
 	// abortCtx 保存原任务清理所需的上下文。由持有 busy 的请求读写。
 	abortCtx context.Context
 	// historyCleanupPending 表示旧任务已放弃，仍需补齐原历史。
@@ -572,7 +575,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			if started {
 				return
 			}
-			if stale != nil && (!replacing || stale.historyCleanupPending || h.hasTaskCheckpoint(ctx, stale.sess.RunID)) {
+			if stale != nil && (!replacing || stale.historyCleanupPending || hasTaskCheckpoint(ctx, stale.checkpoint, stale.sess.RunID)) {
 				h.restoreEntry(key, stale)
 				claimed = stale
 			} else {
@@ -596,12 +599,9 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 	if shared != nil && shared.settledReplacement != "" {
 		runOpts = append(runOpts, agent_v2.WithSettledAbandonedTask(shared.settledReplacement))
 	}
-	if oldTask != "" && shared == nil {
+	if oldTask != "" && shared == nil && (stale.checkpoint != nil || stale.history.Store != nil) {
 		var dropErr error
-		dropCtx, dropActivity, dropErr = h.beginDropCP(ctx, oldTask)
-		if dropErr == nil && dropActivity == nil && stale.history.Store != nil {
-			dropCtx, dropActivity, dropErr = compose_v2.BeginTaskActivity(context.WithoutCancel(ctx), "", []string{oldTask})
-		}
+		dropCtx, dropActivity, dropErr = beginDropCP(ctx, stale.checkpoint, oldTask)
 		if dropErr != nil {
 			if errors.Is(dropErr, compose_v2.ErrTaskBusy) {
 				_ = sse.Reject(http.StatusConflict, "busy", "an operation on the previous task is in progress")
@@ -610,9 +610,7 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 			}
 			return
 		}
-		if dropActivity != nil {
-			defer dropActivity.Release()
-		}
+		defer dropActivity.Release()
 	}
 
 	// 已接受的放弃先完成清理，清档失败时还原入口，避免新任务覆盖清理句柄。
@@ -628,18 +626,28 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 		stale = nil
 	}
 
-	cleanupCtx := ctx
 	adapter := newSSEAdapter(sse, in.RunID, in.Messages)
 	ag := h.build(adapter)
 	if agent_v2.IsNilAgent(ag) {
 		_ = sse.Reject(http.StatusInternalServerError, "nil_agent", "agui: AgentFactory returned nil agent")
 		return
 	}
+	sess := agent_v2.NewRunSession()
+	if shared == nil {
+		rootCtx := compose_v2.WithGraphNS(compose_v2.WithSessionIDCtx(ctx, sess.RunID), "")
+		cp, err := compose_v2.ResolveCheckpointPartition(rootCtx, h.cp)
+		if err != nil {
+			slog.WarnContext(ctx, "agui: 无法选择任务存档分区", "sid", sess.RunID, "err", err)
+			_ = sse.Reject(http.StatusServiceUnavailable, "agent_error", "could not select the task checkpoint partition")
+			return
+		}
+		claimed.checkpoint = cp
+		ctx = compose_v2.WithBoundCheckpointPartitionCtx(ctx, cp)
+	}
+	cleanupCtx := ctx
 	// ctx 版 OrchHooks 让嵌套子 agent 也继承流式事件钩子。
 	ctx = agent_v2.WithCtxOrchHooks(ctx, adapter)
 	ctx = toolresult.WithObserver(ctx, &adapter.resultObserver)
-
-	sess := agent_v2.NewRunSession()
 	runID := in.RunID
 	if runID == "" {
 		runID = sess.RunID
@@ -686,8 +694,8 @@ func (h *handler) serveRun(ctx context.Context, sse eventWriter, in *RunAgentInp
 	} else {
 		if dropActivity != nil {
 			replacing = true
-			if h.cp != nil {
-				if err := h.deleteCP(dropCtx, oldTask); err != nil {
+			if stale.checkpoint != nil {
+				if err := deleteCP(dropCtx, stale.checkpoint, oldTask); err != nil {
 					// 前置清档失败时由 defer 恢复原续跑入口，等待存储恢复。
 					replacing = false
 					_ = sse.Reject(http.StatusServiceUnavailable, "agent_error", replacementCleanupError)
@@ -763,8 +771,6 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 		_ = sse.Reject(http.StatusNotImplemented, "no_checkpointer", "resume requires checkpointer (agui.WithCheckpointer)")
 		return
 	}
-	// 在接入 SSE 钩子前捕获清理所需的请求值，避免补偿沿用原请求的流式适配器。
-	abortBase := ctx
 	// 校验 resume entry 合法性（对齐官方 ResumeEntry：status 是 resolved/cancelled 枚举、
 	// interruptId 非空）——非法值 fail-fast 发 RunError，不静默当 resolved（官方 wire 层是
 	// enum 拒非法；内联协议层显式拒暴露客户端 bug，而非把未知状态当有效答案注入续跑）。
@@ -848,6 +854,11 @@ func (h *handler) serveResume(ctx context.Context, sse eventWriter, in *RunAgent
 		return
 	}
 	sess, open, prior := entry.sess, entry.open, entry.prior
+	if shared == nil {
+		ctx = compose_v2.WithBoundCheckpointPartitionCtx(ctx, entry.checkpoint)
+	}
+	// 在接入 SSE 钩子前捕获清理所需的请求值，避免补偿沿用原请求的流式适配器。
+	abortBase := ctx
 	ctx = agent_v2.WithCallerHistoryCtx(ctx, prior)
 
 	// **resume 列表恰好覆盖挂起的那些中断**（AG-UI：每一条答一个挂起的中断，全部都要答到或者明确放弃，不支持只答
@@ -1088,7 +1099,7 @@ func (h *handler) handleOutcome(ctx context.Context, sse eventWriter, key sessio
 		// 新任务可能是子任务忙后留下的失败档；续跑则保留当前挂起入口。
 		if fresh {
 			if shared == nil {
-				_ = h.dropCP(ctx, sess.RunID)
+				_ = dropCP(ctx, compose_v2.GetCheckpointer(ctx), sess.RunID)
 				h.removeEntry(key)
 			} else if !h.finishSession(ctx, sse, key) {
 				return
@@ -1165,7 +1176,7 @@ func (h *handler) handleOutcome(ctx context.Context, sse eventWriter, key sessio
 	}
 	if shared == nil && sess != nil && kind != runoutcome.CheckpointSaveFailed && compose_v2.LeavesResumableCheckpoint(err) {
 		// 终态没有续跑入口。持有任务许可时尽力清理本次执行的存档。
-		_ = h.dropCP(ctx, sess.RunID)
+		_ = dropCP(ctx, compose_v2.GetCheckpointer(ctx), sess.RunID)
 	}
 	switch kind {
 	case runoutcome.Success:
@@ -1411,23 +1422,24 @@ func (h *handler) retryAbort(entry *sessionEntry, deadline time.Time) error {
 	if entry.terminal || entry.historyCleanupPending {
 		ctx, cancel := localHistoryCleanupContext(entry.abortCtx, deadline)
 		defer cancel()
-		ctx = compose_v2.WithCheckpointerCtx(ctx, h.cp)
+		cp := entry.checkpoint
+		ctx = compose_v2.WithBoundCheckpointerCtx(ctx, cp)
 		sid := entry.sess.RunID
 		ctx, activity, err := compose_v2.BeginTaskActivity(ctx, "", []string{sid})
 		if err != nil {
 			return err
 		}
 		defer activity.Release()
-		if h.cp != nil {
+		if cp != nil {
 			if entry.historyCleanupPending {
-				slots, err := h.cp.LoadAllInSession(ctx, sid)
+				slots, err := cp.LoadAllInSession(ctx, sid)
 				if err != nil {
 					return fmt.Errorf("verify discarded task %q checkpoint: %w", sid, err)
 				}
 				if len(slots) != 0 {
 					return fmt.Errorf("discarded task %q has a checkpoint again", sid)
 				}
-			} else if err := h.deleteCP(ctx, sid); err != nil {
+			} else if err := deleteCP(ctx, cp, sid); err != nil {
 				return err
 			}
 		}
@@ -1449,7 +1461,7 @@ func (h *handler) tryEvictLocked(key sessionKey, entry *sessionEntry) (evictedTa
 	task := evictedTask{key: key, entry: entry}
 	if entry.sess != nil {
 		task.sid = entry.sess.RunID
-		if task.sid != "" && (h.cp != nil || entry.history.Store != nil) {
+		if task.sid != "" && (entry.checkpoint != nil || entry.history.Store != nil) {
 			if entry.abortCtx == nil {
 				_, activity, err := compose_v2.BeginTaskActivity(context.Background(), "", []string{task.sid})
 				if err != nil {
@@ -1499,10 +1511,11 @@ func (h *handler) cleanupEvicted(ctx context.Context, tasks []evictedTask) {
 			h.finishEviction(task, err == nil)
 		case task.activity != nil:
 			var cleanupCtx context.Context
-			cleanupCtx, err = task.activity.WithCheckpointLeases(leaseCtx, h.cp)
+			cp := task.entry.checkpoint
+			cleanupCtx, err = task.activity.WithCheckpointLeases(leaseCtx, cp)
 			if err == nil {
-				if h.cp != nil {
-					err = h.deleteCP(cleanupCtx, task.sid)
+				if cp != nil {
+					err = deleteCP(cleanupCtx, cp, task.sid)
 				}
 				if err == nil && task.entry.history.Store != nil {
 					task.entry.abortCtx = context.WithoutCancel(leaseCtx)
@@ -1637,22 +1650,21 @@ func (h *handler) evictIfNeededLocked(inserter string, skipped map[sessionKey]bo
 	return nil // 无可淘汰时允许表暂时超出上限。
 }
 
-// dropCP 尽力清一个 sid 的 cp 子树（覆盖旧挂起 / 淘汰时防 cp 孤儿泄漏）。任务正忙时返回 ErrTaskBusy。
-// 用 DeleteSubtree 直删而非 Resume(Abort)——淘汰场景不需 agent 层 emit，省 build 开销。
-func (h *handler) dropCP(ctx context.Context, sid string) error {
-	cleanupCtx, activity, err := h.beginDropCP(ctx, sid)
-	if activity == nil {
+// dropCP 在取得任务放弃许可后清理当前分区的存档子树。任务正忙时返回 ErrTaskBusy。
+func dropCP(ctx context.Context, cp compose_v2.Checkpointer, sid string) error {
+	if cp == nil || sid == "" {
+		return nil
+	}
+	cleanupCtx, activity, err := beginDropCP(ctx, cp, sid)
+	if err != nil {
 		return err
 	}
 	defer activity.Release()
-	return h.deleteCP(cleanupCtx, sid)
+	return deleteCP(cleanupCtx, cp, sid)
 }
 
-func (h *handler) beginDropCP(ctx context.Context, sid string) (context.Context, *compose_v2.TaskActivity, error) {
-	if h.cp == nil || sid == "" {
-		return ctx, nil, nil
-	}
-	cleanupCtx := compose_v2.WithCheckpointerCtx(context.WithoutCancel(ctx), h.cp)
+func beginDropCP(ctx context.Context, cp compose_v2.Checkpointer, sid string) (context.Context, *compose_v2.TaskActivity, error) {
+	cleanupCtx := compose_v2.WithBoundCheckpointerCtx(context.WithoutCancel(ctx), cp)
 	cleanupCtx, activity, err := compose_v2.BeginTaskActivity(cleanupCtx, "", []string{sid})
 	if err != nil {
 		slog.WarnContext(ctx, "agui: 跳过仍有操作在途的任务存档清理", "sid", sid, "err", err)
@@ -1662,22 +1674,22 @@ func (h *handler) beginDropCP(ctx context.Context, sid string) (context.Context,
 }
 
 // hasTaskCheckpoint 核对异常退出的替换操作是否已经删掉了旧档。读取失败时保留原入口。
-func (h *handler) hasTaskCheckpoint(ctx context.Context, sid string) bool {
-	if h.cp == nil {
+func hasTaskCheckpoint(ctx context.Context, cp compose_v2.Checkpointer, sid string) bool {
+	if cp == nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropCPTimeout)
 	defer cancel()
-	all, err := h.cp.LoadAllInSession(ctx, sid)
+	all, err := cp.LoadAllInSession(ctx, sid)
 	return err != nil || len(all) > 0
 }
 
 // deleteCP 在持有任务的删档许可时调用。
-func (h *handler) deleteCP(ctx context.Context, sid string) error {
+func deleteCP(ctx context.Context, cp compose_v2.Checkpointer, sid string) error {
 	// 调用方已从请求取消中分离，保留回收预算和任务租约的取消。
 	dctx, cancel := context.WithTimeout(ctx, dropCPTimeout)
 	defer cancel()
-	_, err := h.cp.DeleteSubtree(dctx, sid, "")
+	_, err := cp.DeleteSubtree(dctx, sid, "")
 	if err != nil {
 		slog.WarnContext(ctx, "agui: 存档清理失败", "sid", sid, "err", err)
 	}

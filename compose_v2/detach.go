@@ -202,6 +202,11 @@ func (c detachedCtx) Value(key any) any {
 	if isExecutionKey(key) {
 		return nil
 	}
+	if _, ok := key.(checkpointerKey); ok {
+		if binding, ok := boundCheckpointerFrom(c.Context); ok && binding.restoreConfiguration {
+			return binding.detached
+		}
+	}
 	return c.Context.Value(key)
 }
 

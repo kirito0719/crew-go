@@ -46,7 +46,7 @@ func seedPending(t *testing.T, h *handler, cp compose_v2.Checkpointer, key sessi
 	}); err != nil {
 		t.Fatalf("SaveNS: %v", err)
 	}
-	h.sessions[key] = &sessionEntry{sess: sess, touchedAt: time.Now().Add(-idle).UnixNano()}
+	h.sessions[key] = &sessionEntry{sess: sess, checkpoint: cp, touchedAt: time.Now().Add(-idle).UnixNano()}
 	return sess.RunID
 }
 
@@ -128,7 +128,7 @@ func TestServeRun_RetainsPendingTaskWhenCheckpointCleanupIsBusy(t *testing.T) {
 		t.Fatal("应保留旧任务的存档、挂起问题、续跑入口和闲置时间")
 	}
 	activity.Release()
-	if err := h.dropCP(t.Context(), sid); err != nil || hasCP(sid) {
+	if err := dropCP(t.Context(), cp, sid); err != nil || hasCP(sid) {
 		t.Fatal("任务执行结束后应能清理存档")
 	}
 }
@@ -145,7 +145,7 @@ func TestServeRun_DoesNotRestoreEntryDeletedBeforeTaskConflict(t *testing.T) {
 			sid := seedPending(t, h, cp, key, 0)
 			if retry {
 				ctx := compose_v2.WithCheckpointerCtx(t.Context(), cp)
-				if err := h.dropCP(ctx, sid); err != nil {
+				if err := dropCP(ctx, cp, sid); err != nil {
 					t.Fatal(err)
 				}
 				entry := h.sessions[key]
@@ -445,8 +445,10 @@ func (c *remoteBusyCheckpointer) DeleteSubtree(ctx context.Context, sid, ns stri
 func TestSessionTTL_RemoteBusyKeepsEntryUntilReclaim(t *testing.T) {
 	h, cp, hasCP := ttlFixture(t, time.Hour)
 	old := sessionKey{owner: "o", threadID: "old"}
-	sid := seedPending(t, h, cp, old, 2*time.Hour)
-	h.cp = &remoteBusyCheckpointer{Checkpointer: cp, t: t, h: h, remoteSID: sid, remoteBusy: true}
+	leased := &remoteBusyCheckpointer{Checkpointer: cp, t: t, h: h, remoteBusy: true}
+	h.cp = leased
+	sid := seedPending(t, h, leased, old, 2*time.Hour)
+	leased.remoteSID = sid
 	oldEntry := h.sessions[old]
 	h.build = func(hook.Hooks) agent_v2.Agent { return nil }
 	run := func(key sessionKey) int {
@@ -463,7 +465,7 @@ func TestSessionTTL_RemoteBusyKeepsEntryUntilReclaim(t *testing.T) {
 	if h.sessions[old] != oldEntry || oldEntry.busy || !hasCP(sid) {
 		t.Fatal("remote busy TTL sweep should leave old entry idle for retry")
 	}
-	h.cp.(*remoteBusyCheckpointer).remoteBusy = false
+	leased.remoteBusy = false
 	h.lastSweep = 0
 	run(sessionKey{owner: "o", threadID: "new"})
 	if h.sessions[old] != nil || hasCP(sid) {
@@ -477,9 +479,11 @@ func TestSessionCapacity_SkipsRemoteBusyOldest(t *testing.T) {
 	busy := sessionKey{owner: "one-owner", threadID: "oldest"}
 	idle := sessionKey{owner: "one-owner", threadID: "idle"}
 	new1 := sessionKey{owner: "one-owner", threadID: "new1"}
-	busySID := seedPending(t, h, cp, busy, 2*time.Hour)
-	idleSID := seedPending(t, h, cp, idle, time.Hour)
-	h.cp = &remoteBusyCheckpointer{Checkpointer: cp, t: t, h: h, remoteSID: busySID, remoteBusy: true}
+	leased := &remoteBusyCheckpointer{Checkpointer: cp, t: t, h: h, remoteBusy: true}
+	h.cp = leased
+	busySID := seedPending(t, h, leased, busy, 2*time.Hour)
+	idleSID := seedPending(t, h, leased, idle, time.Hour)
+	leased.remoteSID = busySID
 	_, evicted, claimed := h.acquireForRun(new1)
 	if claimed == nil {
 		t.Fatal("fixture must reserve new run")

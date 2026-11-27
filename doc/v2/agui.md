@@ -175,8 +175,12 @@ Run → 中断 → RunFinished(outcome=interrupt, interrupts=[{id, reason, messa
 ### 共享会话
 
 持久化部署使用 `agui.WithSessionStore` 同时提供会话与 Checkpointer。进程内模式的 `agui.WithCheckpointer`
-要求存档随进程退出而消失，由 `compose_v2.VolatileCheckpointer` 声明。仅经请求中间件注入 Checkpointer 时，Handler 会拒绝请求。
+要求存档随进程退出而消失，由配置对象的 `compose_v2.VolatileCheckpointer` 声明，覆盖其解析出的全部分区。
+仅经请求中间件注入 Checkpointer 时，Handler 会拒绝请求。
 当前任务和嵌套图沿用 Handler 绑定的存档后端，钩子或图选项设置的 Checkpointer 不会替换它。
+进程内模式中，若后端实现 `compose_v2.CheckpointPartitionResolver`，Handler 按首次运行的根任务上下文选定易失分区。
+整棵存档子树、答复续跑和清档共用该分区。同线程新任务独立选择自己的分区，旧任务的替换和回收沿用原分区。
+用 `agent_v2.DetachTask` 开启的独立任务从原配置重新选择分区。
 已有 SQLite、PostgreSQL 或 MySQL 部署可用原 Checkpointer 构造 `sql.NewAGUISessionStore` 并运行 `Setup`。
 Redis 部署使用 `redis.NewAGUISessionStore`。每个实例使用相同存储域，同一工作流版本使用兼容的 Agent 图定义。
 
@@ -235,7 +239,7 @@ sequenceDiagram
 进程内会话在用户全选 `cancelled` 后进入清理状态。清档失败会发送 `abort_failed` 并保留任务入口，
 再次发送原中断 ID 的取消请求可继续清理。送回答案会得到 HTTP 409 `cleanup_pending`。
 同线程新 Run 在清理成功后才能启动。容量或 TTL 回收也会用原取消请求的身份完成清档和历史收尾。
-普通容量或 TTL 回收先清理已配置的存档，再到原任务绑定的历史后端和分区补齐缺失的工具结果。
+普通容量或 TTL 回收先清理原任务分区中的存档，再到原任务绑定的历史后端和分区补齐缺失的工具结果。
 补写失败时保留清理入口。后续回收或同线程新 Run 可继续补写。已配置存档的会话拒绝续跑答复，仍可重试取消。
 初次 Run 异常退出且宿主收到终结信号时，进程内会话沿用原任务身份清档和补写。失败时由同线程新 Run 或后续回收重试。
 Resume 异常退出仍保留挂起现场。清理入口与进程内会话一同保存。
