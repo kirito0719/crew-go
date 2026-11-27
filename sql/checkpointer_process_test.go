@@ -153,6 +153,7 @@ type sharedApproval struct {
 	history    *crewsql.HistoryStore
 	key        agent_v2.HistoryKey
 	agent      *agent_v2.BasicAgent
+	session    *agent_v2.RunSession
 }
 
 func newSQLiteSharedApproval(t *testing.T) sharedApproval {
@@ -186,7 +187,7 @@ func newSharedApproval(t *testing.T, backend sharedApprovalBackend) sharedApprov
 		t.Fatalf("应停在转账审批，实际 %v", err)
 	}
 	return sharedApproval{ctx: ctx, backend: backend, sid: session.RunID, askID: interrupt.AllQueries()[0].InterruptID,
-		cp: cp, history: history, key: key, agent: agent}
+		cp: cp, history: history, key: key, agent: agent, session: session}
 }
 
 func dropSQLTestTablesOnCleanup(t *testing.T, db *sql.DB, tables ...string) {
@@ -226,6 +227,89 @@ func (f sharedApproval) results(t *testing.T) []string {
 // TestSharedCheckpointer_AbandonDuringResume 用两个进程穿过真实 Agent 的读档、工具执行和历史收尾。
 func TestSharedCheckpointer_AbandonDuringResume(t *testing.T) {
 	runAbandonDuringResume(t, newSQLiteSharedApproval(t))
+}
+
+type routedAbandonCheckpointer struct {
+	compose_v2.Checkpointer
+	oldID string
+	old   compose_v2.Checkpointer
+}
+
+func (cp routedAbandonCheckpointer) ResolveCheckpointPartition(ctx context.Context) (compose_v2.Checkpointer, error) {
+	if compose_v2.GetSessionID(ctx) == cp.oldID {
+		return cp.old, nil
+	}
+	return cp.Checkpointer, nil
+}
+
+func TestSQLiteCheckpointer_RoutedAbandonChecksOldLease(t *testing.T) {
+	f := newSQLiteSharedApproval(t)
+	next, _ := openSQLiteCheckpointer(t)
+	router := routedAbandonCheckpointer{Checkpointer: next, oldID: f.sid, old: f.cp}
+	ctx := compose_v2.WithCheckpointerCtx(f.ctx, router)
+	replacement := agent_v2.NewRunSession()
+	run := func() ([]*agent_v2.AgentEvent, error) {
+		return f.agent.Run(ctx, replacement, schema.UserMessage("查余额"), agent_v2.WithAbandonedTasks(f.sid))
+	}
+
+	lease := f.cp.CheckpointTaskLeases()
+	const token = "pending-resume"
+	if acquired, err := lease.TryAcquireTaskLease(ctx, f.sid, token, 30*time.Second); err != nil || !acquired {
+		t.Fatalf("旧分区应持有独立续跑租约，acquired=%v err=%v", acquired, err)
+	}
+	defer func() {
+		if err := lease.ReleaseTaskLease(ctx, f.sid, token); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := run(); !errors.Is(err, compose_v2.ErrTaskBusy) {
+		t.Errorf("旧分区租约冲突应拒绝新任务，实际 %v", err)
+	}
+	if pending, err := f.cp.ListPending(ctx, f.sid); err != nil || len(pending) != 1 || len(f.results(t)) != 0 {
+		t.Errorf("冲突时应保留旧档且未补写历史，实际 pending=%v err=%v results=%v", pending, err, f.results(t))
+	}
+	if err := lease.ReleaseTaskLease(ctx, f.sid, token); err != nil {
+		t.Fatal(err)
+	}
+
+	otherLease := next.CheckpointTaskLeases()
+	if acquired, err := otherLease.TryAcquireTaskLease(ctx, f.sid, token, 30*time.Second); err != nil || !acquired {
+		t.Fatalf("另一分区应能持有同名租约，acquired=%v err=%v", acquired, err)
+	}
+	defer func() {
+		if err := otherLease.ReleaseTaskLease(ctx, f.sid, token); err != nil {
+			t.Error(err)
+		}
+	}()
+	events, err := run()
+	if reply := agent_v2.FinalMessage(events); err != nil || reply == nil || reply.Content != "好的" {
+		t.Fatalf("释放原分区租约后应能重试，实际 reply=%v err=%v", reply, err)
+	}
+	results := f.results(t)
+	if slots, err := f.cp.LoadAllInSession(ctx, f.sid); err != nil || len(slots) != 0 ||
+		len(results) != 1 || !strings.Contains(results[0], "已被放弃") {
+		t.Errorf("重试应删除原分区并补写一次，实际 slots=%v err=%v results=%v", slots, err, results)
+	}
+}
+
+func TestSQLiteCheckpointer_AbandonViaAnotherClient(t *testing.T) {
+	f := newSQLiteSharedApproval(t)
+	_, peer, _ := f.backend.open(t)
+	ctx := compose_v2.WithCheckpointerCtx(f.ctx, peer)
+	if cp, err := peer.LoadNS(ctx, f.sid, ""); err != nil || cp == nil || !cp.HasResumableWork() {
+		t.Fatalf("另一个客户端应能读到实际挂起档，实际 cp=%v err=%v", cp, err)
+	}
+
+	f.session.NextTask()
+	events, err := f.agent.Run(ctx, f.session, schema.UserMessage("查余额"), agent_v2.WithAbandonedTasks(f.sid))
+	if reply := agent_v2.FinalMessage(events); err != nil || reply == nil || reply.Content != "好的" {
+		t.Fatalf("同库客户端应能完成放弃及新任务，实际 reply=%v err=%v", reply, err)
+	}
+	results := f.results(t)
+	if slots, err := f.cp.LoadAllInSession(ctx, f.sid); err != nil || len(slots) != 0 ||
+		len(results) != 1 || !strings.Contains(results[0], "已被放弃") {
+		t.Errorf("通过另一客户端应成功清档并补写一次，实际 slots=%v err=%v results=%v", slots, err, results)
+	}
 }
 
 func runAbandonDuringResume(t *testing.T, f sharedApproval) {

@@ -271,8 +271,8 @@ func clearTaskApprovalRules(s *RunSession, runID string) {
 	delete(s.values, approvalRulesKey(runID))
 }
 
-// rememberTaskApprovalRoot 记录待续根图的实际存档位置。工具可以等到 Resume 才拿到
-// 第一条授权，因此初次挂起时也保存位置。
+// rememberTaskApprovalRoot 记录待续或待收尾任务的实际存档位置。
+// 工具可以等到 Resume 才拿到第一条授权，因此初次挂起时也保存位置。
 func rememberTaskApprovalRoot(s *RunSession, runID string, partition compose_v2.Checkpointer, ns string) {
 	approvalMu.Lock()
 	defer approvalMu.Unlock()
@@ -318,22 +318,6 @@ func taskApprovalRootMatches(s *RunSession, runID string, partition compose_v2.C
 	}
 	coversRoot := ns == rootNS || (abandoning && compose_v2.IsNSInSubtree(ns, rootNS))
 	return coversRoot && compose_v2.SameCheckpointPartition(rootPartition, partition)
-}
-
-// retireAbandonedTaskApprovals 在原删除路径返回成功后检查审批域。
-// 路由型后端的 DeleteSubtree 可能按旧 RunID 选分区，用已绑定根槽确认是否真的删除。
-func retireAbandonedTaskApprovals(ctx context.Context, s *RunSession, runID string, cper compose_v2.Checkpointer) {
-	partition, ns := taskApprovalRoot(s, runID)
-	if partition != nil && !compose_v2.SameCheckpointPartition(partition, cper) {
-		if _, routed := cper.(compose_v2.CheckpointPartitionResolver); !routed {
-			return
-		}
-		lookup := compose_v2.WithGraphNS(compose_v2.WithSessionIDCtx(ctx, runID), ns)
-		if cp, err := partition.LoadNS(lookup, runID, ns); err != nil || cp != nil {
-			return
-		}
-	}
-	clearTaskApprovalRules(s, runID)
 }
 
 // callApprovalFns 是「这次调用的审批记录」的读写回调——由调用方（tools 节点的 runOne）注入。

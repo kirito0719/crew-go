@@ -402,6 +402,7 @@ OpenAI 真实服务端冒烟四项通过，A04 已完成。GitLab PostgreSQL/MyS
 - **终态证据边界**。已标记 Closing 的共享旧档由同身份的请求认领。没有终态标记的共享挂起任务仍可续。进程直接退出且未保存会话映射时，应用凭可核实的原任务身份处理存量。异常 Resume 保留原续跑现场，终态补写不会推断工具是否实际执行。
 - **同线程替换在原历史分区收尾**。AG-UI 为旧任务补齐工具结果，补写失败时保留重试入口。新 Agent 入口通过 `WithSettledAbandonedTask` 核对任务冲突。独立调用 Agent 时，`WithAbandonedTasks` 仍按当前历史写入器尽力收尾。 [进程内跨历史分区回归](../../agui/replacement_history_test.go) · [共享 SQLite 回归](../../sql/agui_replacement_history_test.go)
 - **进程内 AG-UI 的存档分区（2026-11-27）**。首次运行选择的易失分区与任务同寿命。两分区故障注入在原版复现续跑读取错误分区、替换跳过实际删档故障、取消和容量回收清错分区。修复版从原分区续跑并执行工具一次。替换失败保留原档，重试成功后清理原档，另一分区的同名槽始终保留。 [回归](../../agui/checkpoint_partition_test.go) · [分区契约](../v2/agui.md#共享会话)
+- **直接放弃旧任务的分区（2026-11-27）**。原版在两个内存分区上跳过旧档实际删除并提前补写历史，在两个 SQLite 分区上也未检查旧档所在的租约。修复后，旧任务许可与删除使用按其 RunID 解析的固定句柄。原分区删除失败会保留待答记录，重试成功只补一次。会话记录的实际分区不符时保留旧档和历史。 [删档顺序](../../agent_v2/abandoned_partition_test.go) · [SQLite 租约](../../sql/checkpointer_process_test.go)
 - **明确设计**。NextTask 只换 RunID，旧任务可续（agent_v2/session.go:167、195。TestWithAbandonedTasks_NotGivenLeavesPendingTaskResumable）。阶段 3 的整会话写边界扫描已否决，不能在并发可续期间全局合成。当前合成文案不声称工具未执行，精细分档是独立可选方案（doc/code/dangling-toolcall-fix-notes.md:35–37，agent_v2/history_slot.go:769–773）。
 
 ## 历史 TODO 逐条核验

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
-	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -106,54 +105,47 @@ func CheckCheckpointTaskLease(ctx context.Context) error {
 // WithCheckpointLeases 将这次登记绑定到 cp。用于已在应用锁下做进程内登记、现在可以访问后端的集成层。
 // 调用方在成功和失败路径都要 Release。执行与放弃只能绑定一次。
 func (a *TaskActivity) WithCheckpointLeases(ctx context.Context, cp Checkpointer) (context.Context, error) {
-	return a.acquireCheckpointLeases(ctx, cp)
+	return a.acquireCheckpointLeases(ctx, cp, cp, 0)
 }
 
-func (a *TaskActivity) acquireCheckpointLeases(ctx context.Context, cp Checkpointer) (context.Context, error) {
-	if a.cancel != nil || a.releaseLocal != nil {
+func (a *TaskActivity) acquireCheckpointLeases(ctx context.Context, cp, abandonedConfig Checkpointer, pendingCount int) (context.Context, error) {
+	if a.cancel != nil || a.releaseLocal != nil || a.abandonedCheckpoints != nil {
 		return ctx, errors.New("compose_v2: task activity already has checkpoint leases")
 	}
-	if isFrameworkNil(cp) || (a.sid == "" && len(a.abandoned) == 0) {
-		return ctx, nil
-	}
-	var store TaskLeaseStore
-	if provider, ok := cp.(TaskLeaseProvider); ok {
-		store = provider.CheckpointTaskLeases()
-	}
-	if isFrameworkNil(store) {
-		return ctx, a.acquireLocalCheckpointLease(ctx, cp)
-	}
-	if !reflect.ValueOf(store).Comparable() {
-		return ctx, errors.New("compose_v2: checkpoint task lease store must be comparable")
-	}
-	if err := CheckCheckpointTaskLease(ctx); err != nil {
+	ctx, err := a.acquireRunCheckpointLease(ctx, cp)
+	if err != nil || len(a.abandoned) == 0 || (isFrameworkNil(cp) && isFrameworkNil(abandonedConfig)) {
 		return ctx, err
 	}
-	existing := taskLeaseFrom(ctx, store, a.sid)
-	acquireRun := a.sid != "" && (existing == nil || existing.released.Load())
-	if !acquireRun && len(a.abandoned) == 0 {
-		return ctx, nil
-	}
-	ctx, a.cancel = context.WithCancelCause(ctx)
-	if acquireRun {
-		outerCtx := ctx
-		var err error
-		ctx, a.sharedRun, err = acquireCheckpointExecutionLease(ctx, store, a.sid, a.cancel)
+
+	a.abandonedCheckpoints = make(map[string]Checkpointer, len(a.abandoned))
+	for i, id := range a.abandoned {
+		if _, resolved := a.abandonedCheckpoints[id]; resolved {
+			continue
+		}
+		partition := cp
+		if i < pendingCount {
+			rootCtx := WithGraphNS(withSessionID(ctx, id), "")
+			partition, err = ResolveCheckpointPartition(rootCtx, abandonedConfig)
+			if err != nil {
+				return ctx, fmt.Errorf("resolve abandoned task %q checkpoint: %w", id, err)
+			}
+		}
+		a.abandonedCheckpoints[id] = partition
+		store, err := checkpointLeaseStore(partition)
 		if err != nil {
 			return ctx, err
 		}
-		if a.sharedRun != nil {
-			if err := verifyOuterCheckpointLeases(outerCtx, a.sid); err != nil {
-				return ctx, err
-			}
+		if store == nil {
+			continue
 		}
-	}
-	for _, id := range a.abandoned {
+		if err := CheckCheckpointTaskLease(ctx); err != nil {
+			return ctx, err
+		}
 		if existing := taskLeaseFrom(ctx, store, id); existing != nil && !existing.released.Load() {
-			if !slices.Contains(a.sharedAbandons, existing) {
-				return ctx, &TaskBusyError{TaskID: id, operation: "cannot abandon task"}
-			}
-			continue // 同一次调用里重复声明同一个旧任务。
+			return ctx, &TaskBusyError{TaskID: id, operation: "cannot abandon task"}
+		}
+		if a.cancel == nil {
+			ctx, a.cancel = context.WithCancelCause(ctx)
 		}
 		next, lease, err := acquireCheckpointTaskLease(ctx, store, id, a.cancel)
 		if err != nil {
@@ -163,6 +155,84 @@ func (a *TaskActivity) acquireCheckpointLeases(ctx context.Context, cp Checkpoin
 		a.sharedAbandons = append(a.sharedAbandons, lease)
 	}
 	return ctx, nil
+}
+
+func (a *TaskActivity) acquireRunCheckpointLease(ctx context.Context, cp Checkpointer) (context.Context, error) {
+	if a.sid == "" || isFrameworkNil(cp) {
+		return ctx, nil
+	}
+	store, err := checkpointLeaseStore(cp)
+	if err != nil {
+		return ctx, err
+	}
+	if store == nil {
+		return ctx, a.acquireLocalCheckpointLease(ctx, cp)
+	}
+	if err := CheckCheckpointTaskLease(ctx); err != nil {
+		return ctx, err
+	}
+	existing := taskLeaseFrom(ctx, store, a.sid)
+	if existing != nil && !existing.released.Load() {
+		return ctx, nil
+	}
+	ctx, a.cancel = context.WithCancelCause(ctx)
+	outerCtx := ctx
+	ctx, a.sharedRun, err = acquireCheckpointExecutionLease(ctx, store, a.sid, a.cancel)
+	if err == nil && a.sharedRun != nil {
+		err = verifyOuterCheckpointLeases(outerCtx, a.sid)
+	}
+	return ctx, err
+}
+
+func checkpointLeaseStore(cp Checkpointer) (TaskLeaseStore, error) {
+	provider, ok := cp.(TaskLeaseProvider)
+	if !ok {
+		return nil, nil
+	}
+	store := provider.CheckpointTaskLeases()
+	if isFrameworkNil(store) {
+		return nil, nil
+	}
+	if !reflect.ValueOf(store).Comparable() {
+		return nil, errors.New("compose_v2: checkpoint task lease store must be comparable")
+	}
+	return store, nil
+}
+
+// ConfirmCheckpointPartition 核对两个已解析的句柄是否指向同一分区。
+// 句柄不同但都支持租约时，用 selected 持有的任务令牌在 recorded 验证续约。
+func ConfirmCheckpointPartition(ctx context.Context, sid string, selected, recorded Checkpointer) (bool, error) {
+	// 反射句柄相同表示同一个装箱引用，也适用于沿同一配置传递的不可比较值。
+	// 比较的是引用身份，避免将两个分区中内容相同的快照当成同一个分区。
+	if SameCheckpointPartition(selected, recorded) || reflect.ValueOf(selected) == reflect.ValueOf(recorded) {
+		return true, nil
+	}
+	active, err := checkpointLeaseStore(selected)
+	if err != nil || active == nil {
+		return false, err
+	}
+	previous, err := checkpointLeaseStore(recorded)
+	if err != nil || previous == nil {
+		return false, err
+	}
+	lease := taskLeaseFrom(ctx, active, sid)
+	if lease == nil || lease.released.Load() {
+		return false, nil
+	}
+	if err := CheckCheckpointTaskLease(ctx); err != nil {
+		return false, err
+	}
+	ok, err := renewCheckpointTaskLease(ctx, previous, lease)
+	if err != nil {
+		return false, fmt.Errorf("verify recorded checkpoint lease for task %q: %w", sid, err)
+	}
+	if !ok {
+		return false, nil
+	}
+	if err := CheckCheckpointTaskLease(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // verifyOuterCheckpointLeases 在新租约成功后检查同一任务的外层持有者。

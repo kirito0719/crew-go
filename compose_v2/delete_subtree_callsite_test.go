@@ -52,7 +52,7 @@ var knownDeleteSubtreeCallSites = map[string]callSiteNote{
 	"compose_v2/nested_completion.go:deleteTransferredResult":                       {1, "领取子结果时，父节点先保留回执，再按实际存储分区和世代删该子树。删除失败可由本次父调用重试，同分区还有父图收尾"},
 	"compose_v2/durability.go:deleteCpSubtree":                                      {1, "Run 出口——嵌套 Run 有祖先；根 Run 空前缀多数 backend 原子"},
 	"agent_v2/resume_helpers.go:commonResumePrep":                                   {1, "Abort——顶层空前缀；嵌套 Abort 无更外层清理者，残留留着"},
-	"agent_v2/history_slot.go:abandonTasksAtEntry":                                  {1, "WithAbandonedTasks 放弃旧任务，持有放弃许可并以空前缀删整个旧任务"},
+	"agent_v2/history_slot.go:abandonTasksAtEntry":                                  {1, "WithAbandonedTasks 持有旧任务分区的放弃许可，以空前缀删除该分区的整份存档"},
 	"agent_v2/background/worker.go:(taskCheckpoint).DeleteSubtree":                  {1, "子图存档由子任务终态事务兜底清理，子任务根档留到该事务"},
 	"agui/handler.go:deleteCP":                                                      {1, "会话丢弃，持有原分区的删档许可并以空前缀删整个任务"},
 	"a2a/server/executor.go:(*Executor).discardFailed":                              {1, "终态失败失去续接入口，持有任务的放弃许可后按空前缀清理"},

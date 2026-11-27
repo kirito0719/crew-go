@@ -902,10 +902,10 @@ func beginRunActivity(ctx context.Context, cfg runConfig, session *RunSession, a
 		return ctx, nil, err
 	}
 	tasks, agentName := cfg.abandoned, ag.Name()
-	ids := make([]string, len(tasks))
-	for i, task := range tasks {
+	ids := make([]string, 0, len(tasks))
+	var settled []string
+	for _, task := range tasks {
 		id := task.id
-		ids[i] = id
 		if id == "" || id == session.RunID {
 			return ctx, nil, rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——放弃的是这次 Run 之前的任务，不能是空的，"+
 				"也不能是这次 Run 自己的任务（RunID %q）", agentName, id, session.RunID)
@@ -913,6 +913,11 @@ func beginRunActivity(ctx context.Context, cfg runConfig, session *RunSession, a
 		if detachedFromRunning(ctx, id) {
 			return ctx, nil, rejectCall(ctx, "agent %q: WithAbandonedTasks 给了 %q——它是脱离出来之前所在的任务，此刻正在执行，不能放弃",
 				agentName, id)
+		}
+		if task.settled {
+			settled = append(settled, id)
+		} else {
+			ids = append(ids, id)
 		}
 	}
 	_, nested := enclosingTask(ctx)
@@ -923,7 +928,7 @@ func beginRunActivity(ctx context.Context, cfg runConfig, session *RunSession, a
 	if freshRoot {
 		begin = compose_v2.BeginFreshTaskActivity
 	}
-	ctx, task, err := begin(ctx, session.RunID, ids)
+	ctx, task, err := begin(ctx, session.RunID, ids, settled...)
 	if err != nil {
 		return ctx, nil, fmt.Errorf("agent %q: %w", agentName, err)
 	}
@@ -953,27 +958,19 @@ func beginRunActivity(ctx context.Context, cfg runConfig, session *RunSession, a
 	return ctx, activity, nil
 }
 
-// abandonEntryTimeout 是入口收尾被放弃的任务时，存储调用（补结果、删存档）一共最多等多久。这一步排在这次 Run 的一切之前，
-// 后端挂住时不该拖住整个请求（agui 每次覆盖挂起都走这里）；到点同删档失败，告警、照常开这次 Run。
+// abandonEntryTimeout 是入口删档和补写历史的共享预算。存储调用超时后记日志并继续新 Run。
 var abandonEntryTimeout = 10 * time.Second
 
-// abandonTasksAtEntry 给 [WithAbandonedTasks] 声明放弃的任务收尾：调用方持有 beginRunActivity 取得的放弃许可。盖完任务章之后，
-// 记这次的输入与触发钩子之前调。补结果写进这次 Run 正在用的那场对话（ctx 上的历史写入器：顶层是这次入口刚建的，嵌套时是父层的
-// ——被调方的历史本来就沿用它；只按被调方自己的配置找时，它没配历史就不补，审计实测）；没有写入器（没配历史、声明了不进历史）
-// 时不补。收尾是尽力而为、有上限（abandonEntryTimeout）：失败只记日志——历史是旁路，放弃一个旧任务不该让这次
-// Run 失败。先删档、删成功（或没配 checkpointer）才补结果，同 Resume 的放弃分支：「历史里写了被放弃」要推得出「档已删」，
-// 反过来档删了、补结果失败只留下悬空的调用，读侧兜得住（审计实测：共用预算在补完结果、删档之间到点时，任务还能续，续跑的
-// 真结果排在「被放弃」之后）。
-func abandonTasksAtEntry(ctx context.Context, tasks []abandonedTask, agentName string) {
+// abandonTasksAtEntry 用入场时已取得许可的旧任务分区清档。删档成功后补齐当前历史写入器中的旧工具结果。
+// 补写完成后释放放弃许可，调用方再记录本次输入并触发钩子。
+func abandonTasksAtEntry(ctx context.Context, activity *compose_v2.TaskActivity, tasks []abandonedTask, agentName string) {
+	defer activity.FinishAbandon()
 	if len(tasks) == 0 {
 		return
 	}
 	sctx, cancel := context.WithTimeout(ctx, abandonEntryTimeout)
 	defer cancel()
 	w := historyWriterFrom(ctx)
-	cper := compose_v2.GetCheckpointer(ctx)
-	// 删被放弃任务的根：RunID 就是任务的身份、也是存档的主索引，它名下的存档整份属于它。不用这次调用所在的 ns——嵌套位置上
-	// （钩子或节点里经 RunSubAgent 透传这个选项）那是子 ns，删不到它的根档（审计实测）。
 	const ns = ""
 	session := GetSession(ctx)
 	for _, task := range tasks {
@@ -981,6 +978,21 @@ func abandonTasksAtEntry(ctx context.Context, tasks []abandonedTask, agentName s
 		if task.settled {
 			clearTaskApprovalRules(session, id)
 			continue
+		}
+		cper, admitted := activity.AbandonedCheckpoint(id)
+		if !admitted {
+			slog.WarnContext(ctx, "agent_v2: 放弃任务的存档分区未确认",
+				"agent", agentName, "task", id, "ns", ns)
+			continue
+		}
+		recorded, _ := taskApprovalRoot(session, id)
+		if recorded != nil {
+			same, err := compose_v2.ConfirmCheckpointPartition(sctx, id, cper, recorded)
+			if err != nil || !same {
+				slog.WarnContext(ctx, "agent_v2: 放弃任务的存档分区未确认",
+					"agent", agentName, "task", id, "ns", ns, "err", err)
+				continue
+			}
 		}
 		if cper != nil {
 			start := time.Now()
@@ -992,11 +1004,15 @@ func abandonTasksAtEntry(ctx context.Context, tasks []abandonedTask, agentName s
 				continue
 			}
 		}
-		retireAbandonedTaskApprovals(sctx, session, id, cper)
 		if w != nil {
 			if err := CloseAbandonedTaskHistory(sctx, TaskHistoryDestination{Key: w.key, Store: w.store}, id); err != nil {
 				slog.WarnContext(ctx, "agent_v2: 放弃任务的历史收尾失败", "agent", agentName, "task", id, "err", err)
+				if cper != nil && recorded == nil {
+					rememberTaskApprovalRoot(session, id, cper, ns)
+				}
+				continue
 			}
 		}
+		clearTaskApprovalRules(session, id)
 	}
 }

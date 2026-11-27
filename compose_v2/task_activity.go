@@ -20,37 +20,41 @@ var taskActivities = struct {
 
 // TaskActivity 持有一次调用的执行登记与放弃许可。由取得它的调用串行释放。
 type TaskActivity struct {
-	sid            string
-	mode           taskActivityMode
-	fresh          *freshTaskCheckpoints
-	abandoned      []string
-	localOwner     *TaskActivity
-	releaseLocal   func()
-	sharedRun      *checkpointTaskLease
-	sharedAbandons []*checkpointTaskLease
-	cancel         context.CancelCauseFunc
+	sid                  string
+	mode                 taskActivityMode
+	fresh                *freshTaskCheckpoints
+	abandoned            []string
+	abandonedCheckpoints map[string]Checkpointer
+	localOwner           *TaskActivity
+	releaseLocal         func()
+	sharedRun            *checkpointTaskLease
+	sharedAbandons       []*checkpointTaskLease
+	cancel               context.CancelCauseFunc
 }
 
 // BeginTaskActivity 在进程内原子登记 sid 的执行和 abandoned 中任务的放弃许可。执行可嵌套，放弃与执行或另一次放弃互斥。
 // sid 为空时只申请放弃许可。支持 [TaskLeaseProvider] 的 Checkpointer 逐个任务申请跨进程独占租约。
+// 同时登记 sid 和放弃项时，按每个旧任务的 ID 与根 namespace 解析其分区，调用方用 [TaskActivity.AbandonedCheckpoint] 清档。
+// settled 中的任务已由调用方收尾，按本次执行的分区核对冲突。
 // 其他可比较的 Checkpointer 按实际实例和 sid 排除本进程重叠的独立执行。
 // 登记或申请冲突时返回 [ErrTaskBusy]，释放本次已取得的登记与租约。
 //
 // 给图引擎和 Agent 入口使用：在读写存档或历史之前调用，结束时 Release。放弃操作完成后可先调用 FinishAbandon。
-func BeginTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
-	return beginConfiguredTaskActivity(ctx, sid, abandoned, taskActivityShared)
+func BeginTaskActivity(ctx context.Context, sid string, abandoned []string, settled ...string) (context.Context, *TaskActivity, error) {
+	return beginConfiguredTaskActivity(ctx, sid, abandoned, taskActivityShared, settled)
 }
 
 // BeginFreshTaskActivity 保护新任务对存档的独占使用。沿同一 ctx 派生的执行可借用登记，
 // 其他存档调用在本次任务退出前得到 [ErrTaskBusy]。每个实际使用的后端在持有租约时检查该 sid 下的可续存档。
-func BeginFreshTaskActivity(ctx context.Context, sid string, abandoned []string) (context.Context, *TaskActivity, error) {
-	return beginConfiguredTaskActivity(ctx, sid, abandoned, taskActivityFresh)
+// 放弃项与 [BeginTaskActivity] 一样各自解析并取得原分区的许可。
+func BeginFreshTaskActivity(ctx context.Context, sid string, abandoned []string, settled ...string) (context.Context, *TaskActivity, error) {
+	return beginConfiguredTaskActivity(ctx, sid, abandoned, taskActivityFresh, settled)
 }
 
 // BeginRootResumeActivity 在续跑根任务期间独占本进程的任务登记。
 // 通过返回的 ctx 发起的嵌套执行可借用该登记。其他执行返回 [ErrTaskBusy]。
 func BeginRootResumeActivity(ctx context.Context, sid string) (context.Context, *TaskActivity, error) {
-	return beginConfiguredTaskActivity(ctx, sid, nil, taskActivityRootResume)
+	return beginConfiguredTaskActivity(ctx, sid, nil, taskActivityRootResume, nil)
 }
 
 type taskActivityMode uint8
@@ -61,12 +65,16 @@ const (
 	taskActivityRootResume
 )
 
-func beginConfiguredTaskActivity(ctx context.Context, sid string, abandoned []string, mode taskActivityMode) (context.Context, *TaskActivity, error) {
-	partition, err := ResolveCheckpointPartition(ctx, GetCheckpointer(ctx))
+func beginConfiguredTaskActivity(ctx context.Context, sid string, abandoned []string, mode taskActivityMode, settled []string) (context.Context, *TaskActivity, error) {
+	partitionCtx := ctx
+	if len(abandoned) != 0 || len(settled) != 0 {
+		partitionCtx = withSessionID(ctx, sid)
+	}
+	partition, err := ResolveCheckpointPartition(partitionCtx, GetCheckpointer(ctx))
 	if err != nil {
 		return ctx, nil, err
 	}
-	return beginTaskActivity(ctx, partition, sid, abandoned, mode)
+	return beginTaskActivity(ctx, partition, sid, abandoned, mode, settled...)
 }
 
 type taskActivityKey struct{}
@@ -78,12 +86,13 @@ type taskActivityBinding struct {
 	activity *TaskActivity
 }
 
-func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandoned []string, mode taskActivityMode) (context.Context, *TaskActivity, error) {
+func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandoned []string, mode taskActivityMode, settled ...string) (context.Context, *TaskActivity, error) {
 	executionCtx := ctx
 	if sid != "" && !WithinNodeScope(ctx) {
 		executionCtx = withoutDetachedFrom(ctx, sid)
 	}
-	abandoned = slices.Clone(abandoned)
+	pendingCount := len(abandoned)
+	abandoned = append(slices.Clone(abandoned), settled...)
 	parent, _ := ctx.Value(taskActivityKey{}).(*taskActivityBinding)
 	activity := &TaskActivity{sid: sid, mode: mode, abandoned: abandoned}
 	taskActivities.Lock()
@@ -135,7 +144,18 @@ func beginTaskActivity(ctx context.Context, cp Checkpointer, sid string, abandon
 			activity.Release()
 		}
 	}()
-	executionCtx, err := activity.acquireCheckpointLeases(executionCtx, cp)
+	abandonedConfig := cp
+	if sid == "" {
+		// 调用方已选择放弃位置，显式 Abort 可以针对嵌套 namespace。
+		pendingCount = 0
+	} else if pendingCount != 0 {
+		abandonedConfig = GetCheckpointer(ctx)
+		// 分区绑定只服务当前任务。旧任务用绑定前的配置按自身身份寻址。
+		if binding, ok := boundCheckpointerFrom(ctx); ok && binding.restoreConfiguration && binding.detached != nil {
+			abandonedConfig = binding.detached
+		}
+	}
+	executionCtx, err := activity.acquireCheckpointLeases(executionCtx, cp, abandonedConfig, pendingCount)
 	if err != nil {
 		return ctx, nil, err
 	}
@@ -171,6 +191,16 @@ func inheritedActivity(state taskActivityState, parent *taskActivityBinding, sid
 	return
 }
 
+// AbandonedCheckpoint 返回持有放弃许可的任务所使用的固定分区。已登记任务可以没有存档后端。
+// 调用方应在 [TaskActivity.FinishAbandon] 前用此句柄清理该任务。
+func (a *TaskActivity) AbandonedCheckpoint(sid string) (Checkpointer, bool) {
+	if a.abandonedCheckpoints != nil {
+		cp, ok := a.abandonedCheckpoints[sid]
+		return cp, ok
+	}
+	return nil, slices.Contains(a.abandoned, sid)
+}
+
 // FinishAbandon 释放放弃许可。调用方应在删档和历史收尾结束后调用。
 func (a *TaskActivity) FinishAbandon() {
 	if len(a.abandoned) == 0 {
@@ -186,6 +216,7 @@ func (a *TaskActivity) FinishAbandon() {
 	}
 	taskActivities.Unlock()
 	a.abandoned = nil
+	a.abandonedCheckpoints = nil
 }
 
 // Release 释放本次调用持有的许可和执行登记。

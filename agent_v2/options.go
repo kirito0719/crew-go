@@ -254,10 +254,11 @@ func WithRunMaxRounds(n int) RunOption {
 // 配置跑过的，否则找不到它的记录，只删存档。收尾是尽力而为：存储调用一共最多等 10 秒，失败或到点只记日志、照常跑这次 Run
 // （被放弃的档可能还在）。
 //
-// 删的是被放弃任务的整份存档（它的 RunID 名下的全部），不看这次 Run 所在的 ns，所以在哪儿给都行：顶层的 Run、顶层的自研壳经
-// EnterRun 透传的、节点或钩子里经 RunSubAgent 透传的。拒这几种：空的 RunID、这次 Run 自己的任务（嵌套位置上就是所在的任务）、
-// 脱离（DetachTask）出来之前所在的仍在执行的任务。入口登记整批放弃许可，支持租约的 Checkpointer 还需取得存储端许可。
-// 登记或申请许可时与在途执行或放弃冲突会返回 [compose_v2.ErrTaskBusy]。许可持有到删档和历史收尾完成。
+// 按每个旧 RunID 和根 namespace 解析 Checkpointer。在选定分区取得放弃许可并清理整个任务子树。
+// 同一分区句柄用于租约和删除。会话记录的实际分区与本次选择不符时保留旧档和待答历史。
+// 顶层 Run、自研入口透传及 [RunSubAgent] 都可传这个选项。空 RunID、当前任务和脱离前仍在执行的任务会被拒绝。
+// 入口登记整批放弃许可，支持租约的 Checkpointer 还需取得存储端许可。解析或申请失败时新 Run 退出。
+// 与在途执行或放弃冲突会返回 [compose_v2.ErrTaskBusy]。许可持有到删档和历史收尾完成。
 // 补结果写进这次 Run 正在用的那场对话（嵌套时是父层的）。
 //
 //	old := sess.RunID
@@ -277,7 +278,7 @@ type abandonedTask struct {
 }
 
 // WithSettledAbandonedTask 在新 Run 入场时核对已由宿主收尾的旧任务是否仍在执行。
-// 宿主已按原分区完成清档和历史补写，框架获取相同的放弃许可并跳过重复收尾。
+// 宿主已在原分区完成清档和历史补写。框架使用当前执行的存档分区核对冲突并清理会话中的旧审批记录。
 func WithSettledAbandonedTask(runID string) RunOption {
 	return func(c *runConfig) {
 		c.abandoned = append(c.abandoned, abandonedTask{id: runID, settled: true})

@@ -344,8 +344,7 @@ func (h *HandoffAgent) Run(ctx context.Context, session *RunSession, input *sche
 	// 「这是不是新任务」判在钩子之前：钩子里就可能发起调用（见 enterRunTask）
 	ctx = enterGraphRunTask(ctx, session)
 	// 调用方声明放弃了的任务（WithAbandonedTasks）：在记这次的输入、触发钩子之前收尾
-	abandonTasksAtEntry(ctx, cfg.abandoned, h.Name())
-	activity.FinishAbandon()
+	abandonTasksAtEntry(ctx, activity.TaskActivity, cfg.abandoned, h.Name())
 	var startErr error
 	ctx, startErr = activity.callAgentStart(ctx, hooks, info, agentIn)
 	if startErr != nil {

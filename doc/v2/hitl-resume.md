@@ -582,6 +582,7 @@ const (
 | `Abort` | 删除任务存档子树，成功或已无存档时返回 `(nil, nil)`，删除失败时返回原错误链 | 用户主动取消任务 |
 
 内建 Agent 的 `Run`、`Resume` 和图执行按任务 ID 登记。显式 `Abort` 与 `WithAbandonedTasks` 在删档及补历史期间占用放弃许可。
+`WithAbandonedTasks` 使用旧任务的分区，成功清档后补写历史。 [分区绑定与条件清档](checkpoint.md#62-分区绑定与条件清档)
 共享 Redis 或内建 SQL Checkpointer 时，这些入口同时使用 [存储端任务租约](checkpoint.md#61-共享存档的任务租约)。
 执行与放弃在登记或申请租约时冲突，后到的调用返回 `compose_v2.ErrTaskBusy`。调用方可在在途操作结束后重试。
 根任务 Resume 在本进程持有独占的任务登记，嵌套调用沿执行上下文借用。其他独立调用正在执行同一 RunID 时，根 Resume 会返回 `compose_v2.ErrTaskBusy`，即使存档位于不同分区。
